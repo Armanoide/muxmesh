@@ -17,6 +17,10 @@ pub struct HubConfig {
     pub state_path: PathBuf,
     pub ttl: u64,
     pub interval: u64,
+    /// Path of the per-machine token registry (tokens.json, digests only).
+    pub tokens_path: PathBuf,
+    /// Pairing key required by POST /register. Empty => registration closed.
+    pub pair_key: String,
 }
 
 /// Agent configuration (remote machine).
@@ -30,6 +34,8 @@ pub struct AgentConfig {
     pub cmd_port: u16,
     /// local tmux socket the agent controls (empty => tmux default).
     pub tmux_socket: String,
+    /// pairing key for first-run POST /register (mirrors hub.pair_key).
+    pub pair_key: String,
 }
 
 /// Shared token between hub and agents. Never in config.toml.
@@ -142,11 +148,20 @@ impl HubConfig {
         let interval = pick("MUXMESH_INTERVAL", &m, "poll.interval", "2")
             .parse()
             .unwrap_or(2);
+        let tokens_path = expand_tilde(&pick(
+            "MUXMESH_TOKENS",
+            &m,
+            "hub.tokens_path",
+            "~/.muxmesh/tokens.json",
+        ));
+        let pair_key = pick("MUXMESH_PAIR_KEY", &m, "hub.pair_key", "");
         Self {
             bind,
             state_path,
             ttl,
             interval,
+            tokens_path,
+            pair_key,
         }
     }
 }
@@ -169,6 +184,7 @@ impl AgentConfig {
             .parse()
             .unwrap_or(9998);
         let tmux_socket = pick("MUXMESH_TMUX_SOCKET", &m, "agent.tmux_socket", "");
+        let pair_key = pick("MUXMESH_PAIR_KEY", &m, "agent.pair_key", "");
         Self {
             hub,
             port,
@@ -176,11 +192,16 @@ impl AgentConfig {
             interval,
             cmd_port,
             tmux_socket,
+            pair_key,
         }
     }
 
     pub fn url(&self) -> String {
         format!("http://{}:{}/state", self.hub, self.port)
+    }
+
+    pub fn register_url(&self) -> String {
+        format!("http://{}:{}/register", self.hub, self.port)
     }
 }
 
@@ -270,8 +291,10 @@ mod tests {
             interval: 15,
             cmd_port: 9998,
             tmux_socket: String::new(),
+            pair_key: String::new(),
         };
         assert_eq!(cfg.url(), "http://10.0.0.1:9997/state");
+        assert_eq!(cfg.register_url(), "http://10.0.0.1:9997/register");
     }
 
     #[test]

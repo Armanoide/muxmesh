@@ -6,6 +6,7 @@
 //! Cadence: heartbeat every 15 s by default (MUXMESH_INTERVAL). tmux alive -> armed:true.
 //! tmux absent -> armed:false (the hub disarms at TTL).
 
+use std::io::Read;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -114,11 +115,23 @@ fn build_state(host: &str) -> HostState {
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default. Token = separate file.
     let cfg = muxmesh_core::AgentConfig::load();
-    let token = muxmesh_core::read_token().as_str().to_string();
     let url = cfg.url();
 
+    // First-run pairing: no token yet + pair key configured => ask the hub
+    // for OUR OWN token (never shared, revocable per machine).
+    let mut token = muxmesh_core::read_token().as_str().to_string();
     if token.is_empty() {
-        eprintln!("muxmesh-agent: WARNING no token (~/.config/muxmesh/token) -> the hub will reject (401).");
+        match register(&cfg) {
+            Ok(t) => {
+                token = t;
+                eprintln!("muxmesh-agent: paired, token stored (0600).");
+            }
+            Err(e) => {
+                eprintln!(
+                    "muxmesh-agent: no token and pairing failed: {e} -> the hub will reject (401)."
+                );
+            }
+        }
     }
     eprintln!(
         "muxmesh-agent: host={} -> {url} (interval {}s)",
@@ -143,6 +156,60 @@ fn main() {
         );
         thread::sleep(Duration::from_secs(cfg.interval));
     }
+}
+
+/// First-run pairing: POST /register with the pair key, store the issued
+/// token at ~/.config/muxmesh/token (0600). One HTTP call, then normal push.
+fn register(cfg: &muxmesh_core::AgentConfig) -> Result<String, String> {
+    if cfg.pair_key.is_empty() {
+        return Err("agent.pair_key not set (and no token file)".into());
+    }
+    let body =
+        serde_json::to_vec(&serde_json::json!({"host": cfg.host})).map_err(|e| e.to_string())?;
+    let resp = ureq::post(&cfg.register_url())
+        .set("X-Muxmesh-Pair", &cfg.pair_key)
+        .send_bytes(&body)
+        .map_err(|e| format!("{}: {e}", cfg.register_url()))?;
+    if resp.status() != 201 {
+        return Err(format!("hub answered {}", resp.status()));
+    }
+    let mut s = String::new();
+    resp.into_reader()
+        .read_to_string(&mut s)
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+    let token = v
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or("no token in reply")?
+        .to_string();
+    write_token_file(&token)?;
+    Ok(token)
+}
+
+/// Write the issued token to <config_dir>/token, mode 0600 (tmp+rename).
+fn write_token_file(token: &str) -> Result<(), String> {
+    use std::io::Write;
+    let dir = muxmesh_core::config_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("token");
+    let tmp = dir.join(format!("token.tmp.{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        f.write_all(token.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, token.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Serve POST /cmd on LAN: auth, closed-list deserialize, validate, execute on
@@ -247,6 +314,18 @@ fn handle_cmd(
 mod tests {
     use super::*;
 
+    fn cfg() -> muxmesh_core::AgentConfig {
+        muxmesh_core::AgentConfig {
+            hub: "127.0.0.1".into(),
+            port: 9997,
+            host: "test-host".into(),
+            interval: 15,
+            cmd_port: 0,
+            tmux_socket: String::new(),
+            pair_key: String::new(),
+        }
+    }
+
     #[test]
     fn build_state_has_host_and_seen() {
         let s = build_state("host-a");
@@ -261,6 +340,13 @@ mod tests {
         let json = serde_json::to_vec(&s).unwrap();
         let back: muxmesh_core::HostState = serde_json::from_slice(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn register_needs_pair_key_when_no_token() {
+        // no pair key + unreachable hub => clear error, never a panic
+        let e = register(&cfg()).unwrap_err();
+        assert!(e.contains("pair_key"), "got: {e}");
     }
 
     #[test]
