@@ -1,0 +1,12 @@
+#!/bin/sh
+# muxmesh-cli launcher for tpm installs: execs the built binary.
+# Build: cargo build --release (repo root). Override with MUXMESH_CLI_BIN.
+d="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -x "$d/target/release/muxmesh-cli" ]; then
+  exec "$d/target/release/muxmesh-cli" "$@"
+elif [ -n "$MUXMESH_CLI_BIN" ] && [ -x "$MUXMESH_CLI_BIN" ]; then
+  exec "$MUXMESH_CLI_BIN" "$@"
+else
+  echo "muxmesh: no binary — run cargo build --release in $d or set MUXMESH_CLI_BIN" >&2
+  exit 127
+fi
