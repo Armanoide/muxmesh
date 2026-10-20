@@ -14,4 +14,8 @@ CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tmux set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:$PATH"
 
 # F10: one-bar toggle against the armed remote host (Rust decides everything).
-tmux bind-key -n F10 run-shell "muxmesh-cli bar-toggle"
+# Absolute path first (PATH is frozen at server start -> 127 otherwise); the
+# bare name works once set-environment above has taken effect.
+CLI="$CURRENT_DIR/bin/muxmesh-cli"
+[ -x /usr/local/bin/muxmesh-cli ] && CLI=/usr/local/bin/muxmesh-cli
+tmux bind-key -n F10 run-shell "$CLI bar-toggle"
