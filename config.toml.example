@@ -1,11 +1,11 @@
 # muxmesh — shareable config template. Copy to ~/.config/muxmesh/config.toml on each machine.
-# The SECRET (token) is NOT here: it lives in ~/.config/muxmesh/token (mode 0600, gitignored).
+#
+# ATUIN RULE: this file is COMMIT-ABLE (no secrets). Every secret lives in
+# its own 0600 file under ~/.config/muxmesh/:
+#   token     — this machine's hub token (issued by pairing, never shared)
+#   pair_key  — pairing secret, pasted once per new machine (hub + agent only)
 #
 #   cp config.toml.example ~/.config/muxmesh/config.toml
-#
-# No manual token generation: each agent PAIRS on first run (see [agent]
-# pair_key below) and the hub issues it its OWN token. One machine
-# compromised = revoke that host, others keep working.
 
 [hub]
 # where muxmesh-hub listens on the always-on pivot machine. Trusted LAN only.
@@ -13,13 +13,11 @@ bind = "0.0.0.0:9997"
 # where the hub writes the aggregated state (read by the poller and the status bar).
 state_path = "~/.muxmesh/state.json"
 # per-machine token registry written by the hub (digests + prefixes only,
-# NEVER raw tokens). Keep it private anyway. Env: MUXMESH_TOKENS.
+# NEVER raw tokens). Env: MUXMESH_TOKENS.
 tokens_path = "~/.muxmesh/tokens.json"
-# pairing key: an agent must present it ONCE at first run to get its own
-# token. Generate: openssl rand -hex 16. Empty => registration CLOSED (the
-# hub then only accepts already-registered tokens). Same value in [agent] on
-# each machine you want to pair. Env: MUXMESH_PAIR_KEY.
-pair_key = ""
+# pairing is OPEN while ~/.config/muxmesh/pair_key exists on both hub and
+# agent (same content, mode 0600). No file => registration closed, the hub
+# only accepts already-issued tokens. Generate: openssl rand -hex 16.
 
 [poll]
 # seconds between two poller passes (pgrep + state.json reads, zero network).
@@ -44,6 +42,3 @@ interval = 15
 cmd_port = 9998
 # local tmux socket the agent controls ("" => tmux default). Env: MUXMESH_TMUX_SOCKET.
 tmux_socket = ""
-# pairing key from [hub] above, pasted once per new machine. After the first
-# successful pair it can be removed: the issued token lives in ./token.
-pair_key = ""

@@ -19,7 +19,9 @@ pub struct HubConfig {
     pub interval: u64,
     /// Path of the per-machine token registry (tokens.json, digests only).
     pub tokens_path: PathBuf,
-    /// Pairing key required by POST /register. Empty => registration closed.
+    /// Pairing key for first-run /register. Read from its OWN secret file
+    /// (pair_key, 0600) — never from config.toml (shareable, atuin rule).
+    /// Empty => registration closed.
     pub pair_key: String,
 }
 
@@ -65,12 +67,19 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("muxmesh")
 }
 
-/// Reads the token from a file (explicit path > $MUXMESH_TOKEN_PATH > <config_dir>/token).
+/// Reads a secret file (explicit path > $MUXMESH_TOKEN_PATH > <config_dir>/token).
 /// Returns Token("") when absent (the hub then rejects every POST -> no token = closed).
 pub fn read_token() -> Token {
-    let path = std::env::var("MUXMESH_TOKEN_PATH")
+    read_secret_file("MUXMESH_TOKEN_PATH", "token")
+}
+
+/// Generic secret reader: env path override > <config_dir>/<name>. Missing
+/// file => empty (deny). Other errors (EACCES, EISDIR) are operator mistakes
+/// -> say so loudly, then deny.
+pub(crate) fn read_secret_file(env: &str, name: &str) -> Token {
+    let path = std::env::var(env)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| config_dir().join("token"));
+        .unwrap_or_else(|_| config_dir().join(name));
     match fs::read_to_string(&path) {
         Ok(s) => Token(s.trim().to_string()),
         // Absent file: silent deny (fresh install). Anything else (EACCES,
@@ -154,7 +163,9 @@ impl HubConfig {
             "hub.tokens_path",
             "~/.muxmesh/tokens.json",
         ));
-        let pair_key = pick("MUXMESH_PAIR_KEY", &m, "hub.pair_key", "");
+        // secret file, never config.toml (atuin rule: shareable config,
+        // separate 0600 secrets). Same read_token machinery, other filename.
+        let pair_key = read_secret_file("MUXMESH_PAIR_KEY_PATH", "pair_key").0;
         Self {
             bind,
             state_path,
@@ -184,7 +195,8 @@ impl AgentConfig {
             .parse()
             .unwrap_or(9998);
         let tmux_socket = pick("MUXMESH_TMUX_SOCKET", &m, "agent.tmux_socket", "");
-        let pair_key = pick("MUXMESH_PAIR_KEY", &m, "agent.pair_key", "");
+        // pairing secret: its own file (0600), never config.toml.
+        let pair_key = read_secret_file("MUXMESH_PAIR_KEY_PATH", "pair_key").0;
         Self {
             hub,
             port,
