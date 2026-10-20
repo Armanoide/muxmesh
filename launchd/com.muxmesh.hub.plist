@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- muxmesh-hub on macOS (run the Linux equivalent under systemd elsewhere).
+     Copy to ~/Library/LaunchAgents/ then:
+       launchctl load ~/Library/LaunchAgents/com.muxmesh.hub.plist
+     Replace USER with the real account name. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.muxmesh.hub</string>
+
+  <key>ProgramArguments</key><array>
+    <string>/Users/USER/dev/muxmesh/target/release/muxmesh-hub</string>
+  </array>
+
+  <key>EnvironmentVariables</key><dict>
+    <!-- shareable config.toml + secret token, both under this directory -->
+    <key>MUXMESH_CONFIG_DIR</key><string>/Users/USER/.config/muxmesh</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string>
+  </dict>
+
+  <!-- relaunch if the process dies; start again at login -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <!-- debug logs (drop these two keys once stable) -->
+  <key>StandardOutPath</key><string>/Users/USER/.muxmesh/hub.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/USER/.muxmesh/hub.err.log</string>
+</dict></plist>

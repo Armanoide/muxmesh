@@ -1,0 +1,13 @@
+[package]
+name = "muxmesh-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Client on the driver machine: reads hub state (GET /state), cross-checks
+# pgrep, sets the @muxmesh-armed-win badge. Keys F8/F9/F10 (brique 3) will
+# POST /cmd to the target agent. std only -> offline build.
+
+[dependencies]
+muxmesh-core = { workspace = true }
+serde_json = { workspace = true }
