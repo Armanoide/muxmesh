@@ -179,7 +179,18 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(9998);
-    let token = muxmesh_core::read_token().as_str().to_string();
+    // /cmd is authenticated by the TARGET agent with ITS own token (the one
+    // minted on the hub for <host>). The driver never holds remote secrets:
+    // forwarding its own token would 401 forever. Mint a per-host command
+    // token on the hub (`muxmesh-hub generate-token <host> --cmd`) and export
+    // it inside the armed ssh session: `export MUXMESH_CMD_TOKEN=...`.
+    let token = std::env::var("MUXMESH_CMD_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        eprintln!(
+            "muxmesh-cli bar-toggle: no MUXMESH_CMD_TOKEN for {host} — mint one on the hub (muxmesh-hub generate-token {host} --cmd) and export it in this ssh session"
+        );
+        return 1;
+    }
     let env = CommandEnvelope {
         v: 1,
         id: format!("c-{}", now_ts()),

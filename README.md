@@ -64,11 +64,13 @@ cargo run --bin muxmesh-hub    # on the always-on machine (set hub.bind in confi
 MUXMESH_HOST=host-a cargo run --bin muxmesh-agent   # on each server
 cargo run --bin muxmesh-cli poll   # debug only: hub/agent embed the poller already
 
-# send a closed-list command to a remote agent (POST /cmd, direct client->agent)
-cargo run --bin muxmesh-cli send host-a NewWindow main
-cargo run --bin muxmesh-cli send host-a NewSession build
-cargo run --bin muxmesh-cli send host-a FocusWindow main 2
-cargo run --bin muxmesh-cli send host-a AttachOrDetach main
+# send a closed-list command to a remote agent (POST /cmd, direct client->agent).
+# Auth: the target agent checks YOUR token against ITS ~/.config/muxmesh/token,
+# so export the target's token (minted on the hub) before sending:
+MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a NewWindow main
+MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a NewSession build
+MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a FocusWindow main 2
+MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a AttachOrDetach main
 ```
 
 Verbs are a closed list (`NewWindow`, `NewSession`, `FocusWindow`, `AttachOrDetach`, `BarHide`, `BarShow`); names are whitelisted `[A-Za-z0-9_-]`; the agent only ever spawns `tmux` via argv — never a shell.
