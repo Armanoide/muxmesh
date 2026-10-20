@@ -72,7 +72,18 @@ cargo run --bin muxmesh-cli send host-a AttachOrDetach main
 
 Verbs are a closed list (`NewWindow`, `NewSession`, `FocusWindow`, `AttachOrDetach`, `BarHide`, `BarShow`); names are whitelisted `[A-Za-z0-9_-]`; the agent only ever spawns `tmux` via argv — never a shell.
 
-Key bindings: source [`misc/muxmesh.tmux.conf`](misc/muxmesh.tmux.conf) on the driver machine — **F10** toggles the remote status bar (one-bar protocol, ported from the tmux-remote fork): armed window -> `BarHide` on the remote (its bar goes off, yours stays), press again -> `BarShow`. Inert on non-armed windows. New window / new session stay native (`prefix + c` / `prefix + s` pass through the ssh straight into the remote tmux).
+Key bindings (driver machine) — install via [tpm](https://github.com/tmux-plugins/tpm):
+
+```tmux
+set -g @plugin 'Armanoide/muxmesh'
+run '~/.tmux/plugins/tpm/tpm'
+```
+
+The root [`muxmesh.tmux.conf`](muxmesh.tmux.conf) is the tpm entry hook; it
+forwards to [`misc/muxmesh.tmux.conf`](misc/muxmesh.tmux.conf) (the repo root
+belongs to Cargo). Without tpm, source `misc/muxmesh.tmux.conf` directly.
+F10 needs `muxmesh-cli` on PATH and the poller running (`muxmesh-cli poll`).
+**F10** toggles the remote status bar (one-bar protocol, ported from the tmux-remote fork): armed window -> `BarHide` on the remote (its bar goes off, yours stays), press again -> `BarShow`. Inert on non-armed windows. New window / new session stay native (`prefix + c` / `prefix + s` pass through the ssh straight into the remote tmux).
 
 ## Status
 
