@@ -31,7 +31,12 @@ on another machine — no interactive ssh, no credential-manager popups.
 - **Shared token** (Atuin-like): `config.toml` is shareable and committed as a
   template; the token lives in `~/.config/muxmesh/token` (0600, gitignored).
   Constant-time comparison; missing token = reject everything.
-- **LAN only**: bind on your LAN interface; never expose these ports to the WAN. The hub is a plain-HTTP, thread-per-connection server with a shared static token — trusted LAN only, no TLS, no per-client identity.
+- **LAN only**: bind on your LAN interface; never expose these ports to the WAN.
+  `bind = "0.0.0.0:9997"` is correct **only if a firewall sits in front**. On
+  macOS, `0.0.0.0` can resolve route-to-loopback in surprising ways: bind the
+  hub to its explicit LAN address (`bind = "10.0.10.3:9997"`) so clients that
+  dial the LAN IP actually reach it. The hub is plain-HTTP, thread-per-connection,
+  trusted LAN only — no TLS.
 
 ## Workspace
 
