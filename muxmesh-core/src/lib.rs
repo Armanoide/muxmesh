@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod httpd;
 pub mod identity;
+pub mod poll;
 pub mod state;
 
 pub use command::{valid_host, valid_name, Ack, Command, CommandEnvelope};

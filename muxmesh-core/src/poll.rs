@@ -1,4 +1,6 @@
 //! Badge poller: per-window arm/disarm of @muxmesh-armed-win + @muxmesh-status.
+//! Lives in muxmesh-core so the hub and the agent can embed it as a thread:
+//! starting muxmesh-hub or muxmesh-agent badges tmux windows automatically.
 //!
 //! Per window: find a live `ssh <host>` child of its panes (pgrep + ps, local,
 //! free), then check the state doc for an armed+fresh entry for that host.
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use muxmesh_core::{now_unix, valid_host, HubConfig, StateDoc};
+use crate::{now_unix, valid_host, HubConfig, StateDoc};
 
 /// ssh options that take a separate value argument (skip the next token).
 const OPTS_WITH_VALUE: &[char] = &[
@@ -115,7 +117,7 @@ pub fn read_state(path: &Path) -> StateDoc {
         .unwrap_or_default()
 }
 
-pub(crate) fn tmux_base(socket: &Option<String>) -> Vec<String> {
+pub fn tmux_base(socket: &Option<String>) -> Vec<String> {
     match socket {
         Some(s) => vec!["tmux".into(), "-S".into(), s.clone()],
         None => vec!["tmux".into()],
@@ -129,7 +131,7 @@ fn run_tmux(base: &[String], args: &[&str]) {
 }
 
 /// Run a tmux command, returning stdout on success (stderr captured for debug).
-pub(crate) fn tmux_out(base: &[String], args: &[&str]) -> Option<String> {
+pub fn tmux_out(base: &[String], args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(&base[0]);
     cmd.args(&base[1..]).args(args);
     match cmd.output() {
@@ -250,6 +252,25 @@ pub fn run(cfg: &HubConfig) {
     }
 }
 
+/// Embedded badge poller for hub/agent: same loop, quiet. On a machine with
+/// no local tmux server (the hub), poll_once is inert and fetch_state only
+/// logs a deduped line every ~30s; that is the expected steady state there.
+pub fn run_embedded(cfg: &HubConfig) {
+    eprintln!(
+        "muxmesh poll: embedded badge poller started (hub={})",
+        cfg.poll_hub
+    );
+    let socket = std::env::var("MUXMESH_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let base = tmux_base(&socket);
+    loop {
+        let doc = fetch_state(&cfg.poll_hub);
+        poll_once(&base, &doc, cfg.ttl);
+        thread::sleep(Duration::from_secs(cfg.interval));
+    }
+}
+
 /// One-shot pass for tests and `poll --once` (no loop).
 pub fn run_once(cfg: &HubConfig) {
     let socket = std::env::var("MUXMESH_SOCKET")
@@ -264,7 +285,7 @@ pub fn run_once(cfg: &HubConfig) {
 /// hub is the source of truth. On unreachable/corrupt, returns the empty doc
 /// (windows disarm after ttl anyway; a flaky hub must not panic the poller).
 pub fn fetch_state(hub_addr: &str) -> StateDoc {
-    match crate::fetch_hub_state(hub_addr) {
+    match fetch_hub_state(hub_addr) {
         Ok(d) => d,
         Err(e) => {
             // dedupe: log the first failure and every 15th (~30s at 2s poll)
@@ -280,6 +301,46 @@ pub fn fetch_state(hub_addr: &str) -> StateDoc {
             StateDoc::default()
         }
     }
+}
+
+/// GET /state from the hub ("host:port"). Minimal HTTP/1.0 over std::net
+/// (no extra deps). GET /state is open on the hub — no token needed.
+pub fn fetch_hub_state(hub_addr: &str) -> Result<StateDoc, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = TcpStream::connect(hub_addr).map_err(|e| format!("{hub_addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let req = format!("GET /state HTTP/1.0\r\nHost: {hub_addr}\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
+    // capped read (1 MiB): a misdirected poll.hub must not exhaust memory.
+    let mut raw = String::new();
+    {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            if raw.len() + n > 1_048_576 {
+                return Err("response over 1 MiB (wrong hub?)".into());
+            }
+            raw.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "malformed http response".to_string())?;
+    let status = head.lines().next().unwrap_or("");
+    if !(status.ends_with("200") || status.contains(" 200 ")) {
+        return Err(format!("hub returned: {status}"));
+    }
+    StateDoc::from_json_str(body).map_err(|e| format!("bad state json: {e}"))
 }
 
 #[cfg(test)]

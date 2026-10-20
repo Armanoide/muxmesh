@@ -17,8 +17,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use muxmesh_core::{Command, CommandEnvelope};
 
-use crate::poll;
-
 /// Build a Command from CLI words. Returns None on unknown verb / arity.
 pub fn parse_command(words: &[String]) -> Option<Command> {
     match words.first().map(|s| s.as_str())? {
@@ -101,13 +99,13 @@ pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
-    let base = poll::tmux_base(&socket);
-    let wid = match poll::tmux_out(&base, &["display", "-p", "#{window_id}"]) {
+    let base = muxmesh_core::poll::tmux_base(&socket);
+    let wid = match muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"]) {
         Some(o) => o.trim().to_string(),
         None => return 1,
     };
-    let doc = poll::read_state(&cfg.state_path);
-    match poll::window_ssh_host(&base, &wid) {
+    let doc = muxmesh_core::poll::read_state(&cfg.state_path);
+    match muxmesh_core::poll::window_ssh_host(&base, &wid) {
         Some(h)
             if muxmesh_core::valid_host(&h)
                 && doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) =>

@@ -128,6 +128,13 @@ fn main() {
         cfg.host, cfg.interval
     );
 
+    // Embedded badge poller: the agent's own machine gets @muxmesh-status
+    // badges automatically (same thread pattern as /cmd below).
+    {
+        let poll_cfg = muxmesh_core::HubConfig::load();
+        thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
+    }
+
     // /cmd server on its own thread: clients POST closed-list commands here.
     // It re-reads the token file per request for the same reason.
     if cfg.cmd_port > 0 {

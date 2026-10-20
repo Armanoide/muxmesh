@@ -68,6 +68,14 @@ fn main() {
         );
     }
 
+    // Embedded badge poller: tmux windows on THIS machine get the
+    // @muxmesh-status badge without the operator launching anything. On a
+    // headless pivot (no tmux server) it is inert by design.
+    {
+        let poll_cfg = cfg.clone();
+        thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
+    }
+
     let bind = cfg.bind.clone();
     let state_path = cfg.state_path.clone();
 
