@@ -1,0 +1,13 @@
+[package]
+name = "muxmesh-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Agent on each remote machine: reads its local tmux, POSTs state to the hub.
+# ureq = minimal blocking HTTP client.
+
+[dependencies]
+muxmesh-core = { workspace = true }
+serde_json = { workspace = true }
+ureq = "2"
