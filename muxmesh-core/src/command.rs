@@ -23,14 +23,11 @@ pub enum Command {
     FocusWindow { session: String, window: String },
     /// tmux attach / detach-client depending on current state
     AttachOrDetach { session: String },
-    /// hide the status bar + disarm keys on the target (one-bar protocol,
-    /// ported from tmux-remote toggle_on): `set -g status off`.
-    #[serde(rename_all = "camelCase")]
-    BarHide { session: String },
-    /// restore the status bar on the target (toggle_off counterpart):
-    /// `set -g status on`. The badge slot stays owned by the theme/poller.
-    #[serde(rename_all = "camelCase")]
-    BarShow { session: String },
+    /// hide the status bar on the target (one-bar protocol): `set -g status off`.
+    /// No args: a global option, nothing to validate or target.
+    BarHide,
+    /// restore the status bar on the target: `set -g status on`.
+    BarShow,
 }
 
 /// Envelope of a command sent by a client.
@@ -90,6 +87,18 @@ pub fn valid_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Host identifiers (poller ssh targets, hub host keys): same whitelist as
+/// valid_name PLUS '.' so dotted-quad IPs work as canonical host names
+/// (e.g. "10.0.10.3"). Still no '/', spaces or flags -> tmux `-t` targets
+/// built from these stay inert (a dot is not a valid session/window char).
+pub fn valid_host(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 impl Command {
     /// tmux names carried by the command; all must pass `valid_name`.
     pub fn names(&self) -> Vec<&str> {
@@ -98,7 +107,7 @@ impl Command {
             Command::NewSession { name } => vec![name],
             Command::FocusWindow { session, window } => vec![session, window],
             Command::AttachOrDetach { session } => vec![session],
-            Command::BarHide { session } | Command::BarShow { session } => vec![session],
+            Command::BarHide | Command::BarShow => vec![],
         }
     }
 
@@ -129,10 +138,10 @@ impl Command {
                 vec!["attach-session".into(), "-t".into(), session.clone()]
             }
             // global option; session is validated + audited but tmux takes no -t
-            Command::BarHide { .. } => {
+            Command::BarHide => {
                 vec!["set".into(), "-g".into(), "status".into(), "off".into()]
             }
-            Command::BarShow { .. } => {
+            Command::BarShow => {
                 vec!["set".into(), "-g".into(), "status".into(), "on".into()]
             }
         }
@@ -145,8 +154,8 @@ impl Command {
             Command::NewWindow { session } | Command::AttachOrDetach { session } => session.clone(),
             Command::NewSession { name } => name.clone(),
             Command::FocusWindow { session, window } => format!("{session}:{window}"),
-            // global option: audit target is the session name, tmux takes no -t
-            Command::BarHide { session } | Command::BarShow { session } => session.clone(),
+            // global option, no -t target
+            Command::BarHide | Command::BarShow => String::new(),
         }
     }
 
@@ -250,38 +259,27 @@ mod tests {
     #[test]
     fn bar_verbs_roundtrip_and_argv() {
         for (json, cmd) in [
-            (
-                r#"{"type":"BarHide","session":"main"}"#,
-                Command::BarHide {
-                    session: "main".into(),
-                },
-            ),
-            (
-                r#"{"type":"BarShow","session":"main"}"#,
-                Command::BarShow {
-                    session: "main".into(),
-                },
-            ),
+            (r#"{"type":"BarHide"}"#, Command::BarHide),
+            (r#"{"type":"BarShow"}"#, Command::BarShow),
         ] {
             let full = format!(r#"{{"v":1,"id":"c","src":"x","cmd":{json},"ts":1}}"#);
             let env: CommandEnvelope = serde_json::from_str(&full).unwrap();
             assert_eq!(env.cmd, cmd);
             assert!(env.cmd.args_valid()); // no names to validate
         }
-        assert_eq!(
-            Command::BarHide {
-                session: "main".into()
-            }
-            .tmux_argv(),
-            ["set", "-g", "status", "off"]
-        );
-        assert_eq!(
-            Command::BarShow {
-                session: "main".into()
-            }
-            .tmux_argv(),
-            ["set", "-g", "status", "on"]
-        );
+        assert_eq!(Command::BarHide.tmux_argv(), ["set", "-g", "status", "off"]);
+        assert_eq!(Command::BarShow.tmux_argv(), ["set", "-g", "status", "on"]);
+    }
+
+    #[test]
+    fn valid_host_allows_dots_rejects_injection() {
+        assert!(valid_host("10.0.10.3"));
+        assert!(valid_host("host-a"));
+        assert!(valid_host("mac_mini"));
+        assert!(!valid_host("10.0.10.3; rm -rf /"));
+        assert!(!valid_host("a/b"));
+        assert!(!valid_host("-x"));
+        assert!(!valid_host(""));
     }
 
     #[test]

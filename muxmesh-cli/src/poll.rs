@@ -13,7 +13,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use muxmesh_core::{now_unix, valid_name, HubConfig, StateDoc};
+use muxmesh_core::{now_unix, valid_host, HubConfig, StateDoc};
 
 /// ssh options that take a separate value argument (skip the next token).
 const OPTS_WITH_VALUE: &[char] = &[
@@ -186,7 +186,7 @@ pub fn poll_once(base: &[String], doc: &StateDoc, ttl: u64) {
                 if let Some(h) = pane_ssh_host(pid) {
                     // Defense in depth: the hub whitelists these, but a hand-edited or
                     // stale state file must never feed a crafted string to tmux `-t`.
-                    if !valid_name(&h) {
+                    if !valid_host(&h) {
                         continue;
                     }
                     if doc.host_armed(&h, now, ttl) {

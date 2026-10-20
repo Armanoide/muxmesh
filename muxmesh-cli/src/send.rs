@@ -35,12 +35,8 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
         "AttachOrDetach" => Some(Command::AttachOrDetach {
             session: words.get(1)?.clone(),
         }),
-        "BarHide" => Some(Command::BarHide {
-            session: words.get(1)?.clone(),
-        }),
-        "BarShow" => Some(Command::BarShow {
-            session: words.get(1)?.clone(),
-        }),
+        "BarHide" => Some(Command::BarHide),
+        "BarShow" => Some(Command::BarShow),
         _ => None,
     }
 }
@@ -113,7 +109,7 @@ pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
     let doc = poll::read_state(&cfg.state_path);
     match poll::window_ssh_host(&base, &wid) {
         Some(h)
-            if muxmesh_core::valid_name(&h)
+            if muxmesh_core::valid_host(&h)
                 && doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) =>
         {
             println!("{h}");
@@ -127,10 +123,15 @@ pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
 /// Returns a small exit code: 0 ok, 1 failure, 2 usage.
 pub fn run_send(_cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     if args.len() < 2 {
-        eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach> [args]");
+        eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach|BarHide|BarShow> [args]");
         return 2;
     }
     let host = &args[0];
+    // the network peer is a host/IP, not a tmux name -> valid_host (dots ok)
+    if !muxmesh_core::valid_host(host) {
+        eprintln!("muxmesh-cli send: invalid host (must match [A-Za-z0-9_.-])");
+        return 2;
+    }
     let cmd = match parse_command(&args[1..]) {
         Some(c) => c,
         None => {
@@ -210,12 +211,12 @@ mod tests {
             Some(Command::AttachOrDetach { .. })
         ));
         assert!(matches!(
-            parse_command(&[v("BarHide"), v("main")]),
-            Some(Command::BarHide { .. })
+            parse_command(&[v("BarHide")]),
+            Some(Command::BarHide)
         ));
         assert!(matches!(
-            parse_command(&[v("BarShow"), v("main")]),
-            Some(Command::BarShow { .. })
+            parse_command(&[v("BarShow")]),
+            Some(Command::BarShow)
         ));
     }
 

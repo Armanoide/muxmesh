@@ -22,8 +22,9 @@ ttl = 30
 # IP or hostname of the hub (the always-on pivot machine) to reach.
 hub = "127.0.0.1"
 port = 9997
-# canonical name of THIS machine == the token you type after `ssh` (host-a, host-b).
-# Leave empty => hostname -s. Set it explicitly if hostname != ssh alias.
+# canonical name of THIS machine == what you type after `ssh` (host-a, or its
+# LAN IP like 10.0.10.3). Leave empty => hostname -s. Set it explicitly if
+# hostname != the token you type. Dots allowed (IPs).
 host = ""
 # seconds between two heartbeats pushed to the hub.
 interval = 15

@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use muxmesh_core::{now_unix, valid_name, HostState, HubConfig, StateDoc};
+use muxmesh_core::{now_unix, valid_host, valid_name, HostState, HubConfig, StateDoc};
 
 /// Monotonic counter for unique tmp filenames (see write_atomic).
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -195,7 +195,7 @@ fn handle(
     // TRUST BOUNDARY: host and session names become tmux target strings later
     // (poller `-t`). Whitelist them here so downstream tmux argv is provably
     // [A-Za-z0-9_-]+ and target injection is structurally impossible.
-    if !valid_name(&host_key) {
+    if !valid_host(&host_key) {
         return respond(&mut stream, 400, "invalid host name\n");
     }
     for s in &state.sessions {

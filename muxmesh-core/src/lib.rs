@@ -7,7 +7,7 @@ pub mod error;
 pub mod httpd;
 pub mod state;
 
-pub use command::{valid_name, Ack, Command, CommandEnvelope};
+pub use command::{valid_host, valid_name, Ack, Command, CommandEnvelope};
 pub use config::{
     config_dir, expand_tilde, read_token, token_matches, AgentConfig, HubConfig, Token,
 };
