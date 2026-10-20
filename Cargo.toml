@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["muxmesh-core", "muxmesh-hub", "muxmesh-agent", "muxmesh-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "signal", "process", "macros"] }
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenv = "0.15"
+
+muxmesh-core = { path = "muxmesh-core" }

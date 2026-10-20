@@ -1,0 +1,34 @@
+# muxmesh — shareable config template. Copy to ~/.config/muxmesh/config.toml on each machine.
+# The SECRET (token) is NOT here: it lives in ~/.config/muxmesh/token (mode 0600, gitignored).
+#
+#   cp config.toml.example ~/.config/muxmesh/config.toml
+#   openssl rand -hex 32 > ~/.config/muxmesh/token && chmod 600 ~/.config/muxmesh/token
+
+[hub]
+# where muxmesh-hub listens on the always-on pivot machine. Trusted LAN only.
+bind = "0.0.0.0:9997"
+# where the hub writes the aggregated state (read by the poller and the status bar).
+state_path = "~/.muxmesh/state.json"
+
+[poll]
+# seconds between two poller passes (pgrep + state.json reads, zero network).
+interval = 2
+# freshness: an entry older than ttl (seconds) is considered offline.
+ttl = 30
+
+# Each remote machine (agent): the token is shared, read from ./token.
+# These values can be overridden by env (MUXMESH_HUB, MUXMESH_HOST, ...).
+[agent]
+# IP or hostname of the hub (the always-on pivot machine) to reach.
+hub = "127.0.0.1"
+port = 9997
+# canonical name of THIS machine == the token you type after `ssh` (host-a, host-b).
+# Leave empty => hostname -s. Set it explicitly if hostname != ssh alias.
+host = ""
+# seconds between two heartbeats pushed to the hub.
+interval = 15
+# local HTTP port where the agent serves POST /cmd (clients send closed-list
+# commands here). 0 disables command execution. Env: MUXMESH_CMD_PORT.
+cmd_port = 9998
+# local tmux socket the agent controls ("" => tmux default). Env: MUXMESH_TMUX_SOCKET.
+tmux_socket = ""
