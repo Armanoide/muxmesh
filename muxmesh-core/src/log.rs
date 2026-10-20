@@ -1,4 +1,4 @@
-//! Logging init — same pattern as lm-sanaga's sn_core::logger: level from
+//! Logging init — same pattern as lm-sanaga's sn_core::logger (init_tracing): level from
 //! env (RUST_LOG), fallback via a project flag. stderr, target + file:line.
 //!
 //! Priority: RUST_LOG > MUXMESH_DEBUG=true -> "debug" > "info".
@@ -12,7 +12,7 @@ use tracing_subscriber::fmt;
 
 /// Install the global subscriber. Idempotent-safe: a second call (or an
 /// already-set global) is ignored rather than panicking.
-pub fn init_tracing() {
+pub fn init() {
     let default_level = match env::var("MUXMESH_DEBUG").as_deref() {
         Ok("true") | Ok("1") => "debug",
         _ => "info",

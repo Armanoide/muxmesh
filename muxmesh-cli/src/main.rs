@@ -20,8 +20,8 @@ use std::process;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
-    let args = muxmesh_core::logger::parse_verbose_flag(&args);
-    muxmesh_core::logger::init_tracing();
+    let args = muxmesh_core::log::parse_verbose_flag(&args);
+    muxmesh_core::log::init();
     let cfg = muxmesh_core::HubConfig::load();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("poll");
 

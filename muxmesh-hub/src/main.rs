@@ -50,8 +50,8 @@ fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default.
     let args: Vec<String> = std::env::args().skip(1).collect();
     // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
-    let args = muxmesh_core::logger::parse_verbose_flag(&args);
-    muxmesh_core::logger::init_tracing();
+    let args = muxmesh_core::log::parse_verbose_flag(&args);
+    muxmesh_core::log::init();
     let cfg = HubConfig::load();
 
     // Console mode (herdr-style `add machine`): mint a token for a host,
