@@ -12,9 +12,9 @@ on another machine — no interactive ssh, no credential-manager popups.
      agents push  │          │  client reads state
             ┌─────┴────┐  ┌───┴──────────┐
             │ agent A  │  │ driver       │
-            │ tmux     │◄─│ F8/F9/F10    │
-            │ local    │POST /cmd        │
-            └──────────┘  └──────────────┘
+            │ tmux     │◄─│ F10 bar toggle │
+            │ local    │  │ POST /cmd      │
+            └──────────┘  └────────────────┘
 ```
 
 - **hub** — state aggregator on any always-on machine. It never executes anything.
@@ -65,13 +65,13 @@ cargo run --bin muxmesh-cli send host-a FocusWindow main 2
 cargo run --bin muxmesh-cli send host-a AttachOrDetach main
 ```
 
-Verbs are a closed list (`NewWindow`, `NewSession`, `FocusWindow`, `AttachOrDetach`); names are whitelisted `[A-Za-z0-9_-]`; the agent only ever spawns `tmux` via argv — never a shell.
+Verbs are a closed list (`NewWindow`, `NewSession`, `FocusWindow`, `AttachOrDetach`, `BarHide`, `BarShow`); names are whitelisted `[A-Za-z0-9_-]`; the agent only ever spawns `tmux` via argv — never a shell.
 
-Key bindings: source [`misc/muxmesh.tmux.conf`](misc/muxmesh.tmux.conf) on the driver machine — F8/F9/F10 send NewWindow / NewSession / AttachOrDetach to the host of the armed window (guarded by `@muxmesh-armed-win`, so they are inert on non-armed windows).
+Key bindings: source [`misc/muxmesh.tmux.conf`](misc/muxmesh.tmux.conf) on the driver machine — **F10** toggles the remote status bar (one-bar protocol, ported from the tmux-remote fork): armed window -> `BarHide` on the remote (its bar goes off, yours stays), press again -> `BarShow`. Inert on non-armed windows. New window / new session stay native (`prefix + c` / `prefix + s` pass through the ssh straight into the remote tmux).
 
 ## Status
 
 - hub + agent + poller: working, tested (43 tests).
-- `/cmd` execution on the agent (`muxmesh-cli send`) + F8/F9/F10 bindings: working, E2E-tested (bindings parse clean; live keystroke UAT on real machines).
+- `/cmd` execution on the agent (`muxmesh-cli send`) + F10 one-bar toggle: working, E2E-tested (bindings parse clean; live keystroke UAT on real machines).
 
 MIT.

@@ -23,6 +23,14 @@ pub enum Command {
     FocusWindow { session: String, window: String },
     /// tmux attach / detach-client depending on current state
     AttachOrDetach { session: String },
+    /// hide the status bar + disarm keys on the target (one-bar protocol,
+    /// ported from tmux-remote toggle_on): `set -g status off`.
+    #[serde(rename_all = "camelCase")]
+    BarHide { session: String },
+    /// restore the status bar on the target (toggle_off counterpart):
+    /// `set -g status on`. The badge slot stays owned by the theme/poller.
+    #[serde(rename_all = "camelCase")]
+    BarShow { session: String },
 }
 
 /// Envelope of a command sent by a client.
@@ -90,6 +98,7 @@ impl Command {
             Command::NewSession { name } => vec![name],
             Command::FocusWindow { session, window } => vec![session, window],
             Command::AttachOrDetach { session } => vec![session],
+            Command::BarHide { session } | Command::BarShow { session } => vec![session],
         }
     }
 
@@ -119,6 +128,13 @@ impl Command {
                 // the agent chooses attach or detach based on current state; base argv:
                 vec!["attach-session".into(), "-t".into(), session.clone()]
             }
+            // global option; session is validated + audited but tmux takes no -t
+            Command::BarHide { .. } => {
+                vec!["set".into(), "-g".into(), "status".into(), "off".into()]
+            }
+            Command::BarShow { .. } => {
+                vec!["set".into(), "-g".into(), "status".into(), "on".into()]
+            }
         }
     }
 
@@ -129,6 +145,8 @@ impl Command {
             Command::NewWindow { session } | Command::AttachOrDetach { session } => session.clone(),
             Command::NewSession { name } => name.clone(),
             Command::FocusWindow { session, window } => format!("{session}:{window}"),
+            // global option: audit target is the session name, tmux takes no -t
+            Command::BarHide { session } | Command::BarShow { session } => session.clone(),
         }
     }
 
@@ -227,6 +245,43 @@ mod tests {
             session: "main; touch /tmp/pwn".into(),
         };
         assert!(!c.args_valid());
+    }
+
+    #[test]
+    fn bar_verbs_roundtrip_and_argv() {
+        for (json, cmd) in [
+            (
+                r#"{"type":"BarHide","session":"main"}"#,
+                Command::BarHide {
+                    session: "main".into(),
+                },
+            ),
+            (
+                r#"{"type":"BarShow","session":"main"}"#,
+                Command::BarShow {
+                    session: "main".into(),
+                },
+            ),
+        ] {
+            let full = format!(r#"{{"v":1,"id":"c","src":"x","cmd":{json},"ts":1}}"#);
+            let env: CommandEnvelope = serde_json::from_str(&full).unwrap();
+            assert_eq!(env.cmd, cmd);
+            assert!(env.cmd.args_valid()); // no names to validate
+        }
+        assert_eq!(
+            Command::BarHide {
+                session: "main".into()
+            }
+            .tmux_argv(),
+            ["set", "-g", "status", "off"]
+        );
+        assert_eq!(
+            Command::BarShow {
+                session: "main".into()
+            }
+            .tmux_argv(),
+            ["set", "-g", "status", "on"]
+        );
     }
 
     #[test]

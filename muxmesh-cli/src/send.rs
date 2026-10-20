@@ -35,6 +35,12 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
         "AttachOrDetach" => Some(Command::AttachOrDetach {
             session: words.get(1)?.clone(),
         }),
+        "BarHide" => Some(Command::BarHide {
+            session: words.get(1)?.clone(),
+        }),
+        "BarShow" => Some(Command::BarShow {
+            session: words.get(1)?.clone(),
+        }),
         _ => None,
     }
 }
@@ -202,6 +208,14 @@ mod tests {
         assert!(matches!(
             parse_command(&[v("AttachOrDetach"), v("main")]),
             Some(Command::AttachOrDetach { .. })
+        ));
+        assert!(matches!(
+            parse_command(&[v("BarHide"), v("main")]),
+            Some(Command::BarHide { .. })
+        ));
+        assert!(matches!(
+            parse_command(&[v("BarShow"), v("main")]),
+            Some(Command::BarShow { .. })
         ));
     }
 
