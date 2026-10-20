@@ -239,11 +239,11 @@ pub fn run(cfg: &HubConfig) {
         .filter(|s| !s.is_empty());
     let base = tmux_base(&socket);
     eprintln!(
-        "muxmesh-cli poll: interval={}s ttl={}s hub={}",
+        "muxmesh poll: interval={}s ttl={}s hub={}",
         cfg.interval, cfg.ttl, cfg.poll_hub
     );
     if cfg.poll_hub.starts_with("127.0.0.1") || cfg.poll_hub.starts_with("localhost") {
-        eprintln!("muxmesh-cli poll: hub is loopback — on a driver machine set poll.hub = \"<hub-ip>:9997\" (or MUXMESH_POLL_HUB) to badge remote hosts.");
+        eprintln!("muxmesh poll: hub is loopback — on a driver machine set poll.hub = \"<hub-ip>:9997\" (or MUXMESH_POLL_HUB) to badge remote hosts.");
     }
     loop {
         let doc = fetch_state(&cfg.poll_hub);
@@ -289,12 +289,13 @@ pub fn fetch_state(hub_addr: &str) -> StateDoc {
         Ok(d) => d,
         Err(e) => {
             // dedupe: log the first failure and every 15th (~30s at 2s poll)
+            // note: process-global counter — assumes one poller per process (true today).
             // so a down hub doesn't spam stderr under launchd KeepAlive.
             static FAILS: AtomicU64 = AtomicU64::new(0);
             let n = FAILS.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(15) {
                 eprintln!(
-                    "muxmesh-cli poll: hub {hub_addr}: {e} (empty state this cycle, #{})",
+                    "muxmesh poll: hub {hub_addr}: {e} (empty state this cycle, #{})",
                     n + 1
                 );
             }

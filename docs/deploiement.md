@@ -10,7 +10,7 @@ debug ponctuel, jamais l'usage normal.
 | Machine | Rôles | Lancé par |
 |---|---|---|
 | Pivot (Mini aujourd'hui, node1/NAS demain) | `muxmesh-hub` + `muxmesh-agent` (hub et agent cohabitent) | launchd (`com.muxmesh.hub.plist` + `com.muxmesh.agent.plist`) |
-| MacBook (driver) | `muxmesh-cli poll` + tmux (bindings F10) | launchd (`com.muxmesh.poll.plist`) + tmux au login |
+| MacBook (driver) | tmux (bindings F10) + poller embarque dans l'agent | launchd (`com.muxmesh.agent.plist`) + tmux au login |
 | Autres serveurs | `muxmesh-agent` | systemd unit (modèle ci-dessous) |
 
 Le **poll** n'a pas à être lancé à la main : c'est un service du driver, comme

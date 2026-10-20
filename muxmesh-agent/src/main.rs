@@ -129,9 +129,12 @@ fn main() {
     );
 
     // Embedded badge poller: the agent's own machine gets @muxmesh-status
-    // badges automatically (same thread pattern as /cmd below).
+    // badges automatically (same thread pattern as /cmd below). It targets
+    // the agent's own push target ([agent] hub), not the hub-side bind
+    // default — a remote agent configured with only [agent] hub still works.
     {
-        let poll_cfg = muxmesh_core::HubConfig::load();
+        let mut poll_cfg = muxmesh_core::HubConfig::load();
+        poll_cfg.poll_hub = muxmesh_core::agent_poll_hub(&cfg);
         thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
     }
 

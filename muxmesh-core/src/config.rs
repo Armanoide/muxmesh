@@ -142,11 +142,31 @@ fn pick(
 
 /// "host" or "host:port" -> "host:port". Bare IPv6 ("::1") is bracketed so
 /// the appended port stays parseable; bracketed input passes through.
+/// Split "host:port" (v6 bracketed or bare v4/host) into its parts.
+fn split_host_port(addr: &str) -> (&str, Option<&str>) {
+    let a = addr.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        if let Some((h, tail)) = rest.split_once(']') {
+            let p = tail.strip_prefix(':').filter(|p| !p.is_empty());
+            return (h, p);
+        }
+        return (a, None);
+    }
+    match a.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, Some(p)),
+        // bare IPv6 (multiple colons) or bare host -> no port part
+        _ => (a, None),
+    }
+}
+
 fn normalize_addr(host: &str, default_port: &str) -> String {
     let h = host.trim();
-    // already "host:port" (v6 bracketed, or v4/host with exactly one colon)
     if h.starts_with('[') {
-        return h.to_string();
+        // bracketed: keep only if a port follows "]"; append the default otherwise
+        return match split_host_port(h) {
+            (_, Some(_)) => h.to_string(),
+            (h6, None) => format!("[{h6}]:{default_port}"),
+        };
     }
     let colons = h.chars().filter(|c| *c == ':').count();
     if colons == 0 {
@@ -157,6 +177,26 @@ fn normalize_addr(host: &str, default_port: &str) -> String {
         // bare IPv6 -> bracket + port
         format!("[{h}]:{default_port}")
     }
+}
+
+/// Poll-hub address for a process configured through [agent] hub/port (the
+/// agent's embedded poller). Explicit poll.hub / MUXMESH_POLL_HUB wins;
+/// otherwise the agent's own push target, so a remote agent never badges
+/// against loopback by accident.
+pub fn agent_poll_hub(agent: &AgentConfig) -> String {
+    let explicit = std::env::var("MUXMESH_POLL_HUB")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            load_map()
+                .get("poll.hub")
+                .cloned()
+                .filter(|s| !s.trim().is_empty())
+        });
+    normalize_addr(
+        explicit.as_deref().unwrap_or(&agent.hub),
+        &agent.port.to_string(),
+    )
 }
 
 impl HubConfig {
@@ -184,13 +224,13 @@ impl HubConfig {
         // poll.hub: where the poller fetches state ("host" or "host:port").
         // Default = bind host so a hub-local poller needs no config; a driver
         // sets it to the hub's LAN IP. Bare IPv6 gets bracketed at use time.
-        let bind_host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+        let (bind_host, bind_port) = split_host_port(&bind);
         let bind_host = if bind_host == "0.0.0.0" || bind_host.is_empty() {
             "127.0.0.1"
         } else {
             bind_host
         };
-        let bind_port = bind.rsplit_once(':').map(|(_, p)| p).unwrap_or("9997");
+        let bind_port = bind_port.unwrap_or("9997");
         let poll_hub_raw = pick("MUXMESH_POLL_HUB", &m, "poll.hub", bind_host);
         let poll_hub = normalize_addr(&poll_hub_raw, bind_port);
         Self {
@@ -278,6 +318,31 @@ pub fn token_matches(expected: &str, got: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_addr_host_v4_ipv6() {
+        assert_eq!(normalize_addr("10.0.10.3", "9997"), "10.0.10.3:9997");
+        assert_eq!(normalize_addr("10.0.10.3:9998", "9997"), "10.0.10.3:9998");
+        assert_eq!(normalize_addr("::1", "9997"), "[::1]:9997");
+        assert_eq!(normalize_addr("[::1]:9998", "9997"), "[::1]:9998");
+    }
+
+    #[test]
+    fn normalize_addr_bracketed_v6_without_port() {
+        assert_eq!(normalize_addr("[::1]", "9997"), "[::1]:9997");
+        assert_eq!(normalize_addr("[::]:9998", "9997"), "[::]:9998");
+    }
+
+    #[test]
+    fn split_host_port_v6_bracketed_keeps_port() {
+        assert_eq!(split_host_port("[::1]:9997"), ("::1", Some("9997")));
+        assert_eq!(split_host_port("[::1]"), ("::1", None));
+        assert_eq!(
+            split_host_port("10.0.10.3:9997"),
+            ("10.0.10.3", Some("9997"))
+        );
+        assert_eq!(split_host_port("10.0.10.3"), ("10.0.10.3", None));
+    }
 
     #[test]
     fn parse_flat_sections_and_keys() {

@@ -62,7 +62,7 @@ openssl rand -hex 32 > ~/.config/muxmesh/token && chmod 600 ~/.config/muxmesh/to
 just check                      # fmt + clippy -D warnings + tests
 cargo run --bin muxmesh-hub    # on the always-on machine (set hub.bind in config)
 MUXMESH_HOST=host-a cargo run --bin muxmesh-agent   # on each server
-cargo run --bin muxmesh-cli poll   # on the driver machine (tmux badge)
+cargo run --bin muxmesh-cli poll   # debug only: hub/agent embed the poller already
 
 # send a closed-list command to a remote agent (POST /cmd, direct client->agent)
 cargo run --bin muxmesh-cli send host-a NewWindow main
@@ -83,7 +83,7 @@ run '~/.tmux/plugins/tpm/tpm'
 The root [`muxmesh.tmux.conf`](muxmesh.tmux.conf) is the tpm entry hook; it
 forwards to [`misc/muxmesh.tmux.conf`](misc/muxmesh.tmux.conf) (the repo root
 belongs to Cargo). Without tpm, source `misc/muxmesh.tmux.conf` directly.
-F10 needs `muxmesh-cli` on PATH and the poller running (`muxmesh-cli poll`).
+F10 needs `muxmesh-cli` on PATH; the badge poller runs embedded in muxmesh-hub/muxmesh-agent (no separate service).
 **F10** toggles the remote status bar (one-bar protocol, ported from the tmux-remote fork): armed window -> `BarHide` on the remote (its bar goes off, yours stays), press again -> `BarShow`. Inert on non-armed windows. New window / new session stay native (`prefix + c` / `prefix + s` pass through the ssh straight into the remote tmux).
 
 ## Status
