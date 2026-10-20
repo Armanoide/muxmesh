@@ -2,8 +2,8 @@
 #
 # ATUIN RULE: this file is COMMIT-ABLE (no secrets). Every secret lives in
 # its own 0600 file under ~/.config/muxmesh/:
-#   token     — this machine's hub token (issued by pairing, never shared)
-#   pair_key  — pairing secret, pasted once per new machine (hub + agent only)
+#   token     — this machine's hub token, pasted once after:
+#               muxmesh-hub generate-token <host>   (run on the pivot)
 #
 #   cp config.toml.example ~/.config/muxmesh/config.toml
 
@@ -15,9 +15,8 @@ state_path = "~/.muxmesh/state.json"
 # per-machine token registry written by the hub (digests + prefixes only,
 # NEVER raw tokens). Env: MUXMESH_TOKENS.
 tokens_path = "~/.muxmesh/tokens.json"
-# pairing is OPEN while ~/.config/muxmesh/pair_key exists on both hub and
-# agent (same content, mode 0600). No file => registration closed, the hub
-# only accepts already-issued tokens. Generate: openssl rand -hex 16.
+# no auto-registration: mint each machine's token here with
+#   muxmesh-hub generate-token <host>   (printed once, paste into agent's token file)
 
 [poll]
 # seconds between two poller passes (pgrep + state.json reads, zero network).
@@ -25,7 +24,7 @@ interval = 2
 # freshness: an entry older than ttl (seconds) is considered offline.
 ttl = 30
 
-# Each remote machine (agent): its token comes from pairing, never shared.
+# Each remote machine (agent): its own token, minted by generate-token, never shared.
 # These values can be overridden by env (MUXMESH_HUB, MUXMESH_HOST, ...).
 [agent]
 # IP or hostname of the hub (the always-on pivot machine) to reach.

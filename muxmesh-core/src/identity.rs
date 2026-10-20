@@ -6,7 +6,8 @@
 //! one entry; the others keep working. No shared secret to scp around.
 //!
 //! First-run pairing:
-//!   agent ──POST /register {host}──► hub   (header X-Muxmesh-Pair: <pair key>)
+//!   hub    $ muxmesh-hub generate-token <host>   -> token printed ONCE
+//!   agent  ~/.config/muxmesh/token (0600)        <- operator pastes it
 //!        ◄──201 {agent_token}────        hub generates 32 random bytes,
 //!                                        stores digest+prefix in tokens.json
 //!   agent writes ~/.config/muxmesh/token (0600), then pushes normally.

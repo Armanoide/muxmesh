@@ -49,12 +49,21 @@ impl Drop for Permit {
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default.
     let cfg = HubConfig::load();
-    // Per-machine token registry (digests only). Empty pair key => closed.
+
+    // Console mode (herdr-style `add machine`): mint a token for a host,
+    // print it ONCE, exit. No server, no network. The operator pastes the
+    // output on the agent machine; the hub is then standby for its pushes.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("generate-token") {
+        generate_token(&cfg, &args[1..]); // diverges (process::exit)
+    }
+
+    // Per-machine token registry (digests only).
     let tokens_path = cfg.tokens_path.clone();
     let store: Arc<Mutex<TokenStore>> = Arc::new(Mutex::new(TokenStore::load(&tokens_path)));
     if store.lock().unwrap().hosts.is_empty() {
         eprintln!(
-            "muxmesh-hub: no registered hosts in {} -> every /state POST is 401 until an agent pairs.",
+            "muxmesh-hub: no registered hosts in {} -> every /state POST is 401 until you mint one: muxmesh-hub generate-token <host>",
             tokens_path.display()
         );
     }
@@ -75,14 +84,9 @@ fn main() {
         }
     };
     eprintln!(
-        "muxmesh-hub: listening on {bind} -> {} (tokens: {}, pair: {})",
+        "muxmesh-hub: listening on {bind} -> {} (tokens: {})",
         state_path.display(),
-        tokens_path.display(),
-        if cfg.pair_key.is_empty() {
-            "CLOSED"
-        } else {
-            "open with key"
-        }
+        tokens_path.display()
     );
 
     // serialize file writes (one POST at a time)
@@ -92,10 +96,8 @@ fn main() {
         match listener.accept() {
             Ok((mut stream, peer)) => {
                 let path = state_path.clone();
-                let tokpath = tokens_path.clone();
                 let lock = lock.clone();
                 let store = store.clone();
-                let pair = cfg.pair_key.clone();
                 // backpressure BEFORE spawning: over cap -> 503, no thread, no read.
                 match Permit::acquire() {
                     Some(permit) => {
@@ -103,9 +105,7 @@ fn main() {
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         thread::spawn(move || {
                             let _permit = permit; // released when the handler returns
-                            if let Err(e) =
-                                handle(stream, peer, &path, &tokpath, &lock, &store, &pair)
-                            {
+                            if let Err(e) = handle(stream, peer, &path, &lock, &store) {
                                 eprintln!("muxmesh-hub: {peer}: {e}");
                             }
                         });
@@ -120,14 +120,77 @@ fn main() {
     }
 }
 
+/// Console mode: `muxmesh-hub generate-token <host>` — mint a machine token,
+/// register it in tokens.json, print it ONCE. herdr-style `add machine`:
+/// operator runs this on the pivot, pastes the printed token on the agent
+/// (~/.config/muxmesh/token), done. Re-issue revokes the host's old token.
+fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
+    let host = match args.first() {
+        Some(h) if valid_host(h) => h.clone(),
+        _ => {
+            eprintln!(
+                "usage: muxmesh-hub generate-token <host>   (host = what you type after ssh)"
+            );
+            process::exit(2);
+        }
+    };
+    let mut store = TokenStore::load(&cfg.tokens_path);
+    let token = match store.issue(&host) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("muxmesh-hub: generate-token: {e}");
+            process::exit(1);
+        }
+    };
+    // persist BEFORE printing: if the file write fails, no token was issued.
+    let json = match store.to_json_pretty() {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("muxmesh-hub: generate-token: serialize: {e}");
+            process::exit(1);
+        }
+    };
+    if let Err(e) = write_file_atomic(&cfg.tokens_path, json.as_bytes()) {
+        eprintln!(
+            "muxmesh-hub: generate-token: write {}: {e}",
+            cfg.tokens_path.display()
+        );
+        process::exit(1);
+    }
+    // the ONLY place a raw token ever appears: stdout, once, for the operator.
+    println!("{token}");
+    eprintln!(
+        "muxmesh-hub: token for '{host}' registered in {} — paste it on the agent as ~/.config/muxmesh/token (0600). Shown once.",
+        cfg.tokens_path.display()
+    );
+    process::exit(0)
+}
+
+/// tmp + rename, mode 0600 (tokens.json holds digests, still keep it tight).
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", process::id()));
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn handle(
     mut stream: TcpStream,
     _peer: std::net::SocketAddr,
     path: &Path,
-    tokpath: &Path,
     lock: &Mutex<()>,
     store: &Mutex<TokenStore>,
-    pair_key: &str,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
@@ -142,7 +205,6 @@ fn handle(
     let mut content_len: usize = 0;
     let mut header_host: Option<String> = None;
     let mut header_token: Option<String> = None;
-    let mut header_pair: Option<String> = None;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
@@ -159,47 +221,7 @@ fn handle(
         } else if lower.starts_with("x-muxmesh-token:") {
             let val = line.split_once(':').map(|x| x.1).unwrap_or("");
             header_token = Some(val.trim().to_string());
-        } else if lower.starts_with("x-muxmesh-pair:") {
-            let val = line.split_once(':').map(|x| x.1).unwrap_or("");
-            header_pair = Some(val.trim().to_string());
         }
-    }
-
-    // POST /register: pairing endpoint, authenticated by the PAIR key (not a
-    // machine token — the caller has none yet). Issues one per host; re-issue
-    // revokes the previous token of that host (dockhand semantics).
-    if method == "POST" && target.starts_with("/register") {
-        if pair_key.is_empty()
-            || !muxmesh_core::token_matches(pair_key, header_pair.as_deref().unwrap_or(""))
-        {
-            return respond(&mut stream, 401, "pairing closed or bad pair key\n");
-        }
-        if content_len == 0 || content_len > 4096 {
-            return respond(&mut stream, 400, "bad length\n");
-        }
-        let mut body = vec![0u8; content_len];
-        reader.read_exact(&mut body)?;
-        let req: serde_json::Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
-            Err(e) => return respond(&mut stream, 422, &format!("invalid payload: {e}\n")),
-        };
-        let host = req.get("host").and_then(|h| h.as_str()).unwrap_or("");
-        if !valid_host(host) {
-            return respond(&mut stream, 400, "invalid host name\n");
-        }
-        // M3: issue + snapshot + persist in ONE critical section, so a
-        // concurrent register/revoke can never write a ledger that omits
-        // the token we just handed out.
-        let token = {
-            let mut st = store
-                .lock()
-                .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-            let token = st.issue(host)?;
-            persist_tokens_locked(tokpath, lock, &st)?;
-            token
-        };
-        eprintln!("muxmesh-hub: registered host {host}");
-        return respond_json(&mut stream, 201, &serde_json::json!({"token": token}));
     }
 
     // AUTH: GET /state is open (badge pollers and `tree` are read-only and
@@ -210,7 +232,12 @@ fn handle(
     }
 
     // per-machine auth for everything else (POST /state). Unknown host or
-    // bad token => 401 (pair first with POST /register).
+    // bad token => 401. Tokens are minted OFFLINE by `muxmesh-hub
+    // generate-token <host>` on the pivot — there is NO registration endpoint:
+    // an unregistered machine cannot introduce itself to the hub at all.
+    if method != "POST" || !target.starts_with("/state") {
+        return respond(&mut stream, 404, "not found\n");
+    }
     let host_hdr = header_host.unwrap_or_default();
     let got_token = header_token.unwrap_or_default();
     // M1: clone the record out of the lock, then run the KDF OUTSIDE it —
@@ -226,10 +253,6 @@ fn handle(
             if got_token.len() >= muxmesh_core::PREFIX_LEN
                 && muxmesh_core::verify_token(&got_token, &r.hash) => {}
         _ => return respond(&mut stream, 401, "unauthorized\n"),
-    }
-
-    if method != "POST" || !target.starts_with("/state") {
-        return respond(&mut stream, 404, "not found\n");
     }
 
     // body capped (1 MiB): an agent sends a few KB, beyond that = abuse
@@ -286,27 +309,6 @@ fn handle(
     respond(&mut stream, 200, "ok\n")
 }
 
-/// Persist tokens.json atomically (tmp + rename). Caller must already hold the
-/// store lock (M3: snapshot + write in one critical section); `lock` only
-/// serializes file writers. M2: no unwrap on the store lock — that happens in
-/// the caller now; here we only take the file lock with map_err discipline.
-fn persist_tokens_locked(path: &Path, lock: &Mutex<()>, store: &TokenStore) -> std::io::Result<()> {
-    let json = store.to_json_pretty().map_err(std::io::Error::other)?;
-    let _g = lock
-        .lock()
-        .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", process::id()));
-    let mut f = fs::File::create(&tmp)?;
-    f.write_all(json.as_bytes())?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 fn read_doc(path: &Path) -> StateDoc {
     fs::read_to_string(path)
         .ok()
@@ -345,26 +347,6 @@ fn purge_and_write(path: &Path, ttl: u64) -> std::io::Result<()> {
         write_atomic(path, &doc)?;
     }
     Ok(())
-}
-
-/// JSON response (register reply carries the issued token once).
-fn respond_json(
-    stream: &mut TcpStream,
-    code: u16,
-    body: &serde_json::Value,
-) -> std::io::Result<()> {
-    let raw = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    let status = match code {
-        201 => "201 Created",
-        _ => "200 OK",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        raw.len()
-    )?;
-    stream.write_all(&raw)?;
-    stream.flush()
 }
 
 fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {

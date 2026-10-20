@@ -58,34 +58,40 @@ systemctl enable --now muxmesh-hub   # une seule fois, puis oublié
 
 ## Ce qui reste manuel (assumé, court)
 
-1. **Premier déploiement par machine** : copier le binaire + config + token (ou `register`, voir note de design à venir).
+1. **Premier déploiement par machine** : copier le binaire + config, puis appairer avec `generate-token` (voir section suivante).
 2. Debug ponctuel : lancer un composant à la main pour lire ses logs.
 
-## Design retenu pour `register` (calqué sur dockhand/hawser, adapté)
+## Appariement d'une machine (`generate-token`)
 
-Lecture du code de `Finsys/dockhand` (collector Go + serveur SvelteKit) : chaque
-agent edge a **son** token (`hw_…`, 32 octets aléatoires) ; le serveur ne stocke
-que **le hash Argon2id + les 8 premiers caractères** (lookup O(1) par préfixe,
-une seule vérif au lieu de N) ; régénérer un token **ferme la connexion live et
-révoque les anciens** du même environnement — une machine compromise se remplace
-en un clic, l'usurpateur reste dehors.
-
-Adaptation muxmesh (hub = fichier, pas de DB) :
+Le hub ne connaît que ce que **toi** tu lui déclares. Pas d'auto-registration :
+une machine inconnue ne peut pas se présenter au hub (le endpoint `/register`
+n'existe pas — un scanner qui le trouve reçoit `404`).
 
 ```
-agent neuf                    hub
-  │ POST /register {host}       (X-Muxmesh-Pair: <clé d'appariement>)
-  │◄── 201 {agent_token}        hub génère 32 octets, stocke hash+préfixe
-  │ écrit ~/.config/muxmesh/token (0600), démarre le push normal
+Mac Mini (pivot)                          machine à appairer
+$ muxmesh-hub generate-token 10.0.10.7
+mm_9f3a…(43 car., affiché UNE SEULE FOIS)
+   │ tokens.json : {host: {prefix, hash, created}} — jamais le clair
+   └──────────── tu colles le token, une fois ────────────►  ~/.config/muxmesh/token (0600)
+                                                            l'agent le relit à chaque push,
+                                                            aucun redémarrage nécessaire
 ```
 
-- `tokens.json` côté hub : `{host: {prefix, hash, created}}` — jamais le token en clair.
-- Clé d'appariement : une chaîne que tu colles une fois par machine (dans le
-  `config.toml`, champ `pair = "…"`), révoquable en changeant le fichier du hub.
+- **Token par machine** : une machine compromise se remplace en régénérant son
+  token (`generate-token <host>` révoque l'ancien immédiatement), les autres intactes.
+- **Le hub ne stocke jamais le secret** : hash SHA-256 itéré ×100 000 (sel aléatoire)
+  + préfixe 8 car. pour le lookup. Vol de `tokens.json` ne donne pas les tokens.
+- **Rotation sans redémarrage** : agent et hub relisent leurs fichiers de secrets
+  à chaque requête — coller un nouveau token dans `token` suffit.
 - `/cmd` : le driver passe **par le hub** (le hub authentifie le driver, relaie
   avec le token de la cible) → les ports 9998 des agents peuvent fermer au LAN.
-- Révocation : `hub revoke <host>` = efface l'entrée → l'agent reçoit 401 et
-  s'arrête proprement, les autres machines intactes.
+- Révocation : supprimer l'entrée de `tokens.json` (ou régénérer) → la machine
+  reçoit 401 et s'arrête proprement, les autres intactes.
+
+> Note de design : calqué sur `Finsys/dockhand` (token par agent, hash+préfixe
+> côté serveur, régénération = révocation), simplifié pour un hub sans DB.
+> dockhand utilise Argon2id ; ici SHA-256 itéré ×100 000 en std seul —
+> hors menaces GPU/offline, qui exigeraient un vrai KDF.
 
 ## Statut de cette règle
 
