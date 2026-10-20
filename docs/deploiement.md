@@ -64,5 +64,4 @@ systemctl enable --now muxmesh-hub   # une seule fois, puis oublié
 ## Statut de cette règle
 
 - ✅ plists hub/agent/poll écrits (RunAtLoad+KeepAlive)
-- ❌ **manque** : `com.muxmesh.agent.plist` (l'agent du Mini tourne à la main aujourd'hui) + unit systemd modèle pour les futurs pivots Linux
-- ❌ installation launchd jamais faite sur tes machines (c'est toi qui appliques)
+- ❌ **manque** : installation launchd jamais faite sur tes machines (c'est toi qui appliques)
