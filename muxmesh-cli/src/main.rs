@@ -2,9 +2,10 @@
 //!
 //! Subcommands:
 //!   poll  : the badge loop. Per window: does a pane hold a live `ssh <host>`
-//!           (pgrep + ps, local) AND is <host> armed+fresh in the state doc
-//!           -> set @muxmesh-armed-win. Zero network per cycle (local file read).
-//!   tree  : print the aggregated state (local file, or GET /state with --hub).
+//!           (pgrep + ps, local) AND is <host> armed+fresh in the hub state
+//!           -> set @muxmesh-armed-win. State comes from the hub over HTTP
+//!           (GET /state, open endpoint) — a driver has no local state.json.
+//!   tree  : print the aggregated state (live hub by default, --local file).
 //!
 //! Detection rule: the pane's process tree is walked DOWN (pane pid -> children
 //! via pgrep) so tmux servers on other machines are never touched. A child is
@@ -23,8 +24,9 @@ fn main() {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("poll");
 
     match cmd {
+        "poll" if args.iter().any(|a| a == "--once") => poll::run_once(&cfg),
         "poll" => poll::run(&cfg),
-        "tree" => tree(&cfg, args.iter().any(|a| a == "--hub")),
+        "tree" => tree(&cfg, args.iter().any(|a| a == "--local")),
         "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
         other => {
@@ -34,18 +36,19 @@ fn main() {
     }
 }
 
-/// Print host/session tree. Default reads the local state file; --hub fetches live.
-fn tree(cfg: &muxmesh_core::HubConfig, from_hub: bool) {
-    let doc = if from_hub {
-        match fetch_hub_state(cfg) {
+/// Print host/session tree. Default reads the live hub (poll.hub); --local
+/// falls back to the local state file (for a hub running on this machine).
+fn tree(cfg: &muxmesh_core::HubConfig, from_local: bool) {
+    let doc = if from_local {
+        poll::read_state(&cfg.state_path)
+    } else {
+        match fetch_hub_state(&cfg.poll_hub) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("muxmesh-cli tree: hub unreachable: {e}");
                 process::exit(1);
             }
         }
-    } else {
-        poll::read_state(&cfg.state_path)
     };
     let now = muxmesh_core::now_unix();
     if doc.hosts.is_empty() {
@@ -78,34 +81,42 @@ fn tree(cfg: &muxmesh_core::HubConfig, from_hub: bool) {
     }
 }
 
-/// GET /state from the hub. Minimal HTTP/1.0 over std::net (no extra deps).
-fn fetch_hub_state(cfg: &muxmesh_core::HubConfig) -> Result<muxmesh_core::StateDoc, String> {
+/// GET /state from the hub (poll.hub, "host:port"). Minimal HTTP/1.0 over
+/// std::net (no extra deps). GET /state is open on the hub — no token needed.
+pub fn fetch_hub_state(hub_addr: &str) -> Result<muxmesh_core::StateDoc, String> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
 
-    // "host:port" -> split at the LAST colon (IPv6-safe enough for LAN use).
-    let (host, port) = cfg.bind.rsplit_once(':').unwrap_or(("127.0.0.1", "9997"));
-    let host = if host == "0.0.0.0" || host.is_empty() {
-        "127.0.0.1"
-    } else {
-        host
-    };
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("{addr}: {e}"))?;
+    let mut stream = TcpStream::connect(hub_addr).map_err(|e| format!("{hub_addr}: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
-    let token = muxmesh_core::read_token().as_str().to_string();
-    let req = format!("GET /state HTTP/1.0\r\nX-Muxmesh-Token: {token}\r\nHost: {addr}\r\n\r\n");
+    let req = format!("GET /state HTTP/1.0\r\nHost: {hub_addr}\r\n\r\n");
     stream
         .write_all(req.as_bytes())
         .map_err(|e| e.to_string())?;
+    // capped read (1 MiB): a misdirected poll.hub must not exhaust memory.
     let mut raw = String::new();
-    stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
-    let body = raw
+    {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            if raw.len() + n > 1_048_576 {
+                return Err("response over 1 MiB (wrong hub?)".into());
+            }
+            raw.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+    let (head, body) = raw
         .split_once("\r\n\r\n")
-        .map(|x| x.1)
         .ok_or_else(|| "malformed http response".to_string())?;
+    let status = head.lines().next().unwrap_or("");
+    if !(status.ends_with("200") || status.contains(" 200 ")) {
+        return Err(format!("hub returned: {status}"));
+    }
     muxmesh_core::StateDoc::from_json_str(body).map_err(|e| format!("bad state json: {e}"))
 }

@@ -19,7 +19,10 @@ tokens_path = "~/.muxmesh/tokens.json"
 #   muxmesh-hub generate-token <host>   (printed once, paste into agent's token file)
 
 [poll]
-# seconds between two poller passes (pgrep + state.json reads, zero network).
+# where the poller fetches live state ("host" or "host:port"). On a DRIVER
+# machine set this to the hub's LAN IP; default = hub.bind host (hub-local).
+# hub = "10.0.10.3:9997"
+# seconds between two poller passes (GET /state + pgrep/ps per window).
 interval = 2
 # freshness: an entry older than ttl (seconds) is considered offline.
 ttl = 30

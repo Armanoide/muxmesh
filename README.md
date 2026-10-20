@@ -26,8 +26,9 @@ on another machine — no interactive ssh, no credential-manager popups.
 - **Closed command list, encoded in the type**: commands are an externally-tagged
   serde enum (`muxmesh-core::Command`). Unknown verbs fail deserialization (400)
   before any execution. tmux is invoked via argv, never through a shell.
-- **Zero network on the read path**: agents push state to the hub; the status bar
-  reads a local file. No `ssh` per poll cycle, ever.
+- **Zero ssh on the read path**: agents push state to the hub over HTTP; the
+  poller badges windows from `GET /state` (open, no secrets) + local pgrep.
+  No `ssh` per poll cycle, ever.
 - **Shared token** (Atuin-like): `config.toml` is shareable and committed as a
   template; the token lives in `~/.config/muxmesh/token` (0600, gitignored).
   Constant-time comparison; missing token = reject everything.

@@ -1,4 +1,4 @@
-//! Badge poller: per-window arm/disarm of @muxmesh-armed-win.
+//! Badge poller: per-window arm/disarm of @muxmesh-armed-win + @muxmesh-status.
 //!
 //! Per window: find a live `ssh <host>` child of its panes (pgrep + ps, local,
 //! free), then check the state doc for an armed+fresh entry for that host.
@@ -10,6 +10,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -181,6 +182,7 @@ pub fn poll_once(base: &[String], doc: &StateDoc, ttl: u64) {
             continue;
         }
         let mut armed = false;
+        let mut armed_host = String::new();
         if let Some(pids) = pane_pids(base, wid) {
             for pid in pids {
                 if let Some(h) = pane_ssh_host(pid) {
@@ -191,6 +193,7 @@ pub fn poll_once(base: &[String], doc: &StateDoc, ttl: u64) {
                     }
                     if doc.host_armed(&h, now, ttl) {
                         armed = true;
+                        armed_host = h;
                         break;
                     }
                 }
@@ -201,10 +204,27 @@ pub fn poll_once(base: &[String], doc: &StateDoc, ttl: u64) {
                 base,
                 &["set-window-option", "-t", wid, "@muxmesh-armed-win", "1"],
             );
+            // Badge text for the theme to render (tmux-remote model): the poller
+            // never touches status-left, it fills @muxmesh-status and the operator
+            // places it. Validated host (valid_host above) -> safe to interpolate.
+            run_tmux(
+                base,
+                &[
+                    "set-window-option",
+                    "-t",
+                    wid,
+                    "@muxmesh-status",
+                    &format!(" REMOTE {armed_host} "),
+                ],
+            );
         } else {
             run_tmux(
                 base,
                 &["set-window-option", "-t", wid, "-u", "@muxmesh-armed-win"],
+            );
+            run_tmux(
+                base,
+                &["set-window-option", "-t", wid, "-u", "@muxmesh-status"],
             );
         }
     }
@@ -217,15 +237,48 @@ pub fn run(cfg: &HubConfig) {
         .filter(|s| !s.is_empty());
     let base = tmux_base(&socket);
     eprintln!(
-        "muxmesh-cli poll: interval={}s ttl={}s state={} (0 network)",
-        cfg.interval,
-        cfg.ttl,
-        cfg.state_path.display()
+        "muxmesh-cli poll: interval={}s ttl={}s hub={}",
+        cfg.interval, cfg.ttl, cfg.poll_hub
     );
+    if cfg.poll_hub.starts_with("127.0.0.1") || cfg.poll_hub.starts_with("localhost") {
+        eprintln!("muxmesh-cli poll: hub is loopback — on a driver machine set poll.hub = \"<hub-ip>:9997\" (or MUXMESH_POLL_HUB) to badge remote hosts.");
+    }
     loop {
-        let doc = read_state(&cfg.state_path);
+        let doc = fetch_state(&cfg.poll_hub);
         poll_once(&base, &doc, cfg.ttl);
         thread::sleep(Duration::from_secs(cfg.interval));
+    }
+}
+
+/// One-shot pass for tests and `poll --once` (no loop).
+pub fn run_once(cfg: &HubConfig) {
+    let socket = std::env::var("MUXMESH_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let base = tmux_base(&socket);
+    let doc = fetch_state(&cfg.poll_hub);
+    poll_once(&base, &doc, cfg.ttl);
+}
+
+/// Live state from the hub. A driver machine has no local state.json — the
+/// hub is the source of truth. On unreachable/corrupt, returns the empty doc
+/// (windows disarm after ttl anyway; a flaky hub must not panic the poller).
+pub fn fetch_state(hub_addr: &str) -> StateDoc {
+    match crate::fetch_hub_state(hub_addr) {
+        Ok(d) => d,
+        Err(e) => {
+            // dedupe: log the first failure and every 15th (~30s at 2s poll)
+            // so a down hub doesn't spam stderr under launchd KeepAlive.
+            static FAILS: AtomicU64 = AtomicU64::new(0);
+            let n = FAILS.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(15) {
+                eprintln!(
+                    "muxmesh-cli poll: hub {hub_addr}: {e} (empty state this cycle, #{})",
+                    n + 1
+                );
+            }
+            StateDoc::default()
+        }
     }
 }
 

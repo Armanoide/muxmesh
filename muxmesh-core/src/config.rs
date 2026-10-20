@@ -15,6 +15,11 @@ use std::path::PathBuf;
 pub struct HubConfig {
     pub bind: String,
     pub state_path: PathBuf,
+    /// Hub address the poller reads live state from ("host:port"). On a
+    /// driver machine there is no local state.json — the hub is the source.
+    /// Defaults to hub.bind; set poll.hub for a remote hub (e.g. the LAN IP
+    /// of the pivot). Env: MUXMESH_POLL_HUB.
+    pub poll_hub: String,
     pub ttl: u64,
     pub interval: u64,
     /// Path of the per-machine token registry (tokens.json, digests only).
@@ -135,6 +140,25 @@ fn pick(
     map.get(key).cloned().unwrap_or_else(|| default.to_string())
 }
 
+/// "host" or "host:port" -> "host:port". Bare IPv6 ("::1") is bracketed so
+/// the appended port stays parseable; bracketed input passes through.
+fn normalize_addr(host: &str, default_port: &str) -> String {
+    let h = host.trim();
+    // already "host:port" (v6 bracketed, or v4/host with exactly one colon)
+    if h.starts_with('[') {
+        return h.to_string();
+    }
+    let colons = h.chars().filter(|c| *c == ':').count();
+    if colons == 0 {
+        format!("{h}:{default_port}")
+    } else if colons == 1 {
+        h.to_string()
+    } else {
+        // bare IPv6 -> bracket + port
+        format!("[{h}]:{default_port}")
+    }
+}
+
 impl HubConfig {
     pub fn load() -> Self {
         let m = load_map();
@@ -157,9 +181,22 @@ impl HubConfig {
             "hub.tokens_path",
             "~/.muxmesh/tokens.json",
         ));
+        // poll.hub: where the poller fetches state ("host" or "host:port").
+        // Default = bind host so a hub-local poller needs no config; a driver
+        // sets it to the hub's LAN IP. Bare IPv6 gets bracketed at use time.
+        let bind_host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+        let bind_host = if bind_host == "0.0.0.0" || bind_host.is_empty() {
+            "127.0.0.1"
+        } else {
+            bind_host
+        };
+        let bind_port = bind.rsplit_once(':').map(|(_, p)| p).unwrap_or("9997");
+        let poll_hub_raw = pick("MUXMESH_POLL_HUB", &m, "poll.hub", bind_host);
+        let poll_hub = normalize_addr(&poll_hub_raw, bind_port);
         Self {
             bind,
             state_path,
+            poll_hub,
             ttl,
             interval,
             tokens_path,
