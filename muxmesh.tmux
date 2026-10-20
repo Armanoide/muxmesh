@@ -8,9 +8,10 @@
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# PATH: the tmux server's run-shell does not read shell rc files; make the
-# plugin's bin/ (and Homebrew on macOS) visible to every run-shell it spawns.
-tmux set-environment -g PATH "$CURRENT_DIR/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# PATH: the tmux server's run-shell does not read shell rc files; its PATH is
+# frozen at server start, so /usr/local/bin (where `just install` puts the
+# binaries) may be missing -> F10 127. Inject it explicitly, here and now.
+tmux set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:$PATH"
 
 # F10: one-bar toggle against the armed remote host (Rust decides everything).
 tmux bind-key -n F10 run-shell "muxmesh-cli bar-toggle"
