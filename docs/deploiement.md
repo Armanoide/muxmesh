@@ -61,6 +61,32 @@ systemctl enable --now muxmesh-hub   # une seule fois, puis oublié
 1. **Premier déploiement par machine** : copier le binaire + config + token (ou `register`, voir note de design à venir).
 2. Debug ponctuel : lancer un composant à la main pour lire ses logs.
 
+## Design retenu pour `register` (calqué sur dockhand/hawser, adapté)
+
+Lecture du code de `Finsys/dockhand` (collector Go + serveur SvelteKit) : chaque
+agent edge a **son** token (`hw_…`, 32 octets aléatoires) ; le serveur ne stocke
+que **le hash Argon2id + les 8 premiers caractères** (lookup O(1) par préfixe,
+une seule vérif au lieu de N) ; régénérer un token **ferme la connexion live et
+révoque les anciens** du même environnement — une machine compromise se remplace
+en un clic, l'usurpateur reste dehors.
+
+Adaptation muxmesh (hub = fichier, pas de DB) :
+
+```
+agent neuf                    hub
+  │ POST /register {host}       (X-Muxmesh-Pair: <clé d'appariement>)
+  │◄── 201 {agent_token}        hub génère 32 octets, stocke hash+préfixe
+  │ écrit ~/.config/muxmesh/token (0600), démarre le push normal
+```
+
+- `tokens.json` côté hub : `{host: {prefix, hash, created}}` — jamais le token en clair.
+- Clé d'appariement : une chaîne que tu colles une fois par machine (dans le
+  `config.toml`, champ `pair = "…"`), révoquable en changeant le fichier du hub.
+- `/cmd` : le driver passe **par le hub** (le hub authentifie le driver, relaie
+  avec le token de la cible) → les ports 9998 des agents peuvent fermer au LAN.
+- Révocation : `hub revoke <host>` = efface l'entrée → l'agent reçoit 401 et
+  s'arrête proprement, les autres machines intactes.
+
 ## Statut de cette règle
 
 - ✅ plists hub/agent/poll écrits (RunAtLoad+KeepAlive)
