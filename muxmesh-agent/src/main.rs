@@ -155,23 +155,34 @@ fn main() {
         thread::spawn(move || serve_cmd(&cmd_cfg));
     }
 
+    // heartbeat: debug per cycle (quiet at default INFO); WARN on push failure;
+    // INFO only when armed/sessions state CHANGES — a running agent must not
+    // spam the pane it lives in.
+    let mut last = (false, usize::MAX);
     loop {
         let token = muxmesh_core::read_token().as_str().to_string();
         let state = build_state(&cfg.host);
         let ok = push(&url, &cfg.host, &token, &state);
-        if ok {
-            tracing::info!(
-                "armed={} sessions={} push=ok",
-                state.armed,
-                state.sessions.len()
-            );
-        } else {
+        tracing::debug!(
+            "armed={} sessions={} push={}",
+            state.armed,
+            state.sessions.len(),
+            if ok { "ok" } else { "FAIL" }
+        );
+        if !ok {
             tracing::warn!(
                 "armed={} sessions={} push=FAIL",
                 state.armed,
                 state.sessions.len()
             );
+        } else if (state.armed, state.sessions.len()) != last {
+            tracing::info!(
+                "armed={} sessions={} push=ok",
+                state.armed,
+                state.sessions.len()
+            );
         }
+        last = (state.armed, state.sessions.len());
         thread::sleep(Duration::from_secs(cfg.interval));
     }
 }

@@ -154,7 +154,7 @@ pub fn tmux_out(base: &[String], args: &[&str]) -> Option<String> {
 /// Pane pids of a window, or None if the query itself failed.
 /// Distinguishes "no panes" (Some(empty)) from "tmux broken" (None) so a
 /// transient failure never silently disarms windows.
-fn pane_pids(base: &[String], wid: &str) -> Option<Vec<u32>> {
+pub fn pane_pids(base: &[String], wid: &str) -> Option<Vec<u32>> {
     let out = tmux_out(base, &["list-panes", "-t", wid, "-F", "#{pane_pid}"])?;
     Some(out.lines().filter_map(|l| l.trim().parse().ok()).collect())
 }
