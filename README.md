@@ -80,9 +80,10 @@ set -g @plugin 'Armanoide/muxmesh'
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
-The root [`muxmesh.tmux.conf`](muxmesh.tmux.conf) is the tpm entry hook; it
-forwards to [`misc/muxmesh.tmux.conf`](misc/muxmesh.tmux.conf) (the repo root
-belongs to Cargo). Without tpm, source `misc/muxmesh.tmux.conf` directly.
+The root [`muxmesh.tmux.conf`](muxmesh.tmux.conf) is the whole plugin: it
+puts `bin/` (a launcher for the release binary) on tmux's PATH and binds
+F10 to `muxmesh-cli bar-toggle` — all toggle logic (armed detection,
+hidden state, BarHide/BarShow) lives in Rust, not in tmux conditionals.
 F10 needs `muxmesh-cli` on PATH; the badge poller runs embedded in muxmesh-hub/muxmesh-agent (no separate service).
 **F10** toggles the remote status bar (one-bar protocol, ported from the tmux-remote fork): armed window -> `BarHide` on the remote (its bar goes off, yours stays), press again -> `BarShow`. Inert on non-armed windows. New window / new session stay native (`prefix + c` / `prefix + s` pass through the ssh straight into the remote tmux).
 

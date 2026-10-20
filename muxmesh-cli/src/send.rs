@@ -92,10 +92,43 @@ fn now_ts() -> u64 {
 }
 
 /// `muxmesh-cli armed-host` — print the remote host of the CURRENT tmux
-/// window if a live `ssh <host>` sits in it AND <host> is armed+fresh in the
-/// state doc. Exit 1 otherwise. This is what F8/F9/F10 call to pick the
-/// target machine of `send`.
+/// window if a live `ssh <host>` sits in it AND <host> is armed+fresh on the
+/// hub. Exit 1 otherwise. This is what F8/F9 call to pick the send target.
 pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
+    match armed_host_of_current_window(cfg) {
+        Some(h) => {
+            println!("{h}");
+            0
+        }
+        None => 1,
+    }
+}
+
+/// The armed remote host of the current window, if any. Detection is live
+/// (pgrep walk + hub state), NOT the @muxmesh-armed-win badge option — the
+/// badge is display-only; the decision always re-runs in Rust.
+fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String> {
+    let socket = std::env::var("MUXMESH_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let base = muxmesh_core::poll::tmux_base(&socket);
+    let wid = muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
+    let wid = wid.trim().to_string();
+    let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
+    let h = muxmesh_core::poll::window_ssh_host(&base, &wid)?;
+    if muxmesh_core::valid_host(&h) && doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
+        Some(h)
+    } else {
+        None
+    }
+}
+
+/// `muxmesh-cli bar-toggle` — the whole F10 logic, no if-shell in tmux.
+/// Finds the armed host of the current window (live detection), keeps the
+/// hidden/shown state in a per-window tmux user option (@muxmesh-bar-hidden,
+/// written/read via tmux show/set-window-option — the state lives in the
+/// tmux server, Rust is just the brain), and POSTs BarHide or BarShow.
+pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -104,16 +137,67 @@ pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
         Some(o) => o.trim().to_string(),
         None => return 1,
     };
-    let doc = muxmesh_core::poll::read_state(&cfg.state_path);
-    match muxmesh_core::poll::window_ssh_host(&base, &wid) {
-        Some(h)
-            if muxmesh_core::valid_host(&h)
-                && doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) =>
-        {
-            println!("{h}");
+    let host = match armed_host_of_current_window(cfg) {
+        Some(h) => h,
+        None => {
+            eprintln!("muxmesh: no armed window");
+            return 1;
+        }
+    };
+
+    // hidden-state: read the window option (empty => shown)
+    let hidden_now = muxmesh_core::poll::tmux_out(
+        &base,
+        &["show-window-option", "-t", &wid, "@muxmesh-bar-hidden"],
+    )
+    .map(|o| o.ends_with("on"))
+    .unwrap_or(false);
+
+    let (cmd, next) = if hidden_now {
+        (Command::BarShow, "on")
+    } else {
+        (Command::BarHide, "off")
+    };
+
+    let port: u16 = std::env::var("MUXMESH_CMD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9998);
+    let token = muxmesh_core::read_token().as_str().to_string();
+    let env = CommandEnvelope {
+        v: 1,
+        id: format!("c-{}", now_ts()),
+        src: hostname_short(),
+        cmd,
+        ts: now_ts(),
+    };
+    match send_cmd(&host, port, &token, &env) {
+        Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
+            // persist the new state on the window (survives across presses)
+            muxmesh_core::poll::run_tmux(
+                &base,
+                &[
+                    "set-window-option",
+                    "-t",
+                    &wid,
+                    "@muxmesh-bar-hidden",
+                    if next == "off" { "on" } else { "off" },
+                ],
+            );
+            println!("muxmesh: bar {next} on {host}");
             0
         }
-        _ => 1,
+        Ok(resp) => {
+            eprintln!(
+                "muxmesh-cli bar-toggle: agent replied: {}",
+                resp.lines().next().unwrap_or("")
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("muxmesh-cli bar-toggle: {host}:{port}: {e}");
+            1
+        }
     }
 }
 

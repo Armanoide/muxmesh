@@ -124,7 +124,7 @@ pub fn tmux_base(socket: &Option<String>) -> Vec<String> {
     }
 }
 
-fn run_tmux(base: &[String], args: &[&str]) {
+pub fn run_tmux(base: &[String], args: &[&str]) {
     let mut cmd = Command::new(&base[0]);
     cmd.args(&base[1..]).args(args);
     let _ = cmd.output();

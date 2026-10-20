@@ -28,8 +28,9 @@ fn main() {
         "tree" => tree(&cfg, args.iter().any(|a| a == "--local")),
         "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
+        "bar-toggle" => std::process::exit(send::run_bar_toggle(&cfg) as i32),
         other => {
-            eprintln!("muxmesh-cli: unknown subcommand '{other}' (expected: poll | tree | send | armed-host)");
+            eprintln!("muxmesh-cli: unknown subcommand '{other}' (expected: poll | tree | send | armed-host | bar-toggle)");
             process::exit(2);
         }
     }
