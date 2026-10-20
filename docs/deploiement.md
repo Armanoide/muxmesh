@@ -97,3 +97,21 @@ mm_9f3a…(43 car., affiché UNE SEULE FOIS)
 
 - ✅ plists hub/agent/poll écrits (RunAtLoad+KeepAlive)
 - ❌ **manque** : installation launchd jamais faite sur tes machines (c'est toi qui appliques)
+
+## Pare-feu macOS — le piège du port 9997 (symptôme réel)
+
+`muxmesh-agent: push=ok` sur le client alors que `state.json` du hub reste
+vide, et `curl http://<lan-ip>:9997/state` qui **expire** même depuis le
+pivot lui-même (alors que `127.0.0.1:9997` répond) : c'est le **pare-feu
+macOS** qui drop silencieusement le port entrant. Le firewall application
+peut être affiché « disabled » et filtrer quand même une règle résiduelle.
+
+Diagnostic en 3 commandes (depuis le pivot) :
+```bash
+curl -s --max-time 3 http://127.0.0.1:9997/state   # répond -> hub vivant
+curl -s --max-time 3 http://<lan-ip>:9997/state     # expire -> filtrage LAN
+/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+```
+Fix : autoriser le port (ou le binaire) dans Pare-feu → Options, ou
+`sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add <binaire>` puis
+relancer le hub. Ne jamais couper le pare-feu pour faire passer un test.
