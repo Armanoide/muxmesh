@@ -187,13 +187,17 @@ fn handle(
         if !valid_host(host) {
             return respond(&mut stream, 400, "invalid host name\n");
         }
+        // M3: issue + snapshot + persist in ONE critical section, so a
+        // concurrent register/revoke can never write a ledger that omits
+        // the token we just handed out.
         let token = {
             let mut st = store
                 .lock()
                 .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-            st.issue(host)?
+            let token = st.issue(host)?;
+            persist_tokens_locked(tokpath, lock, &st)?;
+            token
         };
-        persist_tokens(tokpath, lock, store)?;
         eprintln!("muxmesh-hub: registered host {host}");
         return respond_json(&mut stream, 201, &serde_json::json!({"token": token}));
     }
@@ -209,13 +213,19 @@ fn handle(
     // bad token => 401 (pair first with POST /register).
     let host_hdr = header_host.unwrap_or_default();
     let got_token = header_token.unwrap_or_default();
-    {
-        let st = store
-            .lock()
-            .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-        if !st.verify(&host_hdr, &got_token) {
-            return respond(&mut stream, 401, "unauthorized\n");
-        }
+    // M1: clone the record out of the lock, then run the KDF OUTSIDE it —
+    // otherwise every authenticated push serializes behind 100k sha256 rounds.
+    let rec = store
+        .lock()
+        .map_err(|e| std::io::Error::other(format!("lock: {e}")))?
+        .hosts
+        .get(&host_hdr)
+        .cloned();
+    match rec {
+        Some(r)
+            if got_token.len() >= muxmesh_core::PREFIX_LEN
+                && muxmesh_core::verify_token(&got_token, &r.hash) => {}
+        _ => return respond(&mut stream, 401, "unauthorized\n"),
     }
 
     if method != "POST" || !target.starts_with("/state") {
@@ -276,13 +286,12 @@ fn handle(
     respond(&mut stream, 200, "ok\n")
 }
 
-/// Persist tokens.json atomically (tmp + rename), serialized by `lock`.
-fn persist_tokens(path: &Path, lock: &Mutex<()>, store: &Mutex<TokenStore>) -> std::io::Result<()> {
-    let json = store
-        .lock()
-        .unwrap()
-        .to_json_pretty()
-        .map_err(std::io::Error::other)?;
+/// Persist tokens.json atomically (tmp + rename). Caller must already hold the
+/// store lock (M3: snapshot + write in one critical section); `lock` only
+/// serializes file writers. M2: no unwrap on the store lock — that happens in
+/// the caller now; here we only take the file lock with map_err discipline.
+fn persist_tokens_locked(path: &Path, lock: &Mutex<()>, store: &TokenStore) -> std::io::Result<()> {
+    let json = store.to_json_pretty().map_err(std::io::Error::other)?;
     let _g = lock
         .lock()
         .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
