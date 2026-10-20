@@ -233,6 +233,26 @@ fn respond_json(
     muxmesh_core::httpd::respond(stream, code, "application/json", &body)
 }
 
+/// Resolve the tmux socket the agent controls: the configured one, or ""
+/// meaning "default". A stale/default socket that does not exist on disk is
+/// resolved to the live one (`tmux display -p '#{socket_path}'`) — macOS
+/// sockets live in a per-user /tmp/claude-<uid>/ style dir that changes
+/// between sessions, so a literal "default" often 404s while tmux itself
+/// knows where its socket is.
+fn resolve_socket(cfg: &muxmesh_core::AgentConfig) -> String {
+    if !cfg.tmux_socket.is_empty() && std::path::Path::new(&cfg.tmux_socket).exists() {
+        return cfg.tmux_socket.clone();
+    }
+    std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{socket_path}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.tmux_socket.clone())
+}
+
 fn handle_cmd(
     stream: &mut std::net::TcpStream,
     cfg: &muxmesh_core::AgentConfig,
@@ -272,12 +292,10 @@ fn handle_cmd(
         return respond_json(stream, 400, &Ack::err(env.v, &env.id, "invalid args"));
     }
 
-    let socket = if cfg.tmux_socket.is_empty() {
-        "default"
-    } else {
-        &cfg.tmux_socket
-    };
-    match env.cmd.execute(socket) {
+    // "" => resolve the live socket (see resolve_socket); a literal "default"
+    // fails when tmux runs from a per-user socket dir macOS rotates.
+    let socket = resolve_socket(cfg);
+    match env.cmd.execute(&socket) {
         Ok(()) => respond_json(stream, 200, &Ack::ok(env.v, &env.id)),
         Err(e) => respond_json(stream, 200, &Ack::err(env.v, &env.id, &e)),
     }
