@@ -115,10 +115,25 @@ fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String>
     let wid = muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
     let wid = wid.trim().to_string();
     let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
-    let h = muxmesh_core::poll::window_ssh_host(&base, &wid)?;
-    if muxmesh_core::valid_host(&h) && doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
+    let h = match muxmesh_core::poll::window_ssh_host(&base, &wid) {
+        Some(h) => h,
+        None => {
+            tracing::debug!("window {wid}: no live ssh client found in its panes");
+            return None;
+        }
+    };
+    if !muxmesh_core::valid_host(&h) {
+        tracing::debug!("window {wid}: ssh target '{h}' rejected by valid_host");
+        return None;
+    }
+    if doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
         Some(h)
     } else {
+        let known: Vec<&String> = doc.hosts.keys().collect();
+        tracing::debug!(
+            "ssh target '{h}' not armed on hub (known hosts: {known:?}; hub={})",
+            cfg.poll_hub
+        );
         None
     }
 }
