@@ -137,15 +137,15 @@ pub fn tmux_out(base: &[String], args: &[&str]) -> Option<String> {
     match cmd.output() {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
         Ok(o) => {
-            eprintln!(
-                "muxmesh-cli poll: tmux {:?} failed: {}",
+            tracing::debug!(
+                "tmux {:?} failed: {}",
                 args,
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             None
         }
         Err(e) => {
-            eprintln!("muxmesh-cli poll: spawn tmux: {e}");
+            tracing::debug!("spawn tmux: {e}");
             None
         }
     }
@@ -238,12 +238,9 @@ pub fn run(cfg: &HubConfig) {
         .ok()
         .filter(|s| !s.is_empty());
     let base = tmux_base(&socket);
-    eprintln!(
-        "muxmesh poll: interval={}s ttl={}s hub={}",
-        cfg.interval, cfg.ttl, cfg.poll_hub
-    );
+    tracing::info!(interval = cfg.interval, ttl = cfg.ttl, hub = %cfg.poll_hub, "badge poller started");
     if cfg.poll_hub.starts_with("127.0.0.1") || cfg.poll_hub.starts_with("localhost") {
-        eprintln!("muxmesh poll: hub is loopback — on a driver machine set poll.hub = \"<hub-ip>:9997\" (or MUXMESH_POLL_HUB) to badge remote hosts.");
+        tracing::warn!("hub is loopback — on a driver machine set poll.hub = \"<hub-ip>:9997\" (or MUXMESH_POLL_HUB) to badge remote hosts");
     }
     loop {
         let doc = fetch_state(&cfg.poll_hub);
@@ -256,10 +253,7 @@ pub fn run(cfg: &HubConfig) {
 /// no local tmux server (the hub), poll_once is inert and fetch_state only
 /// logs a deduped line every ~30s; that is the expected steady state there.
 pub fn run_embedded(cfg: &HubConfig) {
-    eprintln!(
-        "muxmesh poll: embedded badge poller started (hub={})",
-        cfg.poll_hub
-    );
+    tracing::info!(hub = %cfg.poll_hub, "embedded badge poller started");
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -294,10 +288,7 @@ pub fn fetch_state(hub_addr: &str) -> StateDoc {
             static FAILS: AtomicU64 = AtomicU64::new(0);
             let n = FAILS.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(15) {
-                eprintln!(
-                    "muxmesh poll: hub {hub_addr}: {e} (empty state this cycle, #{})",
-                    n + 1
-                );
+                tracing::warn!("hub {hub_addr}: {e} (empty state this cycle, #{})", n + 1);
             }
             StateDoc::default()
         }

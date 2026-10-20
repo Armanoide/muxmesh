@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod httpd;
 pub mod identity;
+pub mod logger;
 pub mod poll;
 pub mod state;
 

@@ -48,12 +48,15 @@ impl Drop for Permit {
 
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
+    let args = muxmesh_core::logger::parse_verbose_flag(&args);
+    muxmesh_core::logger::init_tracing();
     let cfg = HubConfig::load();
 
     // Console mode (herdr-style `add machine`): mint a token for a host,
     // print it ONCE, exit. No server, no network. The operator pastes the
     // output on the agent machine; the hub is then standby for its pushes.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|s| s.as_str()) == Some("generate-token") {
         generate_token(&cfg, &args[1..]); // diverges (process::exit)
     }
@@ -62,10 +65,7 @@ fn main() {
     let tokens_path = cfg.tokens_path.clone();
     let store: Arc<Mutex<TokenStore>> = Arc::new(Mutex::new(TokenStore::load(&tokens_path)));
     if store.lock().unwrap().hosts.is_empty() {
-        eprintln!(
-            "muxmesh-hub: no registered hosts in {} -> every /state POST is 401 until you mint one: muxmesh-hub generate-token <host>",
-            tokens_path.display()
-        );
+        tracing::warn!("no registered hosts in {} -> every /state POST is 401 until you mint one: muxmesh-hub generate-token <host>", tokens_path.display());
     }
 
     // Embedded badge poller: tmux windows on THIS machine get the
@@ -81,18 +81,18 @@ fn main() {
 
     // purge once at startup (expired entries disappear from the file)
     if let Err(e) = purge_and_write(&state_path, cfg.ttl) {
-        eprintln!("muxmesh-hub: initial purge failed: {e}");
+        tracing::error!("initial purge failed: {e}");
     }
 
     let listener = match TcpListener::bind(&bind) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("muxmesh-hub: bind {bind} failed: {e}");
+            tracing::error!("bind {bind} failed: {e}");
             process::exit(1);
         }
     };
-    eprintln!(
-        "muxmesh-hub: listening on {bind} -> {} (tokens: {})",
+    tracing::info!(
+        "listening on {bind} -> {} (tokens: {})",
         state_path.display(),
         tokens_path.display()
     );
@@ -114,7 +114,7 @@ fn main() {
                         thread::spawn(move || {
                             let _permit = permit; // released when the handler returns
                             if let Err(e) = handle(stream, peer, &path, &lock, &store) {
-                                eprintln!("muxmesh-hub: {peer}: {e}");
+                                tracing::error!("{peer}: {e}");
                             }
                         });
                     }
@@ -123,7 +123,7 @@ fn main() {
                     }
                 }
             }
-            Err(e) => eprintln!("muxmesh-hub: accept: {e}"),
+            Err(e) => tracing::error!("accept: {e}"),
         }
     }
 }
@@ -195,7 +195,7 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn handle(
     mut stream: TcpStream,
-    _peer: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
     path: &Path,
     lock: &Mutex<()>,
     store: &Mutex<TokenStore>,
@@ -236,6 +236,7 @@ fn handle(
     // the state holds no secrets); writes require a registered machine token.
     if method == "GET" && target.starts_with("/state") {
         let body = fs::read_to_string(path).unwrap_or_else(|_| "{\"hosts\":{}}".into());
+        tracing::debug!("{peer} GET /state ({} bytes)", body.len());
         return respond(&mut stream, 200, &body);
     }
 
@@ -244,6 +245,7 @@ fn handle(
     // generate-token <host>` on the pivot — there is NO registration endpoint:
     // an unregistered machine cannot introduce itself to the hub at all.
     if method != "POST" || !target.starts_with("/state") {
+        tracing::debug!("{peer} {method} {target} -> 404");
         return respond(&mut stream, 404, "not found\n");
     }
     let host_hdr = header_host.unwrap_or_default();
@@ -259,8 +261,17 @@ fn handle(
     match rec {
         Some(r)
             if got_token.len() >= muxmesh_core::PREFIX_LEN
-                && muxmesh_core::verify_token(&got_token, &r.hash) => {}
-        _ => return respond(&mut stream, 401, "unauthorized\n"),
+                && muxmesh_core::verify_token(&got_token, &r.hash) =>
+        {
+            tracing::debug!("{peer} POST /state host={host_hdr} auth=ok");
+        }
+        _ => {
+            tracing::warn!(
+                "{peer} POST /state host={host_hdr} auth=FAIL (registered: {})",
+                store.lock().map(|s| s.hosts.len()).unwrap_or(0)
+            );
+            return respond(&mut stream, 401, "unauthorized\n");
+        }
     }
 
     // body capped (1 MiB): an agent sends a few KB, beyond that = abuse
@@ -314,6 +325,15 @@ fn handle(
     doc.hosts.insert(host_key.clone(), state);
     write_atomic(path, &doc)?;
 
+    tracing::debug!(
+        "state updated host={host_key} armed={} sessions={} -> {}",
+        doc.hosts.get(&host_key).map(|h| h.armed).unwrap_or(false),
+        doc.hosts
+            .get(&host_key)
+            .map(|h| h.sessions.len())
+            .unwrap_or(0),
+        path.display()
+    );
     respond(&mut stream, 200, "ok\n")
 }
 

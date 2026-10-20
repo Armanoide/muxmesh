@@ -140,12 +140,13 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     let host = match armed_host_of_current_window(cfg) {
         Some(h) => h,
         None => {
-            eprintln!("muxmesh: no armed window");
+            tracing::info!("no armed window (no live ssh to an armed host here)");
             return 1;
         }
     };
 
     // hidden-state: read the window option (empty => shown)
+    tracing::debug!("bar-toggle: armed host={host}");
     let hidden_now = muxmesh_core::poll::tmux_out(
         &base,
         &["show-window-option", "-t", &wid, "@muxmesh-bar-hidden"],
@@ -173,6 +174,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     };
     match send_cmd(&host, port, &token, &env) {
         Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
+            tracing::debug!("bar-toggle: agent ack, state -> {}", next);
             // persist the new state on the window (survives across presses)
             muxmesh_core::poll::run_tmux(
                 &base,

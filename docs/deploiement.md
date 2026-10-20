@@ -115,3 +115,19 @@ curl -s --max-time 3 http://<lan-ip>:9997/state     # expire -> filtrage LAN
 Fix : autoriser le port (ou le binaire) dans Pare-feu → Options, ou
 `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add <binaire>` puis
 relancer le hub. Ne jamais couper le pare-feu pour faire passer un test.
+
+## Logs et verbosité (pattern lm-sanaga)
+
+Niveaux `tracing` : ERROR / WARN / INFO (défaut) / DEBUG.
+- Sans option : uniquement l’essentiel (démarrage, `push=ok`, erreurs).
+- `-v` ou `--verbose` (hub, agent, cli) : équivalent `RUST_LOG=muxmesh=debug`
+  — chaque requête GET/POST /state, chaque décision bar-toggle, chaque appel tmux raté.
+- `MUXMESH_DEBUG=true` : debug global sans toucher aux args (pratique sous launchd).
+- `RUST_LOG` explicite gagne toujours (`RUST_LOG=muxmesh_hub=trace,...`).
+
+Exemples :
+```bash
+muxmesh-hub -v            # trace toutes les requetes sur le pivot
+MUXMESH_DEBUG=true muxmesh-agent
+RUST_LOG=muxmesh_cli=debug muxmesh-cli bar-toggle   # pourquoi F10 ne fait rien ?
+```

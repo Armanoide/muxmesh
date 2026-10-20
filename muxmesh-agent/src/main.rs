@@ -88,15 +88,24 @@ fn active_window(session: &str) -> String {
 fn push(url: &str, host: &str, token: &str, state: &HostState) -> bool {
     let body = match serde_json::to_vec(state) {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(e) => {
+            tracing::error!("serialize state: {e}");
+            return false;
+        }
     };
     match ureq::post(url)
         .set("X-Muxmesh-Host", host)
         .set("X-Muxmesh-Token", token)
         .send_bytes(&body)
     {
-        Ok(resp) => resp.status() < 300,
-        Err(_) => false,
+        Ok(resp) => {
+            tracing::debug!("POST {url} -> {}", resp.status());
+            resp.status() < 300
+        }
+        Err(e) => {
+            tracing::warn!("POST {url} -> error {e}");
+            false
+        }
     }
 }
 
@@ -113,6 +122,10 @@ fn build_state(host: &str) -> HostState {
 
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default. Token = separate file.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
+    let _args = muxmesh_core::logger::parse_verbose_flag(&args);
+    muxmesh_core::logger::init_tracing();
     let cfg = muxmesh_core::AgentConfig::load();
     let url = cfg.url();
 
@@ -121,12 +134,9 @@ fn main() {
     // The file is re-read every push, so pasting (or rotating) it takes
     // effect without restarting the agent. Absent => 401s, with a hint.
     if muxmesh_core::read_token().as_str().is_empty() {
-        eprintln!("muxmesh-agent: WARNING no token (~/.config/muxmesh/token) -> the hub will reject (401). Mint one: muxmesh-hub generate-token {}", cfg.host);
+        tracing::warn!("no token (~/.config/muxmesh/token) -> the hub will reject (401). Mint one: muxmesh-hub generate-token {}", cfg.host);
     }
-    eprintln!(
-        "muxmesh-agent: host={} -> {url} (interval {}s)",
-        cfg.host, cfg.interval
-    );
+    tracing::info!("host={} -> {url} (interval {}s)", cfg.host, cfg.interval);
 
     // Embedded badge poller: the agent's own machine gets @muxmesh-status
     // badges automatically (same thread pattern as /cmd below). It targets
@@ -149,12 +159,19 @@ fn main() {
         let token = muxmesh_core::read_token().as_str().to_string();
         let state = build_state(&cfg.host);
         let ok = push(&url, &cfg.host, &token, &state);
-        eprintln!(
-            "muxmesh-agent: armed={} sessions={} push={}",
-            state.armed,
-            state.sessions.len(),
-            if ok { "ok" } else { "FAIL" }
-        );
+        if ok {
+            tracing::info!(
+                "armed={} sessions={} push=ok",
+                state.armed,
+                state.sessions.len()
+            );
+        } else {
+            tracing::warn!(
+                "armed={} sessions={} push=FAIL",
+                state.armed,
+                state.sessions.len()
+            );
+        }
         thread::sleep(Duration::from_secs(cfg.interval));
     }
 }
@@ -168,14 +185,11 @@ fn serve_cmd(cfg: &muxmesh_core::AgentConfig) {
     let listener = match TcpListener::bind(&bind) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("muxmesh-agent: /cmd bind {bind} failed: {e}");
+            tracing::error!("/cmd bind {bind} failed: {e}");
             return;
         }
     };
-    eprintln!(
-        "muxmesh-agent: /cmd listening on {bind} (socket={:?})",
-        cfg.tmux_socket
-    );
+    tracing::info!("/cmd listening on {bind} (socket={:?})", cfg.tmux_socket);
 
     for stream in listener.incoming() {
         match stream {
@@ -189,11 +203,11 @@ fn serve_cmd(cfg: &muxmesh_core::AgentConfig) {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     if let Err(e) = handle_cmd(&mut stream, &cfg, &tok) {
-                        eprintln!("muxmesh-agent: /cmd: {e}");
+                        tracing::error!("/cmd: {e}");
                     }
                 });
             }
-            Err(e) => eprintln!("muxmesh-agent: /cmd accept: {e}"),
+            Err(e) => tracing::error!("/cmd accept: {e}"),
         }
     }
 }
@@ -219,7 +233,7 @@ fn handle_cmd(
     let req = match httpd::read_request(owned, 64 * 1024) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("muxmesh-agent: /cmd parse: {e}");
+            tracing::warn!("/cmd parse: {e}");
             return httpd::respond(stream, 400, "text/plain", b"bad request\n");
         }
     };

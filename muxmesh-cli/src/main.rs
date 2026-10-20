@@ -18,8 +18,11 @@ mod send;
 use std::process;
 
 fn main() {
-    let cfg = muxmesh_core::HubConfig::load();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
+    let args = muxmesh_core::logger::parse_verbose_flag(&args);
+    muxmesh_core::logger::init_tracing();
+    let cfg = muxmesh_core::HubConfig::load();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("poll");
 
     match cmd {
@@ -30,7 +33,8 @@ fn main() {
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
         "bar-toggle" => std::process::exit(send::run_bar_toggle(&cfg) as i32),
         other => {
-            eprintln!("muxmesh-cli: unknown subcommand '{other}' (expected: poll | tree | send | armed-host | bar-toggle)");
+            let _ = other;
+            eprintln!("usage: muxmesh-cli [-v] poll [--once] | tree [--local] | send <host> <cmd> | armed-host | bar-toggle");
             process::exit(2);
         }
     }
@@ -45,7 +49,7 @@ fn tree(cfg: &muxmesh_core::HubConfig, from_local: bool) {
         match muxmesh_core::poll::fetch_hub_state(&cfg.poll_hub) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("muxmesh-cli tree: hub unreachable: {e}");
+                tracing::error!("tree: hub unreachable: {e}");
                 process::exit(1);
             }
         }
