@@ -14,7 +14,6 @@
 
 mod poll;
 mod send;
-mod start;
 
 use std::process;
 
@@ -25,7 +24,7 @@ fn main() {
 
     match cmd {
         "poll" => poll::run(&cfg),
-        "start" => process::exit(start::run_start() as i32),        "tree" => tree(&cfg, args.iter().any(|a| a == "--hub")),
+        "tree" => tree(&cfg, args.iter().any(|a| a == "--hub")),
         "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
         other => {
