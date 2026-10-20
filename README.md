@@ -65,13 +65,30 @@ MUXMESH_HOST=host-a cargo run --bin muxmesh-agent   # on each server
 cargo run --bin muxmesh-cli poll   # debug only: hub/agent embed the poller already
 
 # send a closed-list command to a remote agent (POST /cmd, direct client->agent).
-# Auth: the target agent checks YOUR token against ITS ~/.config/muxmesh/token,
-# so export the target's token (minted on the hub) before sending:
-MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a NewWindow main
+# Auth: the target agent checks YOUR token against ITS ~/.config/muxmesh/token.
+# Same-name machines (you are the registered peer) need nothing extra; to
+# drive a foreign host, export its token (minted on the hub) first:
+cargo run --bin muxmesh-cli send host-a NewWindow main
 MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a NewSession build
 MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a FocusWindow main 2
 MUXMESH_CMD_TOKEN=<token-of-host-a> cargo run --bin muxmesh-cli send host-a AttachOrDetach main
 ```
+
+## F10 — one bar, nested tmux (tmux-remote model)
+
+The same physical F10 drives whichever tmux server owns the keystroke:
+
+- **Press F10 in a local window** → `muxmesh-cli bar-toggle` finds the armed
+  host of the current window (live `ssh <host>` in a pane + host fresh on
+  the hub) and POSTs `BarHide`/`BarShow` to that machine's agent, which runs
+  `tmux set -g status off|on` there. The remote bar disappears; the local
+  badge ` REMOTE host ` stays.
+- **Press F10 inside a nested ssh session** (case: `ssh host` → `tmux`) →
+  the keystroke reaches the REMOTE tmux server, whose own F10 binding runs
+  `bar-toggle` locally there — no network, instant.
+
+This is exactly tmux-remote's contract (badge + one-key bar control across
+ssh), reimplemented in Rust with a hub for discovery and per-machine tokens.
 
 Verbs are a closed list (`NewWindow`, `NewSession`, `FocusWindow`, `AttachOrDetach`, `BarHide`, `BarShow`); names are whitelisted `[A-Za-z0-9_-]`; the agent only ever spawns `tmux` via argv — never a shell.
 
