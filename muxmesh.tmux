@@ -21,4 +21,9 @@ CLI="$CURRENT_DIR/bin/muxmesh-cli"
 # -v: every F10 press leaves a full trace (steps + STOP points) in
 # ~/.muxmesh/bar-toggle.log — the parent/child bar dance is invisible
 # otherwise. Line-buffered by tracing; file append, never truncate.
-tmux bind-key -n F10 run-shell "$CLI bar-toggle -v 2>>$HOME/.muxmesh/bar-toggle.log"
+# mkdir -p first: a missing ~/.muxmesh makes the shell's stderr redirect fail
+# *before* exec -> F10 dies silently with exit 1 (observed on the driver).
+# stdout redirected too: tmux run-shell shows non-zero-exit output as
+# "#[cell]..." noise on the status line; keep tmux's view clean.
+tmux run-shell "mkdir -p $HOME/.muxmesh"
+tmux bind-key -n F10 run-shell "$CLI bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1"

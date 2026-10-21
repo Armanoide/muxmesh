@@ -54,11 +54,7 @@ pub fn send_cmd(
     let addr = format!("{host}:{port}");
     let body = serde_json::to_vec(env).map_err(|e| e.to_string())?;
     let mut stream = TcpStream::connect(&addr).map_err(|e| format!("{addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    // headers flushed first, body in its own segment: the hub reads the head
-    // byte-at-a-time, so this ordering is belt-and-braces, not required.
+    // headers flushed first, body in its own segment (harmless with axum, kept).
     let req = format!(
         "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Host: {}\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         env.src,

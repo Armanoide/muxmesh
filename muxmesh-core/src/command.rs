@@ -84,6 +84,11 @@ impl Ack {
 /// alphanumeric. tmux is invoked via argv (never through a shell) -> no
 /// injection, but we still reject anything outside the expected vocabulary
 /// (paths, flags like `-x`).
+/// Whitelist for tmux target names (sessions, windows): [A-Za-z0-9_-].
+/// tmux itself allows ':' in window names (e.g. the default "shell: 2 windows"
+/// style or user names like "foo:build"); ':' is NOT a valid target separator
+/// in our poller/agent `-t` paths, so such names are rejected and must be
+/// renamed by the operator — the hub logs the exact offending value.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64

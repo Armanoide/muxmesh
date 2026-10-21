@@ -24,7 +24,9 @@ fn main() {
     let args = muxmesh_core::log::parse_verbose_flag(&args);
     muxmesh_core::log::init();
     let cfg = muxmesh_core::HubConfig::load();
-    let cmd = args.first().map(|s| s.as_str()).unwrap_or("poll");
+    // BARE invocation must not block the terminal: bare `muxmesh-cli` used to
+    // fall through to the poll loop (Ctrl-C only escape). Default to `tree`.
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("tree");
 
     match cmd {
         "poll" if args.iter().any(|a| a == "--once") => muxmesh_core::poll::run_once(&cfg),
