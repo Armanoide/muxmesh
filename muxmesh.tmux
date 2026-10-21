@@ -13,6 +13,16 @@ CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # binaries) may be missing -> F10 127. Inject it explicitly, here and now.
 tmux set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:$PATH"
 
+# Declare the user options with defaults. tmux rejects set/show of an
+# unknown @-option ("invalid option"), so the toggle's persistent state must
+# be declared here to survive presses and server restarts. Without these the
+# hidden flag never persists -> every F10 reads "not hidden" -> press 2 can
+# never restore the parent bar (observed in UAT).
+tmux set-option -gq @muxmesh-bar-hidden off
+tmux set-window-option -gq @muxmesh-armed-win 0
+tmux set-window-option -gq @muxmesh-bar-hidden off
+tmux set-window-option -gq @muxmesh-status ""
+
 # F10: one-bar toggle against the armed remote host (Rust decides everything).
 # Absolute path first (PATH is frozen at server start -> 127 otherwise); the
 # bare name works once set-environment above has taken effect.
