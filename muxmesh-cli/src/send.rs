@@ -190,54 +190,17 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
 
     // Parent/child roles are decided by the KEYSTROKE's server, not by us:
     // - F10 lands on the driver's server while an armed ssh has focus ->
-    //   this server is the PARENT: hide its own bar, pass control down.
+    //   this server is the PARENT and OWNS BOTH BARS via HTTP: press 1
+    //   hides local + shows remote (child's bar on screen), press 2 shows
+    //   local + hides remote. No send-keys echo: a forwarded F10 would be
+    //   handled by the child's own bar-toggle with ITS hidden-state, which
+    //   desyncs from the parent's (observed: 2nd press re-hid the child).
     // - F10 pressed inside the nested remote tmux traverses ssh and lands
     //   on the CHILD's server, where armed_host_of_current_window finds no
-    //   outbound ssh -> local branch below.
+    //   outbound ssh -> local branch below (child-only toggle).
     match host {
-        // PARENT side (driver): a live armed ssh is in this window. The parent
-        // bar yields the screen to the child: hide LOCAL, then forward F10
-        // into the focused pane as W.P (%pane_id does not traverse nested ssh
-        // — verified in tmux-remote) so the remote server's own binding shows
-        // ITS bar. One bar on screen: the child's. Next press reverses.
-        Some(h) if !hidden_now => {
-            tracing::info!("bar-toggle: PARENT branch — hiding local bar, forwarding F10 to pane");
-            muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
-            if let Some(p) = muxmesh_core::poll::tmux_out(
-                &base,
-                &["display", "-p", "#{window_index}.#{pane_index}"],
-            ) {
-                let p = p.trim().to_string();
-                if !p.is_empty() {
-                    tracing::info!("bar-toggle: send-keys -t {p} F10 (into the ssh pane)");
-                    muxmesh_core::poll::run_tmux(&base, &["send-keys", "-t", &p, "F10"]);
-                }
-            }
-            muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
-            muxmesh_core::poll::run_tmux(
-                &base,
-                &["set-window-option", "-t", &wid, "@muxmesh-bar-hidden", "on"],
-            );
-            println!("muxmesh: parent bar hidden, control passed to {h}");
-            0
-        }
-        // PARENT side, second press: restore the local bar and tell the child
-        // (via its agent) to hide its bar again — back to badge-only view.
+        // PARENT side: driver presses F10 with an armed ssh pane focused.
         Some(h) => {
-            tracing::info!(
-                "bar-toggle: PARENT branch (2nd press) — restoring local bar, telling {h} to hide"
-            );
-            muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
-            muxmesh_core::poll::run_tmux(
-                &base,
-                &[
-                    "set-window-option",
-                    "-t",
-                    &wid,
-                    "@muxmesh-bar-hidden",
-                    "off",
-                ],
-            );
             let port: u16 = std::env::var("MUXMESH_CMD_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -246,29 +209,64 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
-            let env = CommandEnvelope {
-                v: 1,
-                id: format!("c-{}", now_ts()),
-                src: hostname_short(),
-                cmd: Command::BarHide,
-                ts: now_ts(),
-            };
-            match send_cmd(&h, port, &token, &env) {
-                Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
-                    tracing::info!("bar-toggle: step 5 ok — {h}:{port} acked BarHide");
-                    println!("muxmesh: parent bar shown, {h} bar hidden");
-                    0
+            let post = |verb: Command, label: &str| -> bool {
+                let env = CommandEnvelope {
+                    v: 1,
+                    id: format!("c-{}", now_ts()),
+                    src: hostname_short(),
+                    cmd: verb,
+                    ts: now_ts(),
+                };
+                match send_cmd(&h, port, &token, &env) {
+                    Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
+                        tracing::info!("bar-toggle: {h}:{port} acked {label}");
+                        true
+                    }
+                    other => {
+                        tracing::error!(
+                            "bar-toggle: STOP at step 5 — {h}:{port} {label}: {:?}",
+                            other.map(|r| r.lines().next().unwrap_or("").to_string())
+                        );
+                        false
+                    }
                 }
-                Ok(resp) => {
-                    // child unreachable: parent bar is back either way, report softly
-                    eprintln!(
-                        "muxmesh-cli bar-toggle: {h} agent replied: {}",
-                        resp.lines().next().unwrap_or("")
-                    );
+            };
+            if !hidden_now {
+                // press 1: parent yields the screen — hide local, show remote.
+                tracing::info!("bar-toggle: PARENT press 1 — hide local, show remote {h}");
+                muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
+                muxmesh_core::poll::run_tmux(
+                    &base,
+                    &["set-window-option", "-t", &wid, "@muxmesh-bar-hidden", "on"],
+                );
+                muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
+                let ok = post(Command::BarShow, "BarShow");
+                println!(
+                    "muxmesh: parent bar hidden{} — remote {h} bar shown",
+                    if ok { "" } else { " (remote unreachable)" }
+                );
+                if ok {
+                    0
+                } else {
                     1
                 }
-                Err(e) => {
-                    eprintln!("muxmesh-cli bar-toggle: {h}:{port}: {e}");
+            } else {
+                // press 2: parent takes the screen back — show local, hide remote.
+                tracing::info!("bar-toggle: PARENT press 2 — show local, hide remote {h}");
+                muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
+                muxmesh_core::poll::run_tmux(
+                    &base,
+                    &["set-window-option", "-t", &wid, "@muxmesh-bar-hidden", "off"],
+                );
+                muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
+                let ok = post(Command::BarHide, "BarHide");
+                println!(
+                    "muxmesh: parent bar shown{} — remote {h} bar hidden",
+                    if ok { "" } else { " (remote unreachable)" }
+                );
+                if ok {
+                    0
+                } else {
                     1
                 }
             }
