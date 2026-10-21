@@ -115,6 +115,19 @@ fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String>
     let wid = muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
     let wid = wid.trim().to_string();
     let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
+    tracing::debug!(
+        "armed-host: hub {} -> {} host(s): {:?}",
+        cfg.poll_hub,
+        doc.hosts.len(),
+        doc.hosts
+            .iter()
+            .map(|(h, s)| format!(
+                "{h}:armed={}:seen={}s",
+                s.armed,
+                muxmesh_core::now_unix().saturating_sub(s.seen)
+            ))
+            .collect::<Vec<_>>()
+    );
     let h = match muxmesh_core::poll::window_ssh_host(&base, &wid) {
         Some(h) => h,
         None => {
@@ -122,11 +135,13 @@ fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String>
             return None;
         }
     };
+    tracing::debug!("armed-host: live ssh target in window {wid} = '{h}'");
     if !muxmesh_core::valid_host(&h) {
         tracing::debug!("window {wid}: ssh target '{h}' rejected by valid_host");
         return None;
     }
     if doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
+        tracing::debug!("armed-host: '{h}' armed+fresh on hub -> ARMED");
         Some(h)
     } else {
         let known: Vec<&String> = doc.hosts.keys().collect();
@@ -148,9 +163,17 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         .ok()
         .filter(|s| !s.is_empty());
     let base = muxmesh_core::poll::tmux_base(&socket);
+    tracing::info!(
+        "bar-toggle: start (hub={}, socket={:?})",
+        cfg.poll_hub,
+        socket
+    );
     let wid = match muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"]) {
         Some(o) => o.trim().to_string(),
-        None => return 1,
+        None => {
+            tracing::error!("bar-toggle: STOP at step 1 — no tmux server / no current window");
+            return 1;
+        }
     };
 
     // hidden-state of THIS server's bar (window option, survives presses)
@@ -160,8 +183,10 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     )
     .map(|o| o.ends_with("on"))
     .unwrap_or(false);
+    tracing::debug!("bar-toggle: step 1 ok — window {wid}, bar-hidden={hidden_now}");
 
     let host = armed_host_of_current_window(cfg);
+    tracing::info!("bar-toggle: step 2 — armed host = {:?}", host);
 
     // Parent/child roles are decided by the KEYSTROKE's server, not by us:
     // - F10 lands on the driver's server while an armed ssh has focus ->
@@ -176,6 +201,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         // — verified in tmux-remote) so the remote server's own binding shows
         // ITS bar. One bar on screen: the child's. Next press reverses.
         Some(h) if !hidden_now => {
+            tracing::info!("bar-toggle: PARENT branch — hiding local bar, forwarding F10 to pane");
             muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
             if let Some(p) = muxmesh_core::poll::tmux_out(
                 &base,
@@ -183,6 +209,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
             ) {
                 let p = p.trim().to_string();
                 if !p.is_empty() {
+                    tracing::info!("bar-toggle: send-keys -t {p} F10 (into the ssh pane)");
                     muxmesh_core::poll::run_tmux(&base, &["send-keys", "-t", &p, "F10"]);
                 }
             }
@@ -197,6 +224,9 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         // PARENT side, second press: restore the local bar and tell the child
         // (via its agent) to hide its bar again — back to badge-only view.
         Some(h) => {
+            tracing::info!(
+                "bar-toggle: PARENT branch (2nd press) — restoring local bar, telling {h} to hide"
+            );
             muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
             muxmesh_core::poll::run_tmux(
                 &base,
@@ -225,6 +255,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
             };
             match send_cmd(&h, port, &token, &env) {
                 Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
+                    tracing::info!("bar-toggle: step 5 ok — {h}:{port} acked BarHide");
                     println!("muxmesh: parent bar shown, {h} bar hidden");
                     0
                 }
@@ -247,6 +278,9 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         // nested remote tmux) and any local-only window.
         None => {
             let next = if hidden_now { "on" } else { "off" };
+            tracing::info!(
+                "bar-toggle: CHILD/local branch — no armed ssh here, toggling THIS server's bar -> status {next}"
+            );
             muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", next]);
             muxmesh_core::poll::run_tmux(
                 &base,

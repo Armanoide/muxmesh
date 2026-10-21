@@ -322,18 +322,27 @@ fn handle(
         .lock()
         .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
     let mut doc = read_doc(path);
+    // trace BEFORE the move into the map (armed flag + session/window names),
+    // so an operator can follow F10's chain (the driver reads THIS state).
+    let trace = format!(
+        "armed={} sessions=[{}]",
+        state.armed,
+        state
+            .sessions
+            .iter()
+            .map(|s| format!("{}:{}w/active={}", s.name, s.windows, s.active_window))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     doc.hosts.insert(host_key.clone(), state);
     write_atomic(path, &doc)?;
 
     tracing::debug!(
-        "state updated host={host_key} armed={} sessions={} -> {}",
-        doc.hosts.get(&host_key).map(|h| h.armed).unwrap_or(false),
-        doc.hosts
-            .get(&host_key)
-            .map(|h| h.sessions.len())
-            .unwrap_or(0),
+        "state updated host={host_key} {} -> {}",
+        trace,
         path.display()
     );
+    tracing::info!("state updated: {host_key} {trace}");
     respond(&mut stream, 200, "ok\n")
 }
 

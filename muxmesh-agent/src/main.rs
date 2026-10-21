@@ -270,6 +270,7 @@ fn handle_cmd(
     };
 
     if !token_matches(token, req.header("x-muxmesh-token").unwrap_or("")) {
+        tracing::warn!("/cmd: STOP at auth — token mismatch (empty token file? rotated?)");
         return httpd::respond(stream, 401, "text/plain", b"unauthorized\n");
     }
 
@@ -277,28 +278,71 @@ fn handle_cmd(
         return httpd::respond(stream, 200, "application/json", b"{\"ok\":true}\n");
     }
     if req.method != "POST" || !req.path.starts_with("/cmd") {
+        tracing::debug!(
+            "/cmd: STOP at route — {} {} (expected POST /cmd)",
+            req.method,
+            req.path
+        );
         return httpd::respond(stream, 404, "text/plain", b"not found\n");
     }
 
     // closed list: an unknown verb or bad types fail here, before any exec.
     let env: CommandEnvelope = match serde_json::from_slice(&req.body) {
         Ok(e) => e,
-        Err(e) => return respond_json(stream, 400, &Ack::err(1, "?", &format!("bad json: {e}"))),
+        Err(e) => {
+            tracing::warn!("/cmd: STOP at parse — bad json: {e}");
+            return respond_json(stream, 400, &Ack::err(1, "?", &format!("bad json: {e}")));
+        }
     };
+    tracing::info!(
+        "/cmd: received id={} src={} cmd={:?}",
+        env.id,
+        env.src,
+        env.cmd
+    );
     if env.v != 1 {
+        tracing::warn!("/cmd: STOP at version — v={} (expected 1)", env.v);
         return respond_json(stream, 400, &Ack::err(env.v, &env.id, "unsupported v"));
     }
     if !env.cmd.args_valid() {
+        tracing::warn!("/cmd: STOP at args_valid — cmd={:?}", env.cmd);
         return respond_json(stream, 400, &Ack::err(env.v, &env.id, "invalid args"));
     }
 
     // "" => resolve the live socket (see resolve_socket); a literal "default"
     // fails when tmux runs from a per-user socket dir macOS rotates.
     let socket = resolve_socket(cfg);
+    // which tmux state is affected: the bar is a GLOBAL option, so it hits
+    // every session/window on this socket — name them in the trace.
+    let affected = tmux_sessions(&socket);
+    tracing::info!("/cmd: executing on socket={socket} — affects: {affected}");
     match env.cmd.execute(&socket) {
-        Ok(()) => respond_json(stream, 200, &Ack::ok(env.v, &env.id)),
-        Err(e) => respond_json(stream, 200, &Ack::err(env.v, &env.id, &e)),
+        Ok(()) => {
+            tracing::info!("/cmd: done id={} ok", env.id);
+            respond_json(stream, 200, &Ack::ok(env.v, &env.id))
+        }
+        Err(e) => {
+            tracing::error!("/cmd: STOP at exec — id={} socket={socket}: {e}", env.id);
+            respond_json(stream, 200, &Ack::err(env.v, &env.id, &e))
+        }
     }
+}
+
+/// Human-readable list of sessions on a socket, for the exec trace.
+fn tmux_sessions(socket: &str) -> String {
+    std::process::Command::new("tmux")
+        .args([
+            "-S",
+            socket,
+            "list-sessions",
+            "-F",
+            "#{session_name}(#{session_windows}w,attached=#{?session_attached}yes#{:}no)",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).replace('\n', " "))
+        .unwrap_or_else(|| "(no sessions)".into())
 }
 
 #[cfg(test)]
