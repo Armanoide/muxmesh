@@ -117,7 +117,7 @@ pub fn parse_flat_toml(content: &str) -> std::collections::HashMap<String, Strin
 }
 
 /// Loads config.toml (if present) and applies precedence env > toml > default.
-fn load_map() -> std::collections::HashMap<String, String> {
+pub fn load_map() -> std::collections::HashMap<String, String> {
     let path = config_dir().join("config.toml");
     match fs::read_to_string(&path) {
         Ok(c) => parse_flat_toml(&c),

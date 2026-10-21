@@ -216,7 +216,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 let env = CommandEnvelope {
                     v: 1,
                     id: format!("c-{}", now_ts()),
-                    src: hostname_short(),
+                    src: driver_host(),
                     dst: h.clone(),
                     cmd: verb,
                     ts: now_ts(),
@@ -347,7 +347,7 @@ pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     let env = CommandEnvelope {
         v: 1,
         id: format!("c-{}", now_ts()),
-        src: hostname_short(),
+        src: driver_host(),
         dst: host.clone(),
         cmd,
         ts: now_ts(),
@@ -386,6 +386,27 @@ fn split_host_port(addr: &str) -> (&str, u16) {
         Some((h, p)) if !h.contains(':') => (h, p.parse().unwrap_or(9997)),
         _ => (a, 9997),
     }
+}
+
+/// Identity for the hub: MUST equal the agent's canonical host name (the key
+/// in tokens.json and the X-Muxmesh-Host the agent sends). `hostname -s` is
+/// NOT that — macOS mDNS advertises "MacBook-Pro-de-Norbert.local", so -s
+/// yields a name the hub never registered -> 401 on every POST /cmd.
+/// Same resolution order as AgentConfig::host: env > config.toml agent.host
+/// (load_map flattens [agent] to "agent.host") > hostname -s fallback.
+fn driver_host() -> String {
+    if let Ok(h) = std::env::var("MUXMESH_HOST") {
+        let h = h.trim().to_string();
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    let map = muxmesh_core::load_map();
+    let h = map.get("agent.host").cloned().unwrap_or_default();
+    if !h.is_empty() {
+        return h;
+    }
+    hostname_short()
 }
 
 fn hostname_short() -> String {
