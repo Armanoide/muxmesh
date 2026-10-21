@@ -33,31 +33,33 @@ n'existe pas — un scanner qui le trouve reçoit `404`).
 ```
 Mac Mini (pivot)                          machine à appairer
 $ muxmesh-hub generate-token 10.0.10.7
-mm_9f3a…(43 car., token MACHINE)   rl_7c2b…(43 car., secret RELAY) — affichés UNE SEULE FOIS
+mm_9f3a…(43 car., token MACHINE) — affiché UNE SEULE FOIS
    │ tokens.json : {host: {prefix, hash, created}} — jamais le clair
-   │ ~/.muxmesh/relay/<host>.token (0600) — le hub relaie /cmd avec, relu à chaque requête
-   ├──────────── tu colles le token MACHINE, une fois ─────►  ~/.config/muxmesh/token (0600)
-   └──────────── tu colles le secret RELAY, une fois ──────►  ~/.config/muxmesh/relay-token (0600)
-                                                             l'agent accepte alors les /cmd
-                                                             relayés par le hub
+   └──────────── tu colles le token MACHINE, une fois ─────►  ~/.config/muxmesh/token (0600)
+                                                              l'agent s'en sert pour POST /state
+                                                              ET pour sa poignée de main /ws
 ```
 
-- **Token par machine** : une machine compromise se remplace en régénérant son
-  token (`generate-token <host>` révoque l'ancien immédiatement), les autres intactes.
-- **Le hub ne stocke jamais le secret MACHINE** : hash SHA-256 itéré ×100 000 (sel aléatoire)
-- **Exception assumée : les secrets de RELAI** (`~/.muxmesh/relay/<host>.token`) sont en clair 0600 sur le pivot — le hub doit re-signer chaque relais, un hash ne suffit pas. Pivot compromis ⇒ `generate-token <host>` pour les faire tourner.
+- **UN seul token par machine** : le même secret authentifie `POST /state` et
+  la connexion WebSocket sortante `/ws`. Aucun secret de relais n'existe plus :
+  le hub ne signe rien vers l'agent, il pousse sur le socket que l'agent a
+  lui-même ouvert. `generate-token` n'affiche donc qu'UNE valeur.
+- **Une machine compromise se remplace en régénérant son token**
+  (`generate-token <host>` révoque l'ancien immédiatement), les autres intactes.
+- **Le hub ne stocke jamais le token** : hash SHA-256 itéré ×100 000 (sel aléatoire)
   + préfixe 8 car. pour le lookup. Vol de `tokens.json` ne donne pas les tokens.
-- **Rotation sans redémarrage** : agent et hub relisent leurs fichiers de secrets
-  à chaque requête — coller un nouveau token dans `token` suffit.
+- **Rotation sans redémarrage** : l'agent relit son token à chaque battement et
+  à chaque reconnexion WS — coller un nouveau token dans `token` suffit.
 - `/cmd` : le driver parle **au hub** (`POST /cmd`, `dst: <host>` dans le
-  corps) ; le hub authentifie le driver (même registre que `/state`), exige
-  que la cible soit **armée+fraîche** (sinon `403 target not armed`), puis
-  **relaie** la commande à `<host>:hub.cmd_port` (défaut 9998) signée avec le
-  secret de relais de cet hôte (`~/.muxmesh/relay/<host>.token`). Jamais de
-  driver→agent direct (décision opérateur 2026-10-21). Côté agent : son token
-  (legacy direct) OU le relay-token sont acceptés. LAN only, verbes fermés.
-  Sans fichier de relais : `502 no relay secret for <host>` → relancer
-  `generate-token <host>`.
+  corps) ; le hub authentifie le driver (même registre que `/state`), refuse
+  une cible non enregistrée (`403 dst not registered`) ou sans WebSocket actif
+  (`409 target not connected`), sinon met la trame en file et répond
+  `202 {"queued":true}` (TTL file ~10 s). Le hub **ne joint JAMAIS l'agent** :
+  la trame part sur le `/ws` que l'agent maintient en permanence (reconnexion
+  auto toutes les 2 s), et l'agent accuse réception (ack) sur le même socket —
+  le hub miroir l'ack dans `state.json` (`last_cmd`). Jamais de port entrant
+  sur l'agent, jamais de driver→agent direct (décision opérateur 2026-10-21).
+  LAN only, verbes fermés.
 - Révocation : supprimer l'entrée de `tokens.json` (ou régénérer) → la machine
   reçoit 401 et s'arrête proprement, les autres intactes.
 

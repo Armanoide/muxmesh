@@ -39,8 +39,9 @@ pub struct CommandEnvelope {
     pub id: String,
     /// canonical name of the sending client (e.g. "client-a").
     pub src: String,
-    /// destination machine (hub-relayed commands: driver -> hub -> agent).
-    /// serde default empty so old agents/hub tolerate its absence (v:1 kept).
+    /// destination machine (hub routes by this; the agent double-checks it).
+    /// Required on /cmd: hub 400s without it. `#[serde(default)]` keeps old
+    /// serialized payloads deserializable (v:1 kept).
     #[serde(default)]
     pub dst: String,
     pub cmd: Command,
@@ -236,7 +237,7 @@ mod tests {
 
     #[test]
     fn dst_roundtrip_and_default_empty() {
-        // hub-relayed envelope carries the destination machine
+        // driver -> hub envelope carries the destination machine
         let env = CommandEnvelope {
             v: 1,
             id: "c-1".into(),

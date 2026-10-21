@@ -8,7 +8,7 @@
 //! std-only (no toml dependency): minimal key=value parser for our flat sections.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Hub configuration: listen address + state file.
 #[derive(Debug, Clone)]
@@ -24,19 +24,6 @@ pub struct HubConfig {
     pub interval: u64,
     /// Path of the per-machine token registry (tokens.json, digests only).
     pub tokens_path: PathBuf,
-    /// TCP port the hub relays POST /cmd to on the target agent. Agents use
-    /// agent.cmd_port (same default 9998); env: MUXMESH_HUB_CMD_PORT (hub) / MUXMESH_CMD_PORT (agent), hub.cmd_port.
-    pub cmd_port: u16,
-}
-
-/// Path of the hub's per-host relay secret for `host`: sibling `relay/` dir
-/// of tokens.json (e.g. ~/.muxmesh/relay/<host>.token, 0600).
-pub fn hub_relay_path(tokens_path: &Path, host: &str) -> PathBuf {
-    tokens_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("relay")
-        .join(format!("{host}.token"))
 }
 
 /// Agent configuration (remote machine).
@@ -46,8 +33,6 @@ pub struct AgentConfig {
     pub port: u16,
     pub host: String,
     pub interval: u64,
-    /// local HTTP port where the agent serves POST /cmd (0 => cmd disabled).
-    pub cmd_port: u16,
     /// local tmux socket the agent controls (empty => tmux default).
     pub tmux_socket: String,
 }
@@ -83,15 +68,6 @@ pub fn config_dir() -> PathBuf {
 /// Returns Token("") when absent (the hub then rejects every POST -> no token = closed).
 pub fn read_token() -> Token {
     read_secret_file("MUXMESH_TOKEN_PATH", "token")
-}
-
-/// The agent's RELAY token: minted by `muxmesh-hub generate-token <host>`
-/// (the same value the hub keeps in ~/.muxmesh/relay/<host>.token) and pasted
-/// by the operator as ~/.config/muxmesh/relay-token (0600). The agent accepts
-/// /cmd authenticated with EITHER its own token (legacy direct) or this one
-/// (hub-relayed). Env: MUXMESH_RELAY_TOKEN_PATH.
-pub fn read_relay_token() -> Token {
-    read_secret_file("MUXMESH_RELAY_TOKEN_PATH", "relay-token")
 }
 
 /// Generic secret reader: env path override > <config_dir>/<name>. Missing
@@ -243,11 +219,6 @@ impl HubConfig {
             "hub.tokens_path",
             "~/.muxmesh/tokens.json",
         ));
-        // relay/cmd port: where the hub POSTs /cmd on the target agent.
-        // Same default as agent.cmd_port so both sides agree.
-        let cmd_port = pick("MUXMESH_HUB_CMD_PORT", &m, "hub.cmd_port", "9998")
-            .parse()
-            .unwrap_or(9998);
         // poll.hub: where the poller fetches state ("host" or "host:port").
         // Default = bind host so a hub-local poller needs no config; a driver
         // sets it to the hub's LAN IP. Bare IPv6 gets bracketed at use time.
@@ -267,7 +238,6 @@ impl HubConfig {
             ttl,
             interval,
             tokens_path,
-            cmd_port,
         }
     }
 }
@@ -286,22 +256,24 @@ impl AgentConfig {
         let interval = pick("MUXMESH_INTERVAL", &m, "agent.interval", "15")
             .parse()
             .unwrap_or(15);
-        let cmd_port = pick("MUXMESH_CMD_PORT", &m, "agent.cmd_port", "9998")
-            .parse()
-            .unwrap_or(9998);
         let tmux_socket = pick("MUXMESH_TMUX_SOCKET", &m, "agent.tmux_socket", "");
         Self {
             hub,
             port,
             host,
             interval,
-            cmd_port,
             tmux_socket,
         }
     }
 
     pub fn url(&self) -> String {
         format!("http://{}:{}/state", self.hub, self.port)
+    }
+
+    /// WebSocket URL of the hub's persistent command channel. The agent dials
+    /// OUT to the hub here; the hub never dials the agent.
+    pub fn ws_url(&self) -> String {
+        format!("ws://{}:{}/ws", self.hub, self.port)
     }
 }
 
@@ -414,10 +386,10 @@ mod tests {
             port: 9997,
             host: "a".into(),
             interval: 15,
-            cmd_port: 9998,
             tmux_socket: String::new(),
         };
         assert_eq!(cfg.url(), "http://10.0.0.1:9997/state");
+        assert_eq!(cfg.ws_url(), "ws://10.0.0.1:9997/ws");
     }
 
     #[test]
@@ -426,13 +398,6 @@ mod tests {
         let cfg = HubConfig::load();
         assert!(cfg.bind.ends_with(":9997"));
         assert!(cfg.ttl > 0);
-        assert_eq!(cfg.cmd_port, 9998);
-    }
-
-    #[test]
-    fn hub_relay_path_is_sibling_of_tokens() {
-        let p = hub_relay_path(Path::new("/home/u/.muxmesh/tokens.json"), "host-a");
-        assert_eq!(p, PathBuf::from("/home/u/.muxmesh/relay/host-a.token"));
     }
 
     #[test]

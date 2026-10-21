@@ -6,11 +6,13 @@
 //!     send host-a FocusWindow main 2
 //!     send host-a AttachOrDetach main
 //!
-//! Operator rule: agent→hub only, never driver→agent direct. The CLI POSTs to
-//! the hub (poll.hub), the envelope carries `dst: <host>`; the hub checks the
-//! target is armed+fresh and relays to dst:hub.cmd_port with that host's
-//! relay secret. The driver authenticates with its own token
-//! (~/.config/muxmesh/token, MUXMESH_CMD_TOKEN overrides). std::net only.
+//! Operator rule: the hub NEVER dials an agent. Each agent holds a persistent
+//! OUTBOUND WebSocket (/ws) to the hub; the CLI POSTs /cmd to the hub
+//! (poll.hub), the envelope carries `dst: <host>`; the hub authenticates the
+//! driver, checks dst is registered + WS-connected right now (else 409),
+//! enqueues the frame on that agent's channel and answers 202 queued. The
+//! driver authenticates with its own token (~/.config/muxmesh/token,
+//! MUXMESH_CMD_TOKEN overrides). std::net only.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -41,8 +43,8 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
     }
 }
 
-/// POST /cmd to host:port (the hub, in the relay flow). Returns the raw ack
-/// body. HTTP/1.1 + Connection: close (agent litigates Content-Length); std only.
+/// POST /cmd to host:port (the hub; it queues on the target's WS channel).
+/// Returns the raw response body. HTTP/1.1 + Connection: close; std only.
 pub fn send_cmd(
     host: &str,
     port: u16,
@@ -55,9 +57,8 @@ pub fn send_cmd(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
-    // The hub/agent parse the request line with read_line, which buffers up to
-    // 8 KiB: if it has already swallowed our headers into its buffer, the
-    // body must arrive in a SEPARATE TCP segment or it waits forever.
+    // headers flushed first, body in its own segment: the hub reads the head
+    // byte-at-a-time, so this ordering is belt-and-braces, not required.
     let req = format!(
         "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Host: {}\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         env.src,
@@ -204,8 +205,8 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     match host {
         // PARENT side: driver presses F10 with an armed ssh pane focused.
         Some(h) => {
-            // commands flow driver -> HUB -> agent (never direct to the host):
-            // POST to poll.hub, dst in the envelope, hub relays + re-signs.
+            // commands flow driver -> HUB -> agent's WS (never direct to the
+            // host): POST to poll.hub, dst in the envelope, hub queues + pushes.
             let (hub_host, hub_port) = split_host_port(&cfg.poll_hub);
             let port: u16 = std::env::var("MUXMESH_CMD_PORT")
                 .ok()
@@ -225,8 +226,8 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     ts: now_ts(),
                 };
                 match send_cmd(hub_host, port, &token, &env) {
-                    Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
-                        tracing::info!("bar-toggle: hub {hub_host}:{port} relayed {label} to {h}");
+                    Ok(resp) if resp.starts_with("HTTP/1.1 202") => {
+                        tracing::info!("bar-toggle: hub {hub_host}:{port} queued {label} for {h} (pushed on its /ws channel)");
                         true
                     }
                     other => {
@@ -250,7 +251,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 let ok = post(Command::BarShow, "BarShow");
                 println!(
                     "muxmesh: parent bar hidden{} — remote {h} bar shown (via hub)",
-                    if ok { "" } else { " (hub relay failed)" }
+                    if ok { "" } else { " (hub push failed)" }
                 );
                 if ok {
                     0
@@ -275,7 +276,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 let ok = post(Command::BarHide, "BarHide");
                 println!(
                     "muxmesh: parent bar shown{} — remote {h} bar hidden (via hub)",
-                    if ok { "" } else { " (hub relay failed)" }
+                    if ok { "" } else { " (hub push failed)" }
                 );
                 if ok {
                     0
@@ -311,8 +312,8 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
 }
 
 /// `muxmesh-cli send <host> <verb> [args...]` — POSTed to the HUB, which
-/// relays to <host> after checking it is armed+fresh. Returns a small exit
-/// code: 0 ok, 1 failure, 2 usage.
+/// enqueues it on <host>'s persistent WS channel (202 queued). Returns a
+/// small exit code: 0 ok, 1 failure, 2 usage.
 pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     if args.len() < 2 {
         eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach|BarHide|BarShow> [args]");
@@ -358,7 +359,8 @@ pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     match send_cmd(hub_host, port, &token, &env) {
         Ok(resp) => {
             println!("{resp}");
-            if resp.starts_with("HTTP/1.1 200") {
+            if resp.starts_with("HTTP/1.1 202") {
+                println!("muxmesh: queued via hub (pushed on {host}'s channel)");
                 0
             } else {
                 1
@@ -458,7 +460,7 @@ mod tests {
         let json = serde_json::to_vec(&env).unwrap();
         let text = String::from_utf8_lossy(&json);
         assert!(text.contains("\"type\":\"NewWindow\""));
-        // the hub needs dst to route the relay
+        // the hub needs dst to route the frame
         assert!(text.contains("\"dst\":\"host-a\""));
     }
 

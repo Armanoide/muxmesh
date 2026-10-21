@@ -1,35 +1,43 @@
-//! muxmesh-hub — state aggregator + command relay (runs on the always-on
+//! muxmesh-hub — state aggregator + command dispatcher (runs on the always-on
 //! pivot machine).
 //!
 //! Listens on TCP :9997. Agents POST /state (JSON HostState); the hub merges
 //! into state.json with ATOMIC writes (tmp + rename) so readers (tmux status
 //! bar, CLI) never see a half-written file.
 //!
-//! Commands flow driver -> HUB -> agent, never driver -> agent directly: the
-//! hub authenticates the driver, checks the destination is armed+fresh, then
-//! relays POST /cmd to the target agent with that host's relay secret
-//! (~/.muxmesh/relay/<host>.token). The hub itself NEVER executes commands.
-//! std::net only -> no network dependency, offline build.
+//! Commands flow driver -> HUB -> agent over the agent's OWN outbound WebSocket:
+//! the hub NEVER dials an agent (no outbound TcpStream here, ever). Each agent
+//! holds a persistent WS connection (/ws), authenticated at the handshake with
+//! X-Muxmesh-Host + X-Muxmesh-Token = its own machine token (same registry and
+//! KDF as POST /state). A driver POSTs /cmd; the hub authenticates it, checks
+//! dst is registered + WS-connected right now, enqueues the frame on that
+//! agent's channel and answers 202 queued immediately. The agent executes tmux
+//! locally and replies with an ack frame {v,id,ok,err}, which the hub logs
+//! (and mirrors into state.json's last_cmd so the driver can read it back via
+//! GET /state). std::net + tungstenite (sync) only -> trusted LAN, no TLS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use muxmesh_core::{
-    hub_relay_path, new_token, now_unix, valid_host, valid_name, CommandEnvelope, HostState,
-    HubConfig, StateDoc, TokenStore,
+    now_unix, valid_host, valid_name, Ack, CommandEnvelope, HostState, HubConfig, StateDoc,
+    TokenStore,
 };
+use tungstenite::{handshake::derive_accept_key, protocol::Role, Message, WebSocket};
 
 /// Monotonic counter for unique tmp filenames (see write_atomic).
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic id for /ws connection generations (channel takeover).
+static WS_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// In-flight connection guard: threads are cheap but unbounded is not "bounded".
 /// Acquire before reading a body; over cap -> 503. LAN tool, generous cap.
@@ -53,6 +61,28 @@ impl Drop for Permit {
     }
 }
 
+/// A queued command frame waiting to go out on an agent's WS channel.
+struct Queued {
+    id: String,
+    frame: String,
+    at: Instant,
+}
+
+/// Per-host dispatch channel. POST /cmd handlers only ever push frames onto
+/// `queue`; the writer thread of the CURRENT connection drains it. `gen`
+/// makes takeover safe: a replaced connection's writer stops when its gen is
+/// superseded, so a dead socket is never written to again.
+struct Channel {
+    queue: VecDeque<Queued>,
+    gen: u64,
+}
+
+type Channels = Arc<Mutex<HashMap<String, Channel>>>;
+
+/// TTL of a queued frame: an agent that has not drained within ~10 s is wedged
+/// — a stale bar toggle must never fire late.
+const QUEUE_TTL: Duration = Duration::from_secs(10);
+
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,7 +93,7 @@ fn main() {
 
     // Console mode (herdr-style `add machine`): mint a token for a host,
     // print it ONCE, exit. No server, no network. The operator pastes the
-    // output on the agent machine; the hub is then standby for its pushes.
+    // output on the agent machine; the agent then dials /ws with it.
     if args.first().map(|s| s.as_str()) == Some("generate-token") {
         generate_token(&cfg, &args[1..]); // diverges (process::exit)
     }
@@ -72,7 +102,7 @@ fn main() {
     let tokens_path = cfg.tokens_path.clone();
     let store: Arc<Mutex<TokenStore>> = Arc::new(Mutex::new(TokenStore::load(&tokens_path)));
     if store.lock().unwrap().hosts.is_empty() {
-        tracing::warn!("no registered hosts in {} -> every /state POST is 401 until you mint one: muxmesh-hub generate-token <host>", tokens_path.display());
+        tracing::warn!("no registered hosts in {} -> every /state POST and /ws handshake is 401 until you mint one: muxmesh-hub generate-token <host>", tokens_path.display());
     }
 
     // Embedded badge poller: tmux windows on THIS machine get the
@@ -99,13 +129,15 @@ fn main() {
         }
     };
     tracing::info!(
-        "listening on {bind} -> {} (tokens: {})",
+        "listening on {bind} -> {} (tokens: {}, agents dial /ws)",
         state_path.display(),
         tokens_path.display()
     );
 
     // serialize file writes (one POST at a time)
     let lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    // live WS dispatch channels, host -> channel
+    let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match listener.accept() {
@@ -113,15 +145,57 @@ fn main() {
                 let path = state_path.clone();
                 let lock = lock.clone();
                 let store = store.clone();
-                let cfg = cfg.clone();
+                let channels = channels.clone();
                 // backpressure BEFORE spawning: over cap -> 503, no thread, no read.
                 match Permit::acquire() {
                     Some(permit) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                        // no Nagle: the 101 handshake reply must reach the peer
+                        // promptly (the agent sends nothing until it sees it).
+                        let _ = stream.set_nodelay(true);
+
+                        // Read the FULL head (request line + headers) HERE, in
+                        // the accept loop, with a raw byte-at-a-time read (no
+                        // BufReader near this socket). Routing then happens on
+                        // parsed data and the head is handed to the handler as
+                        // a value — no socket replay, no stranded buffers.
+                        let mut head = String::new();
+                        if read_head(&mut stream, &mut head).is_err() {
+                            continue;
+                        }
+                        let req_line = head.lines().next().unwrap_or("").to_string();
+                        // route ANY GET /ws to handle_ws; it authenticates and
+                        // only then upgrades (401 before the 101, never 404).
+                        let is_ws = {
+                            let p = req_line.split_whitespace().nth(1).unwrap_or("");
+                            p == "/ws" || p.starts_with("/ws?")
+                        };
+
+                        // /ws upgrade: handled on its own thread; the persistent
+                        // connection holds one permit by design (cap 64 agents).
+                        if is_ws {
+                            let ws_stream = match stream.try_clone() {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            drop(stream);
+                            thread::spawn(move || {
+                                let _permit = permit;
+                                if let Err(e) = handle_ws(
+                                    ws_stream, peer, head, &store, &channels, &path, &lock,
+                                ) {
+                                    tracing::debug!("{peer} /ws: {e}");
+                                }
+                            });
+                            continue;
+                        }
+
                         thread::spawn(move || {
                             let _permit = permit; // released when the handler returns
-                            if let Err(e) = handle(stream, peer, &path, &lock, &store, &cfg) {
+                            if let Err(e) =
+                                handle(stream, peer, head, &path, &lock, &store, &channels)
+                            {
                                 tracing::error!("{peer}: {e}");
                             }
                         });
@@ -140,6 +214,7 @@ fn main() {
 /// register it in tokens.json, print it ONCE. herdr-style `add machine`:
 /// operator runs this on the pivot, pastes the printed token on the agent
 /// (~/.config/muxmesh/token), done. Re-issue revokes the host's old token.
+/// ONE token per host: it authenticates POST /state AND the /ws handshake.
 fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
     let host = match args.first() {
         Some(h) if valid_host(h) => h.clone(),
@@ -173,47 +248,18 @@ fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
         );
         process::exit(1);
     }
-    // second secret: the relay token. The hub keeps it in ~/.muxmesh/relay/
-    // <host>.token (0600, re-read per relayed /cmd -> rotation without
-    // restart) and the operator pastes the SAME value on the agent as
-    // ~/.config/muxmesh/relay-token, so the agent accepts hub-relayed /cmd.
-    let relay = match new_token() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("muxmesh-hub: generate-token: relay token: {e}");
-            process::exit(1);
-        }
-    };
-    let relay_path = hub_relay_path(&cfg.tokens_path, &host);
-    if let Err(e) = write_file_atomic(&relay_path, format!("{relay}\n").as_bytes()) {
-        eprintln!(
-            "muxmesh-hub: generate-token: write {}: {e}",
-            relay_path.display()
-        );
-        process::exit(1);
-    }
     // the ONLY place raw tokens ever appear: stdout, once, for the operator.
     println!("{token}");
-    println!("{relay}");
     eprintln!(
-        "muxmesh-hub: host '{host}' paired — machine token in {} + relay secret in {}. Paste the FIRST on the agent as ~/.config/muxmesh/token and the SECOND as ~/.config/muxmesh/relay-token (both 0600). Shown once.",
-        cfg.tokens_path.display(),
-        relay_path.display()
+        "muxmesh-hub: host '{host}' paired — machine token in {}. Paste it on the agent as ~/.config/muxmesh/token (0600). The agent uses it for POST /state and its /ws handshake. Shown once.",
+        cfg.tokens_path.display()
     );
     process::exit(0)
 }
 
 /// tmp + rename, mode 0600 (tokens.json holds digests, still keep it tight).
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", process::id()));
-    let mut f = fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
+    write_bytes_atomic(path, bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -222,44 +268,310 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Read the request head (request line + headers, up to the blank line)
+/// straight from the socket, ONE BYTE AT A TIME — no BufReader anywhere near
+/// this socket, so body bytes are never swallowed. The head is passed to the
+/// handler as a value and NEVER replayed onto the socket (that echo raced the
+/// client's FIN and corrupted reads); handlers parse the value they received.
+fn read_head(stream: &mut TcpStream, head: &mut String) -> std::io::Result<()> {
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(_) => {
+                head.push(byte[0] as char);
+                if byte[0] == b'\n' {
+                    let n = head.len();
+                    if head.ends_with("\r\n\r\n") || (n >= 2 && head.ends_with("\n\n")) {
+                        return Ok(()); // blank line: end of headers
+                    }
+                }
+                if head.len() > 16_384 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "head too long",
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// GET /ws: read the handshake headers, authenticate the agent with its OWN
+/// machine token (same registry + KDF as POST /state, run OUTSIDE the store
+/// lock), 401 before upgrade on failure. On success: complete the upgrade and
+/// run the dispatch session. One channel per host — a second connection from
+/// the same host replaces the first (logged, old writer thread exits via gen).
+fn handle_ws(
+    mut stream: TcpStream,
+    peer: std::net::SocketAddr,
+    head: String,
+    store: &Mutex<TokenStore>,
+    channels: &Channels,
+    state_path: &Path,
+    lock: &Mutex<()>,
+) -> std::io::Result<()> {
+    // Parse the head the accept loop already read (request line + headers).
+    // No socket reads happen before accept(): the head lives in `head`, and
+    // tungstenite's handshake is completed BY hand below — no replay, no
+    // BufReader, nothing can strand a byte.
+    let mut host = String::new();
+    let mut token = String::new();
+    let mut ws_key = String::new();
+    for line in head.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("x-muxmesh-host:") {
+            host = line
+                .split_once(':')
+                .map(|x| x.1.trim().to_string())
+                .unwrap_or_default();
+        } else if lower.starts_with("x-muxmesh-token:") {
+            token = line
+                .split_once(':')
+                .map(|x| x.1.trim().to_string())
+                .unwrap_or_default();
+        } else if lower.starts_with("sec-websocket-key:") {
+            ws_key = line
+                .split_once(':')
+                .map(|x| x.1.trim().to_string())
+                .unwrap_or_default();
+        }
+    }
+
+    // AUTH at the handshake, BEFORE any upgrade. KDF outside the store lock
+    // (M1). No WS key = not an upgrade attempt -> 401 too (nothing else on /ws).
+    let rec = store
+        .lock()
+        .map_err(|e| io::Error::other(format!("lock: {e}")))?
+        .hosts
+        .get(&host)
+        .cloned();
+    let ok = !ws_key.is_empty()
+        && valid_host(&host)
+        && matches!(
+            rec,
+            Some(r) if token.len() >= muxmesh_core::PREFIX_LEN && muxmesh_core::verify_token(&token, &r.hash)
+        );
+    if !ok {
+        tracing::warn!("{peer} /ws host={host} auth=FAIL -> 401 (no upgrade)");
+        return respond(&mut stream, 401, "unauthorized\n");
+    }
+
+    // complete the upgrade BY HAND (the head was consumed by the accept loop):
+    // 101 + Sec-WebSocket-Accept, then wrap the socket in a raw WS codec.
+    // The writer thread gets its OWN clone of the socket (a raw TcpStream can
+    // be read and written concurrently from two threads); this thread reads.
+    let accept_key = derive_accept_key(ws_key.as_bytes());
+    write!(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let ws_stream = stream
+        .try_clone()
+        .map_err(|e| io::Error::other(format!("try_clone: {e}")))?;
+    let mut ws: tungstenite::WebSocket<TcpStream> =
+        WebSocket::from_raw_socket(ws_stream, Role::Server, None);
+
+    let gen = WS_GEN.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut ch = channels
+            .lock()
+            .map_err(|e| io::Error::other(format!("lock: {e}")))?;
+        if let Some(old) = ch.insert(
+            host.clone(),
+            Channel {
+                queue: VecDeque::new(),
+                gen,
+            },
+        ) {
+            tracing::info!(
+                "/ws host={host}: replacing existing connection (gen {} -> {gen})",
+                old.gen
+            );
+        }
+    }
+    tracing::info!("{peer} /ws host={host} connected (gen {gen})");
+
+    // writer loop: drain the channel queue, push frames on this socket (its
+    // own socket clone — reads and writes never contend).
+    let w_channels = channels.clone();
+    let w_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return Err(io::Error::other("try_clone")),
+    };
+    let w_host = host.clone();
+    let writer = thread::spawn(move || {
+        let mut ws: tungstenite::WebSocket<TcpStream> =
+            WebSocket::from_raw_socket(w_stream, Role::Server, None);
+        loop {
+            let frame = {
+                let mut ch = match w_channels.lock() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                match ch.get_mut(&w_host) {
+                    Some(c) if c.gen == gen => loop {
+                        match c.queue.pop_front() {
+                            Some(q) if q.at.elapsed() > QUEUE_TTL => {
+                                tracing::warn!(
+                                    "/ws host={}: dropping stale frame id={} (queue ttl)",
+                                    w_host,
+                                    q.id
+                                );
+                            }
+                            Some(q) => break Some(Some(q.frame)),
+                            None => break Some(None), // empty: keep polling
+                        }
+                    },
+                    // replaced or gone -> stop touching this socket
+                    _ => None,
+                }
+            };
+            match frame {
+                Some(Some(f)) => {
+                    if let Err(e) = ws.send(Message::Text(f)) {
+                        tracing::warn!("/ws host={}: send: {e}", w_host);
+                        return;
+                    }
+                }
+                Some(None) => {} // queue empty: keep the session alive
+                None => return,  // channel superseded or closed -> end session
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    // reader loop: acks and pongs from the agent. Blocking read — a quiet
+    // agent is normal; liveness comes from the hub pinging every ~20 s and
+    // the agent's tungstenite auto-ponging inside its read(). A wedged
+    // half-open socket (NAT silent-drop, hung agent) surfaces here as a
+    // tungstenite Ping timeout error -> channel removed -> F10 gets 409
+    // instead of vanishing into a black hole.
+    let r_host = host.clone();
+    loop {
+        let msg = ws.read();
+        match msg {
+            Ok(Message::Text(text)) => match serde_json::from_str::<Ack>(&text) {
+                Ok(ack) => {
+                    tracing::info!(
+                        "/ws host={r_host} ack id={} ok={}{}",
+                        ack.id,
+                        ack.ok,
+                        ack.err
+                            .as_deref()
+                            .map(|e| format!(" err={e}"))
+                            .unwrap_or_default()
+                    );
+                    record_ack(state_path, lock, &r_host, &ack);
+                }
+                Err(e) => tracing::warn!("/ws host={r_host}: bad ack frame: {e}"),
+            },
+            Ok(Message::Ping(data)) => {
+                let _ = ws.send(Message::Pong(data));
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {} // binary/pong: ignored
+        }
+    }
+
+    // socket closed: remove OUR channel (a replacement connection keeps its own)
+    {
+        let mut ch = channels.lock().unwrap_or_else(|e| e.into_inner());
+        if ch.get(&host).is_some_and(|c| c.gen == gen) {
+            ch.remove(&host);
+        }
+    }
+    let _ = writer; // writer exits on its own once the channel is gone
+    tracing::info!("{peer} /ws host={host} disconnected (gen {gen})");
+    Ok(())
+}
+
+/// Mirror an agent ack into state.json's last_cmd (best effort — the driver
+/// reads it back via GET /state). Never fails the WS session.
+fn record_ack(state_path: &Path, lock: &Mutex<()>, host: &str, ack: &Ack) {
+    let _g = match lock.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut raw: serde_json::Value = fs::read_to_string(state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "hosts": {} }));
+    if !raw.get("hosts").is_some_and(|h| h.is_object()) {
+        raw["hosts"] = serde_json::json!({});
+    }
+    // the ack may arrive BEFORE the agent's first POST /state (test flow and
+    // cold start alike) — create the host entry rather than drop the ack.
+    if !raw["hosts"].get(host).is_some_and(|h| h.is_object()) {
+        raw["hosts"][host] = serde_json::json!({});
+    }
+    raw["hosts"][host]["last_cmd"] = serde_json::json!({
+        "id": ack.id,
+        "ok": ack.ok,
+        "err": ack.err,
+        "at": now_unix(),
+    });
+    if let Ok(json) = serde_json::to_string_pretty(&raw) {
+        if let Err(e) = write_bytes_atomic(state_path, json.as_bytes()) {
+            tracing::warn!("last_cmd write {host}: {e}");
+        }
+    }
+}
+
 fn handle(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
+    head: String,
     path: &Path,
     lock: &Mutex<()>,
     store: &Mutex<TokenStore>,
-    cfg: &HubConfig,
+    channels: &Channels,
 ) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-
-    // request line: "POST /state HTTP/1.1"
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    // The accept loop already read the head (request line + headers) and
+    // passed it as a value — parse it here; the socket is raw for the body.
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
 
-    // headers: Content-Length + host (X-Muxmesh-Host) + token + pair key
+    // headers: Content-Length + host (X-Muxmesh-Host) + token
+    // (header NAMES are case-insensitive; VALUES keep their case)
     let mut content_len: usize = 0;
     let mut header_host: Option<String> = None;
     let mut header_token: Option<String> = None;
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 || line == "\r\n" || line == "\n" {
-            break;
-        }
+    for line in lines {
         let lower = line.to_ascii_lowercase();
-        // header NAMES are case-insensitive (HTTP); the token VALUE keeps its case.
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_len = v.trim().parse().unwrap_or(0);
         } else if lower.starts_with("x-muxmesh-host:") {
-            let val = line.split_once(':').map(|x| x.1).unwrap_or("");
-            header_host = Some(val.trim().to_string());
+            header_host = Some(
+                line.split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
         } else if lower.starts_with("x-muxmesh-token:") {
-            let val = line.split_once(':').map(|x| x.1).unwrap_or("");
-            header_token = Some(val.trim().to_string());
+            header_token = Some(
+                line.split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
         }
+    }
+
+    // a /ws request that reached the plain handler means the accept loop did
+    // not classify it as an upgrade (missing/invalid headers) — reject, 401
+    // before any upgrade, never a bare 404.
+    if target.starts_with("/ws") {
+        tracing::warn!("{peer} {method} /ws without a valid upgrade -> 401");
+        return respond(&mut stream, 401, "unauthorized\n");
     }
 
     // AUTH: GET /state is open (badge pollers and `tree` are read-only and
@@ -270,21 +582,19 @@ fn handle(
         return respond(&mut stream, 200, &body);
     }
 
-    // driver -> HUB -> agent command relay. The hub authenticates the driver
-    // with its machine token (same registry as /state), checks the target is
-    // armed+fresh, then re-signs the request with that host's relay secret.
+    // driver -> HUB -> agent command dispatch (pushed on the agent's WS).
     if method == "POST" && target.starts_with("/cmd") {
-        // the /cmd body sits AFTER the headers we just consumed with
-        // read_line — read it from `reader`, not the raw socket.
+        // the /cmd body sits AFTER the headers already consumed by read_head —
+        // read exactly Content-Length bytes from the raw socket.
         let mut body = vec![0u8; content_len.min(1_048_576)];
         if !body.is_empty() {
-            reader.read_exact(&mut body)?;
+            stream.read_exact(&mut body)?;
         }
-        return handle_cmd_relay(
+        return handle_cmd(
             &mut stream,
             peer,
-            cfg,
             store,
+            channels,
             header_host,
             header_token,
             body,
@@ -331,7 +641,7 @@ fn handle(
     }
 
     let mut body = vec![0u8; content_len];
-    reader.read_exact(&mut body)?;
+    stream.read_exact(&mut body)?;
 
     // host: X-Muxmesh-Host header (source of truth), else the payload field
     let mut state: HostState = match serde_json::from_slice(&body) {
@@ -375,11 +685,19 @@ fn handle(
         }
     }
 
-    // merge under lock -> atomic write
+    // merge under lock -> atomic write. Raw JSON doc (not StateDoc) so the
+    // out-of-band last_cmd ack mirror survives the agent's next /state merge.
     let _g = lock
         .lock()
         .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-    let mut doc = read_doc(path);
+    let mut raw: serde_json::Value = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "hosts": {} }));
+    if !raw.get("hosts").is_some_and(|h| h.is_object()) {
+        raw["hosts"] = serde_json::json!({});
+    }
+    let hosts = raw.get_mut("hosts").unwrap();
     // trace BEFORE the move into the map (armed flag + session/window names),
     // so an operator can follow F10's chain (the driver reads THIS state).
     let trace = format!(
@@ -392,8 +710,14 @@ fn handle(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    doc.hosts.insert(host_key.clone(), state);
-    write_atomic(path, &doc)?;
+    let mut entry = serde_json::to_value(&state).map_err(std::io::Error::other)?;
+    // carry the ack mirror across the merge (the agent payload has no last_cmd)
+    if let Some(prev) = hosts.get(&host_key).and_then(|h| h.get("last_cmd")) {
+        entry["last_cmd"] = prev.clone();
+    }
+    hosts[&host_key] = entry;
+    let json = serde_json::to_string_pretty(&raw).map_err(std::io::Error::other)?;
+    write_bytes_atomic(path, json.as_bytes())?;
 
     tracing::debug!(
         "state updated host={host_key} {} -> {}",
@@ -404,82 +728,14 @@ fn handle(
     respond(&mut stream, 200, "ok\n")
 }
 
-/// Pure armed-check: the target must be a valid host AND present in the hub
-/// state doc, armed and seen within ttl. Extracted so it is unit-testable.
-fn target_armed(doc: &StateDoc, dst: &str, now: u64, ttl: u64) -> bool {
-    valid_host(dst) && doc.host_armed(dst, now, ttl)
-}
-
-/// POST /cmd to `host:port` with the hub's relay secret, then pass the raw
-/// response through to `stream`. Pattern mirrors the CLI's send_cmd: headers
-/// flushed FIRST (the agent read_line-buffers the head), body in a separate
-/// TCP segment. 5 s timeouts — LAN tool, fail fast.
-fn relay_cmd(
-    stream: &mut TcpStream,
-    host: &str,
-    port: u16,
-    token: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let addr = format!("{host}:{port}");
-    // connect with an explicit timeout: a firewalled dst drops SYNs and the
-    // OS default (~2 min) would hold a permit from the hub's pool for the
-    // whole time, starving /state. std-only: resolve then connect per-addr.
-    let mut peer = None;
-    let mut last_err = None;
-    for sa in addr.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
-            Ok(s) => {
-                peer = Some(s);
-                break;
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    let mut peer = match peer {
-        Some(s) => s,
-        None => {
-            return Err(last_err.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, addr)
-            }))
-        }
-    };
-    peer.set_read_timeout(Some(Duration::from_secs(5)))?;
-    peer.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let req = format!(
-        "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Host: hub\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    peer.write_all(req.as_bytes())?;
-    peer.flush()?;
-    // body in its own segment, after the header segment was flushed
-    peer.write_all(body)?;
-    peer.flush()?;
-    // pass the agent's response through, capped at 1 MiB (same cap as every
-    // other body path): a misbehaving peer must not OOM the hub.
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = peer.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        raw.extend_from_slice(&buf[..n]);
-        if raw.len() > 1_048_576 {
-            tracing::warn!("relay to {addr}: response over 1 MiB — dropping");
-            return respond(stream, 502, "relay response too large\n");
-        }
-    }
-    stream.write_all(&raw)?;
-    stream.flush()
-}
-
-/// POST /cmd relay: authenticate the driver, enforce target-armed, relay.
-fn handle_cmd_relay(
-    stream: &mut TcpStream,
+/// POST /cmd: authenticate the driver, check dst registered + WS-connected,
+/// enqueue the frame on the agent's channel, answer 202 queued immediately.
+/// The hub NEVER dials the agent — delivery happens on the agent's own socket.
+fn handle_cmd<W: Write>(
+    stream: &mut W,
     peer: std::net::SocketAddr,
-    cfg: &HubConfig,
     store: &Mutex<TokenStore>,
+    channels: &Channels,
     header_host: Option<String>,
     header_token: Option<String>,
     body: Vec<u8>,
@@ -489,13 +745,15 @@ fn handle_cmd_relay(
         return respond(stream, 400, "bad length\n");
     }
 
-    // closed list: unknown verbs die here, before any relay.
+    // closed list: unknown verbs die here, before any dispatch.
     let env: CommandEnvelope = match serde_json::from_slice(&body) {
         Ok(e) => e,
         Err(e) => return respond(stream, 422, &format!("invalid payload: {e}\n")),
     };
 
     // AUTH driver: same registry + same KDF verify as /state (KDF outside lock).
+    // dst is NOT checked before this: answering 400-before-401 would let an
+    // unauthenticated caller enumerate registered hosts.
     let host_hdr = header_host.unwrap_or_default();
     let got_token = header_token.unwrap_or_default();
     let rec = store
@@ -517,12 +775,8 @@ fn handle_cmd_relay(
         }
     }
 
-    // destination must be armed+fresh on the hub (LAN-only, closed verbs,
-    // target-armed — the operator's three constraints). dst must also be a
-    // registered host key: that pins the relay to machines you minted tokens
-    // for and closes the name-vs-key gap (a driver naming an arbitrary host).
     let dst = env.dst.clone();
-    if !valid_host(&dst) {
+    if dst.is_empty() || !valid_host(&dst) {
         return respond(stream, 400, "invalid dst\n");
     }
     let registered = store
@@ -533,40 +787,46 @@ fn handle_cmd_relay(
         tracing::warn!("{peer} POST /cmd dst={dst} -> 403 dst not registered");
         return respond(stream, 403, "dst not registered\n");
     }
-    let doc = read_doc(&cfg.state_path);
-    if !target_armed(&doc, &dst, now_unix(), cfg.ttl) {
-        tracing::warn!("{peer} POST /cmd dst={dst} -> 403 target not armed");
-        return respond(stream, 403, "target not armed\n");
-    }
-
-    // relay secret per destination, re-read per request (rotation without restart)
-    let relay_path = hub_relay_path(&cfg.tokens_path, &dst);
-    let relay = match fs::read_to_string(&relay_path) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            return respond(
-                stream,
-                502,
-                &format!("no relay secret for {dst} — re-run: muxmesh-hub generate-token {dst}\n"),
-            )
+    // the agent must hold a live WS channel RIGHT NOW — the hub has no other
+    // way (and no right) to reach it.
+    let enqueued = {
+        let mut ch = channels
+            .lock()
+            .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
+        match ch.get_mut(&dst) {
+            Some(c) => {
+                c.queue.push_back(Queued {
+                    id: env.id.clone(),
+                    frame: serde_json::to_string(&env).map_err(std::io::Error::other)?,
+                    at: Instant::now(),
+                });
+                true
+            }
+            None => false,
         }
     };
+    if !enqueued {
+        tracing::warn!("{peer} POST /cmd dst={dst} -> 409 target not connected");
+        return respond(stream, 409, "target not connected\n");
+    }
 
     tracing::info!(
-        "{peer} POST /cmd src={host_hdr} -> relay dst={dst}:{}",
-        cfg.cmd_port
+        "{peer} POST /cmd src={host_hdr} -> queued dst={dst} id={}",
+        env.id
     );
-    match relay_cmd(stream, &dst, cfg.cmd_port, &relay, &body) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            tracing::error!("relay {dst}:{}: {e}", cfg.cmd_port);
-            respond(
-                stream,
-                502,
-                &format!("relay to {dst}:{} failed: {e}\n", cfg.cmd_port),
-            )
-        }
-    }
+    // serde-serialized (env.id is CLI-generated today, but never hand-build JSON)
+    let body = serde_json::json!({"v":1,"id":env.id,"queued":true}).to_string() + "\n";
+    respond_json(stream, &body)
+}
+
+fn respond_json<W: Write>(stream: &mut W, body: &str) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
 }
 
 fn read_doc(path: &Path) -> StateDoc {
@@ -580,14 +840,18 @@ fn read_doc(path: &Path) -> StateDoc {
 /// tmp name is unique per write (pid + counter) so concurrent writers can never
 /// splice into the same scratch file, even across hub instances.
 fn write_atomic(path: &Path, doc: &StateDoc) -> std::io::Result<()> {
+    let json = doc.to_json_pretty().map_err(std::io::Error::other)?;
+    write_bytes_atomic(path, json.as_bytes())
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let json = doc.to_json_pretty().map_err(std::io::Error::other)?;
     let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.tmp.{}.{seq}", process::id()));
     let mut f = fs::File::create(&tmp)?;
-    f.write_all(json.as_bytes())?;
+    f.write_all(bytes)?;
     f.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -609,7 +873,10 @@ fn purge_and_write(path: &Path, ttl: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {
+/// Write a minimal HTTP/1.1 response with Connection: close. Works over a raw
+/// TcpStream or a BufReader<TcpStream> (Write forwards + flushes, so the
+/// reader's own buffer can never strand the response).
+fn respond<W: Write>(stream: &mut W, code: u16, body: &str) -> std::io::Result<()> {
     let status = match code {
         200 => "200 OK",
         201 => "201 Created",
@@ -617,8 +884,8 @@ fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()>
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
         404 => "404 Not Found",
+        409 => "409 Conflict",
         422 => "422 Unprocessable Entity",
-        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
@@ -704,51 +971,28 @@ mod tests {
     }
 
     #[test]
-    fn target_armed_requires_valid_host_and_fresh_entry() {
-        let now = now_unix();
+    fn record_ack_mirrors_last_cmd_into_state_json() {
+        let p = tmp_state("last-cmd");
         let mut doc = StateDoc::default();
         doc.hosts.insert(
             "host-a".into(),
             HostState {
                 host: "host-a".into(),
                 armed: true,
-                seen: now,
+                seen: now_unix(),
                 sessions: vec![],
             },
         );
-        doc.hosts.insert(
-            "host-off".into(),
-            HostState {
-                host: "host-off".into(),
-                armed: false,
-                seen: now,
-                sessions: vec![],
-            },
-        );
-        doc.hosts.insert(
-            "host-stale".into(),
-            HostState {
-                host: "host-stale".into(),
-                armed: true,
-                seen: now - 9_999,
-                sessions: vec![],
-            },
-        );
-        assert!(target_armed(&doc, "host-a", now, 30));
-        assert!(!target_armed(&doc, "host-off", now, 30)); // disarmed
-        assert!(!target_armed(&doc, "host-stale", now, 30)); // past ttl
-        assert!(!target_armed(&doc, "missing", now, 30)); // unknown host
-        assert!(!target_armed(&doc, "a b", now, 30)); // invalid host name
-        assert!(!target_armed(&doc, "", now, 30)); // empty dst
-    }
-
-    #[test]
-    fn relay_secret_absent_yields_502_hint() {
-        // pure check of the 502 branch message contract (no socket here)
-        let dst = "host-x";
-        let msg = format!("no relay secret for {dst} — re-run: muxmesh-hub generate-token {dst}\n");
-        assert!(msg.contains(dst));
-        assert!(msg.contains("generate-token"));
+        write_atomic(&p, &doc).unwrap();
+        let lock = Mutex::new(());
+        record_ack(&p, &lock, "host-a", &Ack::ok(1, "c-1"));
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(raw["hosts"]["host-a"]["last_cmd"]["id"], "c-1");
+        assert_eq!(raw["hosts"]["host-a"]["last_cmd"]["ok"], true);
+        // unknown host -> no panic, file untouched shape
+        record_ack(&p, &lock, "ghost", &Ack::err(1, "c-2", "nope"));
+        fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]

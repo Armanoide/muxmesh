@@ -292,18 +292,6 @@ impl TokenStore {
             .is_some_and(|rec| token.len() >= PREFIX_LEN && verify_token(token, &rec.hash))
     }
 
-    /// Authenticate a request token against ANY host (for hub-relayed /cmd,
-    /// where the target is named in the payload, not the header).
-    pub fn verify_any(&self, token: &str) -> Option<String> {
-        self.hosts.iter().find_map(|(host, rec)| {
-            if token.len() >= PREFIX_LEN && verify_token(token, &rec.hash) {
-                Some(host.clone())
-            } else {
-                None
-            }
-        })
-    }
-
     /// Revoke a machine: its next request 401s, others unaffected.
     pub fn revoke(&mut self, host: &str) -> bool {
         self.hosts.remove(host).is_some()
@@ -392,8 +380,6 @@ mod tests {
         assert!(!st.verify("host-b", &tok));
         assert!(!st.verify("host-a", "bogus"));
         assert!(!st.verify("host-a", ""));
-        assert_eq!(st.verify_any(&tok).as_deref(), Some("host-a"));
-        assert_eq!(st.verify_any("bogus"), None);
         // re-issue revokes the old token (dockhand semantics)
         let tok2 = st.issue("host-a").unwrap();
         assert!(!st.verify("host-a", &tok));

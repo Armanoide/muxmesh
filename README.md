@@ -4,26 +4,30 @@ One keystroke on your driver machine opens, focuses or attaches a tmux session
 on another machine — no interactive ssh, no credential-manager popups.
 
 ```
-            ┌────────────────────────────┐
-            │  hub (always-on machine)   │
-            │  muxmesh-hub :9997         │
-            │  POST/GET /state  POST /cmd  │
-            └───────▲──────────┬─────────┘
-     agents push  │          │  client reads state
-            ┌─────┴────┐  ┌───┴──────────┐
-            │ agent A  │  │ driver       │
-            │ tmux     │◄─│ F10 bar toggle │
-            │ local    │  │ POST /cmd      │
-            └──────────┘  └────────────────┘
+             ┌──────────────────────────────┐
+             │   hub (always-on machine)    │
+             │   muxmesh-hub :9997          │
+             │   GET /state  POST /cmd      │
+             └──▲──────────▲──────────┬─────┘
+   POST /state  │   WS /ws │          │ client reads state
+   (heartbeat)  │  (outbound│         │
+             ┌─┴──────────┐ │dial)  ┌─┴────────────┐
+             │ agent A    ├─┘       │ driver       │
+             │ tmux local │         │ F10 / send   │
+             └────────────┘         │ POST /cmd    │
+                                    └────────────────┘
 ```
 
-- **hub** — state aggregator + command relay on any always-on machine. It never executes
-  commands itself: it authenticates the driver, checks the target is armed+fresh,
-  then relays `POST /cmd` to it with that host's relay secret.
-- **agent** — runs on each server: pushes local tmux state, serves a closed list of `/cmd`
-  actions (auth: its own token OR its relay token).
-- **cli** — driver-side: badge in the tmux status bar, keys -> `POST /cmd` to the **hub**
-  (operator rule: agent→hub only, never driver→agent direct).
+- **hub** — state aggregator + command dispatcher on any always-on machine. It
+  never executes commands and it NEVER dials agents: agents hold a persistent
+  outbound WebSocket (`/ws`) to the hub. `POST /cmd` from a driver is queued
+  on the target's live WS channel (202) and pushed as a frame; the agent acks
+  on the same socket.
+- **agent** — runs on each server: pushes local tmux state (`POST /state`) and
+  dials `ws://hub/ws`, authenticating with its OWN machine token. It serves
+  NO inbound ports; commands arrive as WS frames on its own connection.
+- **cli** — driver-side: badge in the tmux status bar, keys -> `POST /cmd` to
+  the **hub** (operator rule: agent→hub only, never driver→agent direct).
 
 ## Design rules
 
@@ -33,31 +37,34 @@ on another machine — no interactive ssh, no credential-manager popups.
 - **Zero ssh on the read path**: agents push state to the hub over HTTP; the
   poller badges windows from `GET /state` (open, no secrets) + local pgrep.
   No `ssh` per poll cycle, ever.
-- **Shared token** (Atuin-like): `config.toml` is shareable and committed as a
-  template; the token lives in `~/.config/muxmesh/token` (0600, gitignored).
-  Constant-time comparison; missing token = reject everything.
-- **Commands flow driver → HUB → agent**: the CLI POSTs `/cmd` to the hub with
-  `dst: <host>` in the envelope. The hub authenticates the driver (same token
-  registry as `/state`), refuses unless the target is **armed+fresh** (403),
-  then relays to `dst:hub.cmd_port` signed with that host's **relay secret**
-  (`~/.muxmesh/relay/<host>.token`, 0600, minted by `generate-token`). The
-  agent accepts its own token (legacy direct) or the relay token (relayed).
+- **ONE machine token per host** (Atuin-like): `config.toml` is shareable and
+  committed as a template; the token lives in `~/.config/muxmesh/token` (0600,
+  gitignored). The same token authenticates `POST /state` AND the `/ws`
+  handshake. Constant-time comparison; missing token = reject everything.
+  No relay tokens exist anywhere in the protocol.
+- **Commands flow driver → HUB → agent's socket**: the CLI POSTs `/cmd` to the
+  hub with `dst: <host>` in the envelope. The hub authenticates the driver
+  (same token registry as `/state`), refuses unregistered targets (403) and
+  targets without a live WS channel (409 "target not connected"), otherwise
+  enqueues the frame and answers `202 {"queued":true}`. The writer loop pushes
+  the frame on the agent's socket (queue TTL ~10 s), the agent executes and
+  acks; the hub mirrors the ack into `state.json` as `last_cmd`. The target
+  never sees the driver's token — and the hub never opens a port to it.
 - **LAN only**: bind on your LAN interface; never expose these ports to the WAN.
   `bind = "0.0.0.0:9997"` is correct **only if a firewall sits in front**. On
   macOS, `0.0.0.0` can resolve route-to-loopback in surprising ways: bind the
   hub to its explicit LAN address (`bind = "10.0.10.3:9997"`) so clients that
-  dial the LAN IP actually reach it. The hub is plain-HTTP, thread-per-connection,
-  trusted LAN only — no TLS.
+  dial the LAN IP actually reach it. The hub is plain-HTTP/WS, thread-per-
+  connection, trusted LAN only — no TLS.
 
 ## Workspace
 
 ```
 muxmesh/
 ├── muxmesh-core/   # shared contract: HostState, Command (closed list), Ack, config
-├── muxmesh-hub/    # state pivot daemon (std::net only, offline build)
-├── muxmesh-agent/  # per-machine daemon (push /state, serve /cmd)
-├── muxmesh-cli/    # driver client (placeholder, brique 3)
-├── muxmesh-cli/    # driver client: badge poller (`poll`), state tree (`tree`), keys (brique 3)
+├── muxmesh-hub/    # state pivot daemon (std::net + tungstenite, /ws dispatch)
+├── muxmesh-agent/  # per-machine daemon (push /state, dial /ws, execute frames)
+├── muxmesh-cli/    # driver client: badge poller (`poll`), state tree (`tree`), send
 ```
 
 ## Quick start
@@ -66,18 +73,20 @@ muxmesh/
 # on every machine
 mkdir -p ~/.config/muxmesh
 cp config.toml.example ~/.config/muxmesh/config.toml
-openssl rand -hex 32 > ~/.config/muxmesh/token && chmod 600 ~/.config/muxmesh/token
+
+# on the pivot: mint ONE machine token per host, paste it on that machine
+muxmesh-hub generate-token host-a        # prints the token ONCE
+# -> paste into ~/.config/muxmesh/token (0600) on host-a
 
 just check                      # fmt + clippy -D warnings + tests
 cargo run --bin muxmesh-hub    # on the always-on machine (set hub.bind in config)
-MUXMESH_HOST=host-a cargo run --bin muxmesh-agent   # on each server
+MUXMESH_HOST=host-a cargo run --bin muxmesh-agent   # on each server (dials /ws)
 cargo run --bin muxmesh-cli poll   # debug only: hub/agent embed the poller already
 
-# send a closed-list command VIA THE HUB (POST /cmd to the hub, hub relays
-# to the target after checking it is armed+fresh). Auth: YOUR token in
-# ~/.config/muxmesh/token (the hub's registry knows you); MUXMESH_CMD_TOKEN
-# overrides. The target never sees your token — the hub re-signs with its
-# relay secret for that host.
+# send a closed-list command VIA THE HUB (POST /cmd to the hub; the hub queues
+# it on the target's WS channel and answers 202 "queued via hub"). Auth: YOUR
+# token in ~/.config/muxmesh/token (the hub's registry knows you);
+# MUXMESH_CMD_TOKEN overrides. The target never sees your token.
 cargo run --bin muxmesh-cli send host-a NewWindow main
 MUXMESH_CMD_TOKEN=<your-token> cargo run --bin muxmesh-cli send host-a NewSession build
 MUXMESH_CMD_TOKEN=<your-token> cargo run --bin muxmesh-cli send host-a FocusWindow main 2
@@ -90,9 +99,9 @@ The same physical F10 drives whichever tmux server owns the keystroke:
 
 - **Press F10 in a local window** → `muxmesh-cli bar-toggle` finds the armed
   host of the current window (live `ssh <host>` in a pane + host fresh on
-  the hub) and POSTs `BarHide`/`BarShow` **to the hub**, which relays them to
-  that machine's agent, which runs `tmux set -g status off|on` there. The
-  remote bar disappears; the local badge ` REMOTE host ` stays.
+  the hub) and POSTs `BarHide`/`BarShow` **to the hub**, which queues them on
+  that machine's WS channel; the agent runs `tmux set -g status off|on` there.
+  The remote bar disappears; the local badge ` REMOTE host ` stays.
 - **Press F10 inside a nested ssh session** (case: `ssh host` → `tmux`) →
   the keystroke reaches the REMOTE tmux server, whose own F10 binding runs
   `bar-toggle` locally there — no network, instant.
@@ -118,7 +127,7 @@ F10 needs `muxmesh-cli` on PATH; the badge poller runs embedded in muxmesh-hub/m
 
 ## Status
 
-- hub + agent + poller: working, tested (43 tests).
-- `/cmd` execution on the agent (`muxmesh-cli send`) + F10 one-bar toggle: working, E2E-tested (bindings parse clean; live keystroke UAT on real machines).
+- hub + agent + poller: working, tested.
+- `/cmd` dispatch over the agent's WS (`muxmesh-cli send` -> 202 queued) + F10 one-bar toggle: working, E2E-tested (bindings parse clean; live keystroke UAT on real machines).
 
 MIT.
