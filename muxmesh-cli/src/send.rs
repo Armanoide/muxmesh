@@ -154,10 +154,9 @@ fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String>
 }
 
 /// `muxmesh-cli bar-toggle` — the whole F10 logic, no if-shell in tmux.
-/// Finds the armed host of the current window (live detection), keeps the
-/// hidden/shown state in a per-window tmux user option (@muxmesh-bar-hidden,
-/// written/read via tmux show/set-window-option — the state lives in the
-/// tmux server, Rust is just the brain), and POSTs BarHide or BarShow.
+/// Finds the armed host of the current window (live detection), reads the
+/// bar's hidden state from tmux itself (`show-options -g status` — tmux is
+/// the source of truth, no local flag), and POSTs BarHide or BarShow.
 pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
@@ -176,13 +175,13 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         }
     };
 
-    // hidden-state of THIS server's bar (window option, survives presses)
-    let hidden_now = muxmesh_core::poll::tmux_out(
-        &base,
-        &["show-window-option", "-t", &wid, "@muxmesh-bar-hidden"],
-    )
-    .map(|o| o.ends_with("on"))
-    .unwrap_or(false);
+    // hidden-state of THIS server's bar: tmux itself knows. `status` is a
+    // server-global option; after `set -g status off`, show-options answers
+    // "status off" (verified on tmux 3.3a). No local flag to maintain — the
+    // old @muxmesh-bar-hidden window option was fragile (scope) and redundant.
+    let hidden_now = muxmesh_core::poll::tmux_out(&base, &["show-options", "-g", "status"])
+        .map(|o| o.trim().ends_with("off"))
+        .unwrap_or(false);
     tracing::debug!("bar-toggle: step 1 ok — window {wid}, bar-hidden={hidden_now}");
 
     let host = armed_host_of_current_window(cfg);
@@ -239,10 +238,6 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 // press 1: parent yields the screen — hide local, show remote.
                 tracing::info!("bar-toggle: PARENT press 1 — hide local, show remote {h}");
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
-                muxmesh_core::poll::run_tmux(
-                    &base,
-                    &["set-window-option", "-t", &wid, "@muxmesh-bar-hidden", "on"],
-                );
                 muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
                 let ok = post(Command::BarShow, "BarShow");
                 println!(
@@ -258,16 +253,6 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 // press 2: parent takes the screen back — show local, hide remote.
                 tracing::info!("bar-toggle: PARENT press 2 — show local, hide remote {h}");
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
-                muxmesh_core::poll::run_tmux(
-                    &base,
-                    &[
-                        "set-window-option",
-                        "-t",
-                        &wid,
-                        "@muxmesh-bar-hidden",
-                        "off",
-                    ],
-                );
                 muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
                 let ok = post(Command::BarHide, "BarHide");
                 println!(
@@ -290,16 +275,6 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 "bar-toggle: CHILD/local branch — no armed ssh here, toggling THIS server's bar -> status {next}"
             );
             muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", next]);
-            muxmesh_core::poll::run_tmux(
-                &base,
-                &[
-                    "set-window-option",
-                    "-t",
-                    &wid,
-                    "@muxmesh-bar-hidden",
-                    if hidden_now { "off" } else { "on" },
-                ],
-            );
             muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
             println!("muxmesh: local bar {next}");
             0
