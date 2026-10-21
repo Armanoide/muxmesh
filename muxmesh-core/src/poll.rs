@@ -124,10 +124,20 @@ pub fn tmux_base(socket: &Option<String>) -> Vec<String> {
     }
 }
 
+/// Run a tmux command, logging stderr on failure (a silent failure here is
+/// how the bar-hidden flag stopped persisting — never swallow it again).
 pub fn run_tmux(base: &[String], args: &[&str]) {
     let mut cmd = Command::new(&base[0]);
     cmd.args(&base[1..]).args(args);
-    let _ = cmd.output();
+    if let Ok(o) = cmd.output() {
+        if !o.status.success() {
+            tracing::warn!(
+                "tmux {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+    }
 }
 
 /// Run a tmux command, returning stdout on success (stderr captured for debug).

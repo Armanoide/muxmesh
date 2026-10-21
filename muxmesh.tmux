@@ -18,9 +18,11 @@ tmux set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:
 # be declared here to survive presses and server restarts. Without these the
 # hidden flag never persists -> every F10 reads "not hidden" -> press 2 can
 # never restore the parent bar (observed in UAT).
-tmux set-option -gq @muxmesh-bar-hidden off
-tmux set-window-option -gq @muxmesh-armed-win 0
+# SCOPE MATTERS: the CLI sets these with `set-window-option -t <window>`,
+# which requires a WINDOW-Scope default. A global (-g) declaration does NOT
+# satisfy the per-window check -> "invalid option" persists (observed).
 tmux set-window-option -gq @muxmesh-bar-hidden off
+tmux set-window-option -gq @muxmesh-armed-win 0
 tmux set-window-option -gq @muxmesh-status ""
 
 # F10: one-bar toggle against the armed remote host (Rust decides everything).
