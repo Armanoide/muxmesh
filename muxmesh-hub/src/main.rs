@@ -299,7 +299,7 @@ fn handle(
     let host_key = if host_hdr.is_empty() {
         state.host.clone()
     } else {
-        host_hdr
+        host_hdr.clone()
     };
     if host_key.is_empty() {
         return respond(&mut stream, 400, "missing host\n");
@@ -313,6 +313,13 @@ fn handle(
     }
     for s in &state.sessions {
         if !valid_name(&s.name) || (!s.active_window.is_empty() && !valid_name(&s.active_window)) {
+            // name the rejected value: tmux allows ':' in window names, our
+            // whitelist does not -> without this the 400 is undiagnosable.
+            tracing::warn!(
+                "rejecting session name='{}' active_window='{}' from host={host_hdr} (valid_name=[A-Za-z0-9_-])",
+                s.name,
+                s.active_window
+            );
             return respond(&mut stream, 400, "invalid session name\n");
         }
     }

@@ -256,7 +256,13 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
                 muxmesh_core::poll::run_tmux(
                     &base,
-                    &["set-window-option", "-t", &wid, "@muxmesh-bar-hidden", "off"],
+                    &[
+                        "set-window-option",
+                        "-t",
+                        &wid,
+                        "@muxmesh-bar-hidden",
+                        "off",
+                    ],
                 );
                 muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
                 let ok = post(Command::BarHide, "BarHide");
