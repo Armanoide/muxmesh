@@ -62,7 +62,7 @@ on another machine — no interactive ssh, no credential-manager popups.
 ```
 muxmesh/
 ├── muxmesh-core/   # shared contract: HostState, Command (closed list), Ack, config
-├── muxmesh-hub/    # state pivot daemon (std::net + tungstenite, /ws dispatch)
+├── muxmesh-hub/    # state pivot daemon (axum + tokio, /agent/ws dispatch)
 ├── muxmesh-agent/  # per-machine daemon (push /state, dial /ws, execute frames)
 ├── muxmesh-cli/    # driver client: badge poller (`poll`), state tree (`tree`), send
 ```

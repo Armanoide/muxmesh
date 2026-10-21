@@ -5,11 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 # Agent on each remote machine: reads its local tmux, POSTs state to the hub.
-# ureq = minimal blocking HTTP client.
+# ureq = minimal blocking HTTP client (short outbound pushes only).
+# tokio-tungstenite = persistent outbound WS command channel.
 
 [dependencies]
 tracing = { workspace = true }
 muxmesh-core = { workspace = true }
 serde_json = { workspace = true }
 ureq = "2"
-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
+futures-util.workspace = true
+tokio = { workspace = true }

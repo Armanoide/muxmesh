@@ -1,23 +1,41 @@
-//! muxmesh-agent — daemon on a remote machine.
+//! muxmesh-agent — daemon on a remote machine (tokio + tokio-tungstenite).
 //!
-//! Reads its LOCAL tmux (unix socket, free) and POSTs the state to the hub.
-//! No ssh, no forwarded SSH agent consulted -> no credential-manager popups.
+//! Reads its LOCAL tmux (unix socket, free) and POSTs the state to the hub
+//! (ureq — short outbound HTTP, blocking is fine). No ssh, no forwarded SSH
+//! agent consulted -> no credential-manager popups.
 //!
-//! Commands arrive on the agent's OWN OUTBOUND WebSocket (/ws): the agent
-//! dials the hub at startup and holds the channel open forever (auto-reconnect,
-//! 2 s backoff). The hub NEVER dials the agent — the agent serves NOTHING
-//! inbound. A pushed CommandEnvelope (dst == own host) executes on the live
-//! tmux socket and the agent replies with an ack frame {v,id,ok,err}.
+//! Commands arrive on the agent's OWN OUTBOUND WebSocket (/agent/ws): the
+//! agent dials the hub at startup and holds the channel open forever
+//! (reconnect loop, exponential backoff 1s->30s, reset on success). The hub
+//! NEVER dials the agent — the agent serves NOTHING inbound. A pushed
+//! CommandEnvelope (dst == own host) executes on the live tmux socket and the
+//! agent replies with an ack frame {v,id,ok,err}.
+//!
+//! Keepalive: the agent sends a WS ping every 30 s; tungstenite answers the
+//! hub's pings automatically (never reply manually). Two consecutive sent
+//! pings without a pong -> drop the connection -> reconnect loop.
 //!
 //! Cadence: heartbeat every 15 s by default (MUXMESH_INTERVAL). tmux alive -> armed:true.
 //! tmux absent -> armed:false (the hub disarms at TTL).
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use muxmesh_core::{now_unix, Ack, CommandEnvelope, HostState, RemoteSession};
-use tungstenite::{connect, Message};
+use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
+
+/// Keepalive cadence: one WS ping per 30 s.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Drop the connection after this many consecutive unanswered sent pings.
+const MAX_MISSED_PONGS: u64 = 2;
 
 /// Live local tmux? sessions + active window per session.
 /// Returns (armed, sessions).
@@ -107,7 +125,8 @@ fn build_state(host: &str) -> HostState {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default. Token = separate file.
     let args: Vec<String> = std::env::args().skip(1).collect();
     // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
@@ -118,9 +137,9 @@ fn main() {
 
     // The machine token is minted OFFLINE on the hub (`muxmesh-hub
     // generate-token <host>`) and pasted here as ~/.config/muxmesh/token.
-    // It signs BOTH POST /state and the /ws handshake. The file is re-read
-    // per push/per reconnect, so pasting (or rotating) it takes effect
-    // without restarting the agent. Absent => 401s, with a hint.
+    // It signs BOTH POST /state and the /agent/ws handshake. The file is
+    // re-read per push/per reconnect, so pasting (or rotating) it takes
+    // effect without restarting the agent. Absent => 401s, with a hint.
     if muxmesh_core::read_token().as_str().is_empty() {
         tracing::warn!("no token (~/.config/muxmesh/token) -> the hub will reject (401). Mint one: muxmesh-hub generate-token {}", cfg.host);
     }
@@ -129,71 +148,85 @@ fn main() {
     // Embedded badge poller: the agent's own machine gets @muxmesh-status
     // badges automatically. It targets the agent's own push target
     // ([agent] hub), not the hub-side bind default — a remote agent
-    // configured with only [agent] hub still works.
+    // configured with only [agent] hub still works. Blocking ureq+tmux ->
+    // dedicated std::thread, off the tokio runtime.
     {
         let mut poll_cfg = muxmesh_core::HubConfig::load();
         poll_cfg.poll_hub = muxmesh_core::agent_poll_hub(&cfg);
         thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
     }
 
-    // WS command channel on its own thread: dial out, hold open, execute.
-    {
-        let ws_cfg = cfg.clone();
-        thread::spawn(move || ws_channel(&ws_cfg));
-    }
-
     // heartbeat: debug per cycle (quiet at default INFO); WARN on push failure;
     // INFO only when armed/sessions state CHANGES — a running agent must not
-    // spam the pane it lives in.
-    let mut last = (false, usize::MAX);
-    loop {
-        let token = muxmesh_core::read_token().as_str().to_string();
-        let state = build_state(&cfg.host);
-        let ok = push(&url, &cfg.host, &token, &state);
-        tracing::debug!(
-            "armed={} sessions={} push={}",
-            state.armed,
-            state.sessions.len(),
-            if ok { "ok" } else { "FAIL" }
-        );
-        if !ok {
-            tracing::warn!(
-                "armed={} sessions={} push=FAIL",
-                state.armed,
-                state.sessions.len()
-            );
-        } else if (state.armed, state.sessions.len()) != last {
-            tracing::info!(
-                "armed={} sessions={} push=ok",
-                state.armed,
-                state.sessions.len()
-            );
-        }
-        last = (state.armed, state.sessions.len());
-        thread::sleep(Duration::from_secs(cfg.interval));
+    // spam the pane it lives in. Blocking ureq+tmux -> dedicated std::thread
+    // (same pattern as the poller), off the tokio runtime.
+    let ws = ws_channel(Arc::new(cfg.clone()));
+    {
+        let cfg = cfg.clone();
+        thread::spawn(move || {
+            let mut last = (false, usize::MAX);
+            loop {
+                let token = muxmesh_core::read_token();
+                let state = build_state(&cfg.host);
+                let ok = push(&cfg.url(), &cfg.host, token.as_str(), &state);
+                tracing::debug!(
+                    "armed={} sessions={} push={}",
+                    state.armed,
+                    state.sessions.len(),
+                    if ok { "ok" } else { "FAIL" }
+                );
+                if !ok {
+                    tracing::warn!(
+                        "armed={} sessions={} push=FAIL",
+                        state.armed,
+                        state.sessions.len()
+                    );
+                } else if (state.armed, state.sessions.len()) != last {
+                    tracing::info!(
+                        "armed={} sessions={} push=ok",
+                        state.armed,
+                        state.sessions.len()
+                    );
+                }
+                last = (state.armed, state.sessions.len());
+                thread::sleep(Duration::from_secs(cfg.interval));
+            }
+        });
     }
+
+    ws.await; // the WS channel reconnects forever; main just keeps it alive
 }
 
-/// Persistent outbound WS channel: connect /ws with the machine token headers,
-/// execute pushed commands, ack them. Auto-reconnect every 2 s; logs state
-/// changes only (never the token).
-/// shortcut: fixed 2 s backoff, no jitter — fine at homelab scale, add
-/// exponential+jitter if many agents ever hammer a restarting hub.
-fn ws_channel(cfg: &muxmesh_core::AgentConfig) {
-    let url = cfg.ws_url();
+/// Persistent outbound WS channel: dial /agent/ws with the machine token
+/// headers, execute pushed commands, ack them. Reconnect with exponential
+/// backoff 1s -> 30s (reset on a successful session); logs state changes only
+/// (never the token).
+/// shortcut: no jitter on the backoff — fine at homelab scale, add jitter if
+/// many agents ever hammer a restarting hub.
+async fn ws_channel(cfg: Arc<muxmesh_core::AgentConfig>) {
+    let url = {
+        // core's ws_url() is the legacy /ws path; the axum hub serves both,
+        // canonical /agent/ws wins.
+        let legacy = cfg.ws_url();
+        match legacy.strip_suffix("/ws") {
+            Some(prefix) => format!("{prefix}/agent/ws"),
+            None => legacy,
+        }
+    };
+    let mut backoff = Duration::from_secs(1);
     loop {
         let token = muxmesh_core::read_token().as_str().to_string();
         if token.is_empty() {
-            tracing::warn!("ws: no token -> retrying in 2s");
-            thread::sleep(Duration::from_secs(2));
+            tracing::warn!("ws: no token -> retrying in 1s");
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
-        let backoff = match connect_with_auth(&url, &cfg.host, &token) {
-            Ok((mut ws, resp)) => {
+        match connect_with_auth(&url, &cfg.host, &token).await {
+            Ok((ws, resp)) => {
                 tracing::info!("ws: connected to {url} (status {})", resp.status());
-                ws_session(cfg, &mut ws);
-                tracing::warn!("ws: channel closed -> reconnecting in 2s");
-                Duration::from_secs(2)
+                ws_session(&cfg, ws).await;
+                tracing::warn!("ws: channel closed -> reconnecting");
+                backoff = Duration::from_secs(1); // success resets the ramp
             }
             Err(e) => {
                 // revoked/bad token: 100k-round KDF per handshake is real CPU —
@@ -201,81 +234,153 @@ fn ws_channel(cfg: &muxmesh_core::AgentConfig) {
                 // a fresh one recovers without restart.
                 let denied = matches!(
                     &e,
-                    tungstenite::Error::Http(resp) if resp.status() == 401
+                    tokio_tungstenite::tungstenite::Error::Http(resp) if resp.status() == 401
                 );
-                let wait = if denied {
-                    Duration::from_secs(30)
-                } else {
-                    Duration::from_secs(2)
-                };
+                if denied {
+                    backoff = Duration::from_secs(30);
+                }
                 tracing::warn!(
                     "ws: connect {url} failed: {e} -> retry in {}s",
-                    wait.as_secs()
+                    backoff.as_secs()
                 );
-                wait
             }
-        };
-        thread::sleep(backoff);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
-/// Dial the hub's /ws with X-Muxmesh-Host + X-Muxmesh-Token (own machine
-/// token — the same identity as POST /state, zero relay tokens).
+/// Dial the hub's /agent/ws with X-Muxmesh-Host + X-Muxmesh-Token (own
+/// machine token — the same identity as POST /state, zero relay tokens).
 #[allow(clippy::result_large_err)] // tungstenite::Error is theirs, not ours to box
-fn connect_with_auth(
+async fn connect_with_auth(
     url: &str,
     host: &str,
     token: &str,
-) -> tungstenite::Result<(
-    tungstenite::WebSocket<WsStream>,
-    tungstenite::handshake::client::Response,
+) -> tokio_tungstenite::tungstenite::Result<(
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
 )> {
-    use tungstenite::client::IntoClientRequest;
-    let mut req = url.into_client_request()?;
-    let h = req.headers_mut();
+    let mut req = url.into_client_request().map_err(|_| {
+        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid ws url",
+        ))
+    })?;
     // header values must be visible ASCII: a malformed pasted token must not
     // panic the agent — fail the attempt, the loop re-reads the file.
     let (hv, tv) = match (host.parse(), token.parse()) {
         (Ok(h), Ok(t)) => (h, t),
         _ => {
             tracing::error!("ws: host/token contain invalid header characters (check token file)");
-            return Err(tungstenite::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid header value",
-            )));
+            return Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid header value"),
+            ));
         }
     };
+    let h = req.headers_mut();
     h.insert("X-Muxmesh-Host", hv);
     h.insert("X-Muxmesh-Token", tv);
-    connect(req)
+    connect_async(req).await
 }
 
-/// The concrete stream type tungstenite's `connect()` returns for ws:// URLs.
-type WsStream = tungstenite::stream::MaybeTlsStream<std::net::TcpStream>;
-
 /// Read pushed frames until the socket dies: parse the closed-list envelope,
-/// execute on the live tmux socket, ack. Non-command frames are ignored.
-/// tungstenite answers hub pings with pong automatically inside read() —
-/// that is the keepalive: a wedged half-open socket surfaces as a ping
-/// timeout -> return -> the channel reconnects.
-fn ws_session(cfg: &muxmesh_core::AgentConfig, ws: &mut tungstenite::WebSocket<WsStream>) {
-    loop {
-        match ws.read() {
-            Ok(Message::Text(text)) => {
-                if let Some(ack) = dispatch_command(cfg, &cfg.host, text.as_str()) {
-                    if ws.send(Message::Text(ack)).is_err() {
-                        return;
+/// execute on the live tmux socket (Command is std-blocking; shortcut: run
+/// inline — a hung tmux client stalls the reader, acceptable at homelab
+/// scale; wrap dispatch in spawn_blocking if it ever bites), ack.
+/// Also: send our own ping every 30 s and drop the connection after
+/// MAX_MISSED_PONGS unanswered pings (dead hub). tungstenite answers hub
+/// pings with pong automatically — never reply manually.
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn ws_session(cfg: &muxmesh_core::AgentConfig, ws: Ws) {
+    let (mut sink, mut stream) = ws.split();
+    // liveness counters are SESSION-local: statics shared across reconnects
+    // would corrupt the missed-pong accounting between sessions.
+    let last_ping_seq = Arc::new(AtomicU64::new(0)); // last ping WE sent
+    let alive_seq = Arc::new(AtomicU64::new(0)); // last ping the hub answered
+                                                 // outbound frames (acks + keepalive pings) go through one channel so a
+                                                 // single task owns the sink (a SplitSink cannot be shared).
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    // ping loop: outbound keepalive, seq-stamped so pongs prove liveness.
+    let tx_p = tx.clone();
+    let last_ping_p = last_ping_seq.clone();
+    let pinger = async move {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ping.tick().await;
+            let seq = last_ping_p.fetch_add(1, Ordering::Relaxed) + 1;
+            if tx_p.send(Message::Ping(seq.to_string().into())).is_err() {
+                return; // writer gone -> session over
+            }
+        }
+    };
+
+    // writer task: the ONLY owner of the sink.
+    let writer = async {
+        while let Some(msg) = rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                return; // socket error -> session over
+            }
+        }
+    };
+
+    let last_ping_r = last_ping_seq.clone();
+    let alive_r = alive_seq.clone();
+    let reader = async move {
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Some(ack) = dispatch_command(cfg, &cfg.host, text.as_str()) {
+                        if tx.send(Message::Text(ack.into())).is_err() {
+                            return;
+                        }
                     }
                 }
-            }
-            Ok(Message::Ping(data)) => {
-                if ws.send(Message::Pong(data)).is_err() {
+                Ok(Message::Pong(data)) => {
+                    // tungstenite echoes the ping payload back verbatim: a pong
+                    // carrying our latest sent seq proves the hub is alive.
+                    let seq: u64 = String::from_utf8_lossy(&data).parse().unwrap_or(0);
+                    if seq != 0 && seq == last_ping_r.load(Ordering::Relaxed) {
+                        alive_r.store(seq, Ordering::Relaxed);
+                    }
+                }
+                Ok(Message::Close(_)) => return,
+                Ok(_) => {} // binary/ping: ping auto-answered by tungstenite
+                Err(e) => {
+                    tracing::warn!("ws: recv error: {e}");
                     return;
                 }
             }
-            Ok(Message::Close(_)) | Err(_) => return,
-            Ok(_) => {} // binary/pong: ignored
         }
+    };
+
+    // Dead-hub watchdog: MAX_MISSED_PONGS pings sent without a matching pong
+    // -> end the session so the reconnect loop takes over. A silent half-open
+    // socket surfaces here, not as a read timeout (there is none).
+    let last_ping_w = last_ping_seq.clone();
+    let alive_w = alive_seq.clone();
+    let watchdog = async move {
+        loop {
+            tokio::time::sleep(PING_INTERVAL).await;
+            let last = last_ping_w.load(Ordering::Relaxed);
+            if last.saturating_sub(alive_w.load(Ordering::Relaxed)) >= MAX_MISSED_PONGS {
+                tracing::warn!(
+                    "ws: {MAX_MISSED_PONGS} unanswered pings -> dropping connection (dead hub)"
+                );
+                return;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = reader => {}
+        _ = pinger => {}
+        _ = writer => {}
+        _ = watchdog => {}
     }
 }
 

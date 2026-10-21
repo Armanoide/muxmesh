@@ -1,87 +1,110 @@
 //! muxmesh-hub — state aggregator + command dispatcher (runs on the always-on
 //! pivot machine).
 //!
-//! Listens on TCP :9997. Agents POST /state (JSON HostState); the hub merges
-//! into state.json with ATOMIC writes (tmp + rename) so readers (tmux status
-//! bar, CLI) never see a half-written file.
+//! One axum server on ONE port (tokio runtime). Agents POST /state (JSON
+//! HostState); the hub merges into state.json with ATOMIC writes (tmp +
+//! rename) so readers (tmux status bar, CLI) never see a half-written file.
 //!
-//! Commands flow driver -> HUB -> agent over the agent's OWN outbound WebSocket:
-//! the hub NEVER dials an agent (no outbound TcpStream here, ever). Each agent
-//! holds a persistent WS connection (/ws), authenticated at the handshake with
-//! X-Muxmesh-Host + X-Muxmesh-Token = its own machine token (same registry and
-//! KDF as POST /state). A driver POSTs /cmd; the hub authenticates it, checks
-//! dst is registered + WS-connected right now, enqueues the frame on that
-//! agent's channel and answers 202 queued immediately. The agent executes tmux
-//! locally and replies with an ack frame {v,id,ok,err}, which the hub logs
-//! (and mirrors into state.json's last_cmd so the driver can read it back via
-//! GET /state). std::net + tungstenite (sync) only -> trusted LAN, no TLS.
+//! Commands flow driver -> HUB -> agent over the agent's OWN outbound WebSocket
+//! (/agent/ws): the hub NEVER dials an agent. Each agent holds a persistent WS
+//! session, authenticated at the handshake from headers BEFORE the upgrade
+//! (X-Muxmesh-Host + X-Muxmesh-Token = its own machine token — same registry
+//! and KDF as POST /state; 401 before any 101). A driver POSTs /cmd; the hub
+//! authenticates it, checks dst is registered + has a LIVE ws channel right
+//! now, enqueues the frame on that channel's mpsc sender and answers 202
+//! queued immediately. The agent executes tmux locally and replies with an ack
+//! frame {v,id,ok,err}, which the hub logs (and mirrors into state.json's
+//! last_cmd so the driver can read it back via GET /state).
+//!
+//! Liveness: the hub pings each agent every 30 s; two consecutive unanswered
+//! pings close the channel (dead-peer detection). There is NO socket read
+//! timeout — a quiet persistent channel is normal (the old 5 s accept-loop
+//! timeout killed every WS at 5.07 s; that bug is structurally gone).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use tokio::sync::mpsc::UnboundedSender;
 
 use muxmesh_core::{
     now_unix, valid_host, valid_name, Ack, CommandEnvelope, HostState, HubConfig, StateDoc,
     TokenStore,
 };
-use tungstenite::{handshake::derive_accept_key, protocol::Role, Message, WebSocket};
 
 /// Monotonic counter for unique tmp filenames (see write_atomic).
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Monotonic id for /ws connection generations (channel takeover).
+/// Monotonic id for /agent/ws connection generations (channel takeover).
 static WS_GEN: AtomicU64 = AtomicU64::new(1);
 
-/// In-flight connection guard: threads are cheap but unbounded is not "bounded".
-/// Acquire before reading a body; over cap -> 503. LAN tool, generous cap.
-const MAX_INFLIGHT: usize = 64;
-static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Keepalive cadence: one WS ping per agent per interval.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
-struct Permit;
-impl Permit {
-    fn acquire() -> Option<Self> {
-        if INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
-            INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-            None
-        } else {
-            Some(Permit)
-        }
-    }
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-    }
+/// Close a channel after this many consecutive unanswered pings (dead peer).
+const MAX_MISSED_PONGS: u32 = 2;
+
+/// Cap on the /cmd body (a command envelope is a few hundred bytes).
+const MAX_CMD_BODY: usize = 1_048_576;
+
+/// Shared hub state: token registry (digests only), state.json path + write
+/// serialization, and one live mpsc channel per connected host.
+struct AppState {
+    tokens: Mutex<TokenStore>,
+    state_path: PathBuf,
+    write_lock: Mutex<()>,
+    channels: Mutex<HashMap<String, Sender>>,
 }
 
-/// A queued command frame waiting to go out on an agent's WS channel.
-struct Queued {
-    id: String,
-    frame: String,
-    at: Instant,
-}
-
-/// Per-host dispatch channel. POST /cmd handlers only ever push frames onto
-/// `queue`; the writer thread of the CURRENT connection drains it. `gen`
-/// makes takeover safe: a replaced connection's writer stops when its gen is
-/// superseded, so a dead socket is never written to again.
-struct Channel {
-    queue: VecDeque<Queued>,
+/// A live WS session for one host. POST /cmd only ever pushes onto `tx`;
+/// the session task drains it. `gen` makes takeover safe: a replaced session's
+/// task stops when its gen is superseded, so a dead socket is never used again.
+struct Sender {
+    tx: UnboundedSender<String>,
     gen: u64,
 }
 
-type Channels = Arc<Mutex<HashMap<String, Channel>>>;
+impl AppState {
+    /// Authenticate `host`+`token` against the registry. The record is cloned
+    /// out of the lock and the KDF runs OUTSIDE it — otherwise every auth
+    /// serializes behind 100k sha256 rounds.
+    fn auth_ok(&self, host: &str, token: &str) -> bool {
+        let rec = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hosts
+            .get(host)
+            .cloned();
+        matches!(
+            rec,
+            Some(r)
+                if token.len() >= muxmesh_core::PREFIX_LEN
+                    && muxmesh_core::verify_token(token, &r.hash)
+        )
+    }
 
-/// TTL of a queued frame: an agent that has not drained within ~10 s is wedged
-/// — a stale bar toggle must never fire late.
-const QUEUE_TTL: Duration = Duration::from_secs(10);
+    /// Read a header value (names are case-insensitive; values keep their case).
+    fn hdr(map: &HeaderMap, name: &str) -> String {
+        map.get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+}
 
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default.
@@ -93,27 +116,27 @@ fn main() {
 
     // Console mode (herdr-style `add machine`): mint a token for a host,
     // print it ONCE, exit. No server, no network. The operator pastes the
-    // output on the agent machine; the agent then dials /ws with it.
+    // output on the agent machine; the agent then dials /agent/ws with it.
     if args.first().map(|s| s.as_str()) == Some("generate-token") {
         generate_token(&cfg, &args[1..]); // diverges (process::exit)
     }
 
     // Per-machine token registry (digests only).
     let tokens_path = cfg.tokens_path.clone();
-    let store: Arc<Mutex<TokenStore>> = Arc::new(Mutex::new(TokenStore::load(&tokens_path)));
-    if store.lock().unwrap().hosts.is_empty() {
-        tracing::warn!("no registered hosts in {} -> every /state POST and /ws handshake is 401 until you mint one: muxmesh-hub generate-token <host>", tokens_path.display());
+    let store = TokenStore::load(&tokens_path);
+    if store.hosts.is_empty() {
+        tracing::warn!("no registered hosts in {} -> every /state POST and /agent/ws handshake is 401 until you mint one: muxmesh-hub generate-token <host>", tokens_path.display());
     }
 
     // Embedded badge poller: tmux windows on THIS machine get the
     // @muxmesh-status badge without the operator launching anything. On a
-    // headless pivot (no tmux server) it is inert by design.
+    // headless pivot (no tmux server) it is inert by design. Spawned as a
+    // plain std::thread BEFORE the tokio runtime (it is blocking ureq+tmux).
     {
         let poll_cfg = cfg.clone();
         thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
     }
 
-    let bind = cfg.bind.clone();
     let state_path = cfg.state_path.clone();
 
     // purge once at startup (expired entries disappear from the file)
@@ -121,99 +144,475 @@ fn main() {
         tracing::error!("initial purge failed: {e}");
     }
 
-    let listener = match TcpListener::bind(&bind) {
-        Ok(l) => l,
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
         Err(e) => {
-            tracing::error!("bind {bind} failed: {e}");
+            tracing::error!("tokio runtime: {e}");
             process::exit(1);
         }
     };
-    tracing::info!(
-        "listening on {bind} -> {} (tokens: {}, agents dial /ws)",
-        state_path.display(),
-        tokens_path.display()
-    );
+    if let Err(e) = rt.block_on(run(cfg, store)) {
+        tracing::error!("server: {e}");
+        process::exit(1);
+    }
+}
 
-    // serialize file writes (one POST at a time)
-    let lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-    // live WS dispatch channels, host -> channel
-    let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
+/// Build the router and serve until the listener dies.
+async fn run(cfg: HubConfig, store: TokenStore) -> std::io::Result<()> {
+    let state = Arc::new(AppState {
+        tokens: Mutex::new(store),
+        state_path: cfg.state_path.clone(),
+        write_lock: Mutex::new(()),
+        channels: Mutex::new(HashMap::new()),
+    });
+
+    let app = Router::new()
+        .route("/state", get(get_state).post(post_state))
+        .route("/cmd", post(post_cmd))
+        .route("/agent/ws", get(agent_ws))
+        // legacy path: old agents dial /ws — same handler, same auth.
+        .route("/ws", get(agent_ws))
+        .fallback(not_found)
+        // 401 before any route runs when the upgrade headers are missing or
+        // wrong (never a bare 404 on the WS paths, never a 101).
+        .route_layer(middleware::from_fn_with_state(state.clone(), ws_auth_gate))
+        // body cap 1 MiB on POSTs (agents send a few KB; beyond that = abuse)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
+    tracing::info!(
+        "listening on {} -> {} (tokens: {}, agents dial /agent/ws)",
+        cfg.bind,
+        cfg.state_path.display(),
+        cfg.tokens_path.display()
+    );
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(std::io::Error::other)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received");
+}
+
+/// Gate on the WS paths: a GET /agent/ws (or legacy /ws) without valid auth
+/// headers is 401 HERE — before the upgrade, before the handler. Any other
+/// request passes through untouched.
+async fn ws_auth_gate(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if path == "/agent/ws" || path == "/ws" {
+        let host = AppState::hdr(req.headers(), "x-muxmesh-host");
+        let token = AppState::hdr(req.headers(), "x-muxmesh-token");
+        if !valid_host(&host) || !state.auth_ok(&host, &token) {
+            tracing::warn!("/agent/ws host={host} auth=FAIL -> 401 (no upgrade)");
+            return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+        }
+        // single source of truth: the handler must NOT re-read attacker-
+        // influenced headers to decide identity — use what was verified here.
+        req.extensions_mut().insert(AuthenticatedHost(host));
+    }
+    next.run(req).await
+}
+
+/// Identity verified by ws_auth_gate; consumed by agent_ws via axum's
+/// FromRequestParts — the handler never re-reads attacker-influenced headers.
+#[derive(Clone, Debug)]
+struct AuthenticatedHost(String);
+
+impl FromRequestParts<Arc<AppState>> for AuthenticatedHost {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<AuthenticatedHost>()
+            .cloned()
+            .unwrap_or_else(|| AuthenticatedHost(String::new())))
+    }
+}
+
+/// GET /state: open (badge pollers and `tree` are read-only and the state
+/// holds no secrets).
+async fn get_state(State(state): State<Arc<AppState>>) -> Response {
+    let body = fs::read_to_string(&state.state_path).unwrap_or_else(|_| "{\"hosts\":{}}".into());
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// POST /state: per-machine auth (unknown host or bad token => 401). Tokens
+/// are minted OFFLINE by `muxmesh-hub generate-token <host>` — there is NO
+/// registration endpoint: an unregistered machine cannot introduce itself.
+async fn post_state(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let host_hdr = AppState::hdr(&headers, "x-muxmesh-host");
+    let got_token = AppState::hdr(&headers, "x-muxmesh-token");
+    if !state.auth_ok(&host_hdr, &got_token) {
+        tracing::warn!(
+            "POST /state host={host_hdr} auth=FAIL (registered: {})",
+            state.tokens.lock().map(|s| s.hosts.len()).unwrap_or(0)
+        );
+        return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+    }
+
+    if body.is_empty() || body.len() > MAX_CMD_BODY {
+        return (StatusCode::BAD_REQUEST, "bad length\n").into_response();
+    }
+
+    // host: X-Muxmesh-Host header (source of truth), else the payload field
+    let mut st: HostState = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid payload: {e}\n"),
+            )
+                .into_response()
+        }
+    };
+    if st.seen == 0 {
+        st.seen = now_unix(); // clockless agent -> stamp on receipt
+    } else {
+        // clock-skew guard: a future `seen` would stay "fresh" forever; clamp it.
+        let now = now_unix();
+        if st.seen > now + 60 {
+            st.seen = now;
+        }
+    }
+    let host_key = if host_hdr.is_empty() {
+        st.host.clone()
+    } else {
+        host_hdr.clone()
+    };
+    if host_key.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing host\n").into_response();
+    }
+
+    // TRUST BOUNDARY: host and session names become tmux target strings later
+    // (poller `-t`). Whitelist them here so downstream tmux argv is provably
+    // [A-Za-z0-9_.-]+ and target injection is structurally impossible.
+    if !valid_host(&host_key) {
+        return (StatusCode::BAD_REQUEST, "invalid host name\n").into_response();
+    }
+    for s in &st.sessions {
+        if !valid_name(&s.name) || (!s.active_window.is_empty() && !valid_name(&s.active_window)) {
+            // name the rejected value: tmux allows ':' in window names, our
+            // whitelist does not -> without this the 400 is undiagnosable.
+            tracing::warn!(
+                "rejecting session name='{}' active_window='{}' from host={host_hdr} (valid_name=[A-Za-z0-9_-])",
+                s.name,
+                s.active_window
+            );
+            return (StatusCode::BAD_REQUEST, "invalid session name\n").into_response();
+        }
+    }
+
+    // merge under the write lock -> atomic write. Raw JSON doc (not StateDoc)
+    // so the out-of-band last_cmd ack mirror survives the agent's next merge.
+    let merge = {
+        let _g = state.write_lock.lock();
+        merge_state(&state.state_path, &host_key, &st)
+    };
+    match merge {
+        Ok(trace) => {
+            tracing::info!("state updated: {host_key} {trace}");
+            (StatusCode::OK, "ok\n").into_response()
+        }
+        Err(e) => {
+            tracing::error!("POST /state merge {host_key}: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response()
+        }
+    }
+}
+
+/// Merge one HostState into state.json (caller holds write_lock).
+/// Returns the debug trace ("armed=.. sessions=[..]").
+fn merge_state(path: &Path, host_key: &str, st: &HostState) -> std::io::Result<String> {
+    let mut raw: serde_json::Value = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "hosts": {} }));
+    if !raw.get("hosts").is_some_and(|h| h.is_object()) {
+        raw["hosts"] = serde_json::json!({});
+    }
+    let hosts = raw.get_mut("hosts").unwrap();
+    // trace BEFORE the move into the map (armed flag + session/window names),
+    // so an operator can follow F10's chain (the driver reads THIS state).
+    let trace = format!(
+        "armed={} sessions=[{}]",
+        st.armed,
+        st.sessions
+            .iter()
+            .map(|s| format!("{}:{}w/active={}", s.name, s.windows, s.active_window))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut entry = serde_json::to_value(st).map_err(std::io::Error::other)?;
+    // carry the ack mirror across the merge (the agent payload has no last_cmd)
+    if let Some(prev) = hosts.get(host_key).and_then(|h| h.get("last_cmd")) {
+        entry["last_cmd"] = prev.clone();
+    }
+    hosts[host_key] = entry;
+    let json = serde_json::to_string_pretty(&raw).map_err(std::io::Error::other)?;
+    write_bytes_atomic(path, json.as_bytes())?;
+    tracing::debug!(
+        "state updated host={host_key} {trace} -> {}",
+        path.display()
+    );
+    Ok(trace)
+}
+
+/// POST /cmd: authenticate the driver, check dst registered + has a live WS
+/// channel right now, enqueue the frame on that channel, answer 202 queued.
+/// The hub NEVER dials the agent — delivery happens on the agent's own socket.
+/// shortcut: unbounded mpsc drops HEAD's 10 s queue TTL (a frame queued while
+/// the agent is slow arrives late); upgrade to a bounded/TTL'd queue if stale
+/// bar toggles firing late ever matter. `shortcut:` blocking file IO in
+/// record_ack on a tokio worker — state.json is a few KB, homelab scale.
+async fn post_cmd(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // HEAD parity: empty/over-cap body -> 400 "bad length" (no axum
+    // DefaultBodyLimit on this route: it would answer 413 before the handler
+    // and break the CLI's literal status-line contract).
+    if body.is_empty() || body.len() > MAX_CMD_BODY {
+        return (StatusCode::BAD_REQUEST, "bad length\n").into_response();
+    }
+
+    // closed list: unknown verbs die here, before any dispatch.
+    let env: CommandEnvelope = match serde_json::from_slice(&body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid payload: {e}\n"),
+            )
+                .into_response()
+        }
+    };
+
+    // AUTH driver: same registry + same KDF verify as /state (KDF outside lock).
+    // dst is NOT checked before this: answering 400-before-401 would let an
+    // unauthenticated caller enumerate registered hosts.
+    let host_hdr = AppState::hdr(&headers, "x-muxmesh-host");
+    let got_token = AppState::hdr(&headers, "x-muxmesh-token");
+    if !state.auth_ok(&host_hdr, &got_token) {
+        tracing::warn!("POST /cmd src={host_hdr} auth=FAIL");
+        return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+    }
+
+    let dst = env.dst.clone();
+    if dst.is_empty() || !valid_host(&dst) {
+        return (StatusCode::BAD_REQUEST, "invalid dst\n").into_response();
+    }
+    let registered = state
+        .tokens
+        .lock()
+        .map(|s| s.hosts.contains_key(&dst))
+        .unwrap_or(false);
+    if !registered {
+        tracing::warn!("POST /cmd dst={dst} -> 403 dst not registered");
+        return (StatusCode::FORBIDDEN, "dst not registered\n").into_response();
+    }
+    // the agent must hold a live WS channel RIGHT NOW — the hub has no other
+    // way (and no right) to reach it.
+    let enqueued = {
+        let ch = state.channels.lock().unwrap_or_else(|e| e.into_inner());
+        match ch.get(&dst) {
+            Some(s) => match serde_json::to_string(&env) {
+                Ok(frame) => s.tx.send(frame).is_ok(),
+                // a frame that cannot be serialized must never reach the agent
+                // as an empty text frame — drop it and name it in the log.
+                Err(e) => {
+                    tracing::error!("POST /cmd id={} serialize failed: {e}", env.id);
+                    false
+                }
+            },
+            None => false,
+        }
+    };
+    if !enqueued {
+        tracing::warn!("POST /cmd dst={dst} -> 409 target not connected");
+        return (StatusCode::CONFLICT, "target not connected\n").into_response();
+    }
+
+    tracing::info!("POST /cmd src={host_hdr} -> queued dst={dst} id={}", env.id);
+    // serde-serialized (env.id is CLI-generated today, but never hand-build JSON)
+    let body = Json(serde_json::json!({"v":1,"id":env.id,"queued":true}));
+    (StatusCode::ACCEPTED, body).into_response()
+}
+
+async fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, "not found\n").into_response()
+}
+
+/// GET /agent/ws: the gate middleware already authenticated host+token from
+/// headers BEFORE this runs (bad creds = 401, no upgrade ever). Complete the
+/// upgrade and run the dispatch session. One channel per host — a second
+/// connection from the same host replaces the first (logged, old task exits
+/// via gen).
+async fn agent_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    AuthenticatedHost(host): AuthenticatedHost,
+) -> Response {
+    // identity comes from the gate's verification, never from a second header read
+    ws.on_upgrade(move |socket| handle_agent(socket, host, state))
+}
+
+/// Per-agent WS session: drain the mpsc queue to the sink, read acks into
+/// state.json last_cmd, ping every 30 s, close after 2 missed pongs.
+/// No read timeout — a quiet channel is alive; the pings prove it.
+async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppState>) {
+    let gen = WS_GEN.fetch_add(1, Ordering::Relaxed);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    {
+        let mut ch = state.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = ch.insert(host.clone(), Sender { tx, gen }) {
+            tracing::info!(
+                "/agent/ws host={host}: replacing existing connection (gen {} -> {gen})",
+                old.gen
+            );
+        }
+    }
+    tracing::info!("/agent/ws host={host} connected (gen {gen})");
+
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let _ = ping.tick().await; // first tick fires immediately: skip it
+    let mut missed: u32 = 0;
 
     loop {
-        match listener.accept() {
-            Ok((mut stream, peer)) => {
-                let path = state_path.clone();
-                let lock = lock.clone();
-                let store = store.clone();
-                let channels = channels.clone();
-                // backpressure BEFORE spawning: over cap -> 503, no thread, no read.
-                match Permit::acquire() {
-                    Some(permit) => {
-                        // timeout for short HTTP requests ONLY — the accept
-                        // loop cannot know the route yet, so /ws connections get
-                        // it cleared below before handle_ws (a 5s read timeout
-                        // would kill every persistent channel, observed live).
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                        // no Nagle: the 101 handshake reply must reach the peer
-                        // promptly (the agent sends nothing until it sees it).
-                        let _ = stream.set_nodelay(true);
-
-                        // Read the FULL head (request line + headers) HERE, in
-                        // the accept loop, with a raw byte-at-a-time read (no
-                        // BufReader near this socket). Routing then happens on
-                        // parsed data and the head is handed to the handler as
-                        // a value — no socket replay, no stranded buffers.
-                        let mut head = String::new();
-                        if read_head(&mut stream, &mut head).is_err() {
-                            continue;
+        tokio::select! {
+            // push queued commands to the agent (frames arrive via POST /cmd)
+            maybe_frame = rx.recv() => {
+                match maybe_frame {
+                    Some(frame) => {
+                        if socket.send(Message::Text(frame.into())).await.is_err() {
+                            tracing::warn!("/agent/ws host={host}: send failed");
+                            break;
                         }
-                        let req_line = head.lines().next().unwrap_or("").to_string();
-                        // route ANY GET /ws to handle_ws; it authenticates and
-                        // only then upgrades (401 before the 101, never 404).
-                        let is_ws = {
-                            let p = req_line.split_whitespace().nth(1).unwrap_or("");
-                            p == "/ws" || p.starts_with("/ws?")
-                        };
-
-                        // /ws upgrade: handled on its own thread; the persistent
-                        // connection holds one permit by design (cap 64 agents).
-                        if is_ws {
-                            // persistent channel: no read timeout — a quiet agent
-                            // must not be dropped after 5s (tungstenite ping/pong
-                            // is the liveness mechanism, not a socket timeout).
-                            let _ = stream.set_read_timeout(None);
-                            let ws_stream = match stream.try_clone() {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-                            drop(stream);
-                            thread::spawn(move || {
-                                let _permit = permit;
-                                if let Err(e) = handle_ws(
-                                    ws_stream, peer, head, &store, &channels, &path, &lock,
-                                ) {
-                                    tracing::debug!("{peer} /ws: {e}");
-                                }
-                            });
-                            continue;
-                        }
-
-                        thread::spawn(move || {
-                            let _permit = permit; // released when the handler returns
-                            if let Err(e) =
-                                handle(stream, peer, head, &path, &lock, &store, &channels)
-                            {
-                                tracing::error!("{peer}: {e}");
-                            }
-                        });
                     }
-                    None => {
-                        let _ = respond(&mut stream, 503, "overloaded\n");
+                    // sender dropped (replaced session): stop touching this socket
+                    None => break,
+                }
+            }
+            // acks and pongs from the agent. tungstenite answers our pings via
+            // the client's auto-pong and delivers Pong HERE; a wedged half-open
+            // socket never pongs -> missed keeps climbing.
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<Ack>(&text) {
+                            Ok(ack) => {
+                                tracing::info!(
+                                    "/agent/ws host={host} ack id={} ok={}{}",
+                                    ack.id,
+                                    ack.ok,
+                                    ack.err.as_deref().map(|e| format!(" err={e}")).unwrap_or_default()
+                                );
+                                record_ack(&state, &host, &ack);
+                            }
+                            Err(e) => tracing::warn!("/agent/ws host={host}: bad ack frame: {e}"),
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => missed = 0,
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {} // binary/ping from agent: ignored
+                    Some(Err(e)) => {
+                        tracing::warn!("/agent/ws host={host}: recv: {e}");
+                        break;
                     }
                 }
             }
-            Err(e) => tracing::error!("accept: {e}"),
+            _ = ping.tick() => {
+                missed += 1;
+                if missed > MAX_MISSED_PONGS {
+                    tracing::warn!("/agent/ws host={host}: {MAX_MISSED_PONGS} unanswered pings -> closing (dead peer)");
+                    let _ = socket.send(Message::Close(Some(CloseFrame {
+                        code: axum::extract::ws::close_code::NORMAL,
+                        reason: "dead peer".into(),
+                    }))).await;
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // socket closed: remove OUR channel (a replacement connection keeps its own)
+    {
+        let mut ch = state.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if ch.get(&host).is_some_and(|s| s.gen == gen) {
+            ch.remove(&host);
+        }
+    }
+    tracing::info!("/agent/ws host={host} disconnected (gen {gen})");
+}
+
+/// Mirror an agent ack into state.json's last_cmd (best effort — the driver
+/// reads it back via GET /state). Never fails the WS session. Blocking file
+/// IO on a tokio worker: state.json is a few KB, acceptable here.
+/// shortcut: inline fs::write — move to spawn_blocking if state.json ever
+/// grows large enough to stall a worker.
+fn record_ack(state: &AppState, host: &str, ack: &Ack) {
+    let _g = state.write_lock.lock();
+    let path = &state.state_path;
+    let mut raw: serde_json::Value = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "hosts": {} }));
+    if !raw.get("hosts").is_some_and(|h| h.is_object()) {
+        raw["hosts"] = serde_json::json!({});
+    }
+    // the ack may arrive BEFORE the agent's first POST /state (test flow and
+    // cold start alike) — create the host entry rather than drop the ack.
+    if !raw["hosts"].get(host).is_some_and(|h| h.is_object()) {
+        raw["hosts"][host] = serde_json::json!({});
+    }
+    raw["hosts"][host]["last_cmd"] = serde_json::json!({
+        "id": ack.id,
+        "ok": ack.ok,
+        "err": ack.err,
+        "at": now_unix(),
+    });
+    if let Ok(json) = serde_json::to_string_pretty(&raw) {
+        if let Err(e) = write_bytes_atomic(path, json.as_bytes()) {
+            tracing::warn!("last_cmd write {host}: {e}");
         }
     }
 }
@@ -222,7 +621,7 @@ fn main() {
 /// register it in tokens.json, print it ONCE. herdr-style `add machine`:
 /// operator runs this on the pivot, pastes the printed token on the agent
 /// (~/.config/muxmesh/token), done. Re-issue revokes the host's old token.
-/// ONE token per host: it authenticates POST /state AND the /ws handshake.
+/// ONE token per host: it authenticates POST /state AND the /agent/ws handshake.
 fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
     let host = match args.first() {
         Some(h) if valid_host(h) => h.clone(),
@@ -259,7 +658,7 @@ fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
     // the ONLY place raw tokens ever appear: stdout, once, for the operator.
     println!("{token}");
     eprintln!(
-        "muxmesh-hub: host '{host}' paired — machine token in {}. Paste it on the agent as ~/.config/muxmesh/token (0600). The agent uses it for POST /state and its /ws handshake. Shown once.",
+        "muxmesh-hub: host '{host}' paired — machine token in {}. Paste it on the agent as ~/.config/muxmesh/token (0600). The agent uses it for POST /state and its /agent/ws handshake. Shown once.",
         cfg.tokens_path.display()
     );
     process::exit(0)
@@ -274,567 +673,6 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
-}
-
-/// Read the request head (request line + headers, up to the blank line)
-/// straight from the socket, ONE BYTE AT A TIME — no BufReader anywhere near
-/// this socket, so body bytes are never swallowed. The head is passed to the
-/// handler as a value and NEVER replayed onto the socket (that echo raced the
-/// client's FIN and corrupted reads); handlers parse the value they received.
-fn read_head(stream: &mut TcpStream, head: &mut String) -> std::io::Result<()> {
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-            Ok(_) => {
-                head.push(byte[0] as char);
-                if byte[0] == b'\n' {
-                    let n = head.len();
-                    if head.ends_with("\r\n\r\n") || (n >= 2 && head.ends_with("\n\n")) {
-                        return Ok(()); // blank line: end of headers
-                    }
-                }
-                if head.len() > 16_384 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "head too long",
-                    ));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// GET /ws: read the handshake headers, authenticate the agent with its OWN
-/// machine token (same registry + KDF as POST /state, run OUTSIDE the store
-/// lock), 401 before upgrade on failure. On success: complete the upgrade and
-/// run the dispatch session. One channel per host — a second connection from
-/// the same host replaces the first (logged, old writer thread exits via gen).
-fn handle_ws(
-    mut stream: TcpStream,
-    peer: std::net::SocketAddr,
-    head: String,
-    store: &Mutex<TokenStore>,
-    channels: &Channels,
-    state_path: &Path,
-    lock: &Mutex<()>,
-) -> std::io::Result<()> {
-    // Parse the head the accept loop already read (request line + headers).
-    // No socket reads happen before accept(): the head lives in `head`, and
-    // tungstenite's handshake is completed BY hand below — no replay, no
-    // BufReader, nothing can strand a byte.
-    let mut host = String::new();
-    let mut token = String::new();
-    let mut ws_key = String::new();
-    for line in head.lines().skip(1) {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("x-muxmesh-host:") {
-            host = line
-                .split_once(':')
-                .map(|x| x.1.trim().to_string())
-                .unwrap_or_default();
-        } else if lower.starts_with("x-muxmesh-token:") {
-            token = line
-                .split_once(':')
-                .map(|x| x.1.trim().to_string())
-                .unwrap_or_default();
-        } else if lower.starts_with("sec-websocket-key:") {
-            ws_key = line
-                .split_once(':')
-                .map(|x| x.1.trim().to_string())
-                .unwrap_or_default();
-        }
-    }
-
-    // AUTH at the handshake, BEFORE any upgrade. KDF outside the store lock
-    // (M1). No WS key = not an upgrade attempt -> 401 too (nothing else on /ws).
-    let rec = store
-        .lock()
-        .map_err(|e| io::Error::other(format!("lock: {e}")))?
-        .hosts
-        .get(&host)
-        .cloned();
-    let ok = !ws_key.is_empty()
-        && valid_host(&host)
-        && matches!(
-            rec,
-            Some(r) if token.len() >= muxmesh_core::PREFIX_LEN && muxmesh_core::verify_token(&token, &r.hash)
-        );
-    if !ok {
-        tracing::warn!("{peer} /ws host={host} auth=FAIL -> 401 (no upgrade)");
-        return respond(&mut stream, 401, "unauthorized\n");
-    }
-
-    // complete the upgrade BY HAND (the head was consumed by the accept loop):
-    // 101 + Sec-WebSocket-Accept, then wrap the socket in a raw WS codec.
-    // The writer thread gets its OWN clone of the socket (a raw TcpStream can
-    // be read and written concurrently from two threads); this thread reads.
-    let accept_key = derive_accept_key(ws_key.as_bytes());
-    write!(
-        stream,
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
-    )?;
-    stream.flush()?;
-    let ws_stream = stream
-        .try_clone()
-        .map_err(|e| io::Error::other(format!("try_clone: {e}")))?;
-    let mut ws: tungstenite::WebSocket<TcpStream> =
-        WebSocket::from_raw_socket(ws_stream, Role::Server, None);
-
-    let gen = WS_GEN.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut ch = channels
-            .lock()
-            .map_err(|e| io::Error::other(format!("lock: {e}")))?;
-        if let Some(old) = ch.insert(
-            host.clone(),
-            Channel {
-                queue: VecDeque::new(),
-                gen,
-            },
-        ) {
-            tracing::info!(
-                "/ws host={host}: replacing existing connection (gen {} -> {gen})",
-                old.gen
-            );
-        }
-    }
-    tracing::info!("{peer} /ws host={host} connected (gen {gen})");
-
-    // writer loop: drain the channel queue, push frames on this socket (its
-    // own socket clone — reads and writes never contend).
-    let w_channels = channels.clone();
-    let w_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return Err(io::Error::other("try_clone")),
-    };
-    let w_host = host.clone();
-    let writer = thread::spawn(move || {
-        let mut ws: tungstenite::WebSocket<TcpStream> =
-            WebSocket::from_raw_socket(w_stream, Role::Server, None);
-        loop {
-            let frame = {
-                let mut ch = match w_channels.lock() {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                match ch.get_mut(&w_host) {
-                    Some(c) if c.gen == gen => loop {
-                        match c.queue.pop_front() {
-                            Some(q) if q.at.elapsed() > QUEUE_TTL => {
-                                tracing::warn!(
-                                    "/ws host={}: dropping stale frame id={} (queue ttl)",
-                                    w_host,
-                                    q.id
-                                );
-                            }
-                            Some(q) => break Some(Some(q.frame)),
-                            None => break Some(None), // empty: keep polling
-                        }
-                    },
-                    // replaced or gone -> stop touching this socket
-                    _ => None,
-                }
-            };
-            match frame {
-                Some(Some(f)) => {
-                    if let Err(e) = ws.send(Message::Text(f)) {
-                        tracing::warn!("/ws host={}: send: {e}", w_host);
-                        return;
-                    }
-                }
-                Some(None) => {} // queue empty: keep the session alive
-                None => return,  // channel superseded or closed -> end session
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
-
-    // reader loop: acks and pongs from the agent. Blocking read — a quiet
-    // agent is normal; liveness comes from the hub pinging every ~20 s and
-    // the agent's tungstenite auto-ponging inside its read(). A wedged
-    // half-open socket (NAT silent-drop, hung agent) surfaces here as a
-    // tungstenite Ping timeout error -> channel removed -> F10 gets 409
-    // instead of vanishing into a black hole.
-    let r_host = host.clone();
-    loop {
-        let msg = ws.read();
-        match msg {
-            Ok(Message::Text(text)) => match serde_json::from_str::<Ack>(&text) {
-                Ok(ack) => {
-                    tracing::info!(
-                        "/ws host={r_host} ack id={} ok={}{}",
-                        ack.id,
-                        ack.ok,
-                        ack.err
-                            .as_deref()
-                            .map(|e| format!(" err={e}"))
-                            .unwrap_or_default()
-                    );
-                    record_ack(state_path, lock, &r_host, &ack);
-                }
-                Err(e) => tracing::warn!("/ws host={r_host}: bad ack frame: {e}"),
-            },
-            Ok(Message::Ping(data)) => {
-                let _ = ws.send(Message::Pong(data));
-            }
-            Ok(Message::Close(_)) | Err(_) => break,
-            Ok(_) => {} // binary/pong: ignored
-        }
-    }
-
-    // socket closed: remove OUR channel (a replacement connection keeps its own)
-    {
-        let mut ch = channels.lock().unwrap_or_else(|e| e.into_inner());
-        if ch.get(&host).is_some_and(|c| c.gen == gen) {
-            ch.remove(&host);
-        }
-    }
-    let _ = writer; // writer exits on its own once the channel is gone
-    tracing::info!("{peer} /ws host={host} disconnected (gen {gen})");
-    Ok(())
-}
-
-/// Mirror an agent ack into state.json's last_cmd (best effort — the driver
-/// reads it back via GET /state). Never fails the WS session.
-fn record_ack(state_path: &Path, lock: &Mutex<()>, host: &str, ack: &Ack) {
-    let _g = match lock.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let mut raw: serde_json::Value = fs::read_to_string(state_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({ "hosts": {} }));
-    if !raw.get("hosts").is_some_and(|h| h.is_object()) {
-        raw["hosts"] = serde_json::json!({});
-    }
-    // the ack may arrive BEFORE the agent's first POST /state (test flow and
-    // cold start alike) — create the host entry rather than drop the ack.
-    if !raw["hosts"].get(host).is_some_and(|h| h.is_object()) {
-        raw["hosts"][host] = serde_json::json!({});
-    }
-    raw["hosts"][host]["last_cmd"] = serde_json::json!({
-        "id": ack.id,
-        "ok": ack.ok,
-        "err": ack.err,
-        "at": now_unix(),
-    });
-    if let Ok(json) = serde_json::to_string_pretty(&raw) {
-        if let Err(e) = write_bytes_atomic(state_path, json.as_bytes()) {
-            tracing::warn!("last_cmd write {host}: {e}");
-        }
-    }
-}
-
-fn handle(
-    mut stream: TcpStream,
-    peer: std::net::SocketAddr,
-    head: String,
-    path: &Path,
-    lock: &Mutex<()>,
-    store: &Mutex<TokenStore>,
-    channels: &Channels,
-) -> std::io::Result<()> {
-    // The accept loop already read the head (request line + headers) and
-    // passed it as a value — parse it here; the socket is raw for the body.
-    let mut lines = head.lines();
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("");
-
-    // headers: Content-Length + host (X-Muxmesh-Host) + token
-    // (header NAMES are case-insensitive; VALUES keep their case)
-    let mut content_len: usize = 0;
-    let mut header_host: Option<String> = None;
-    let mut header_token: Option<String> = None;
-    for line in lines {
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_len = v.trim().parse().unwrap_or(0);
-        } else if lower.starts_with("x-muxmesh-host:") {
-            header_host = Some(
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
-        } else if lower.starts_with("x-muxmesh-token:") {
-            header_token = Some(
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
-
-    // a /ws request that reached the plain handler means the accept loop did
-    // not classify it as an upgrade (missing/invalid headers) — reject, 401
-    // before any upgrade, never a bare 404.
-    if target.starts_with("/ws") {
-        tracing::warn!("{peer} {method} /ws without a valid upgrade -> 401");
-        return respond(&mut stream, 401, "unauthorized\n");
-    }
-
-    // AUTH: GET /state is open (badge pollers and `tree` are read-only and
-    // the state holds no secrets); writes require a registered machine token.
-    if method == "GET" && target.starts_with("/state") {
-        let body = fs::read_to_string(path).unwrap_or_else(|_| "{\"hosts\":{}}".into());
-        tracing::debug!("{peer} GET /state ({} bytes)", body.len());
-        return respond(&mut stream, 200, &body);
-    }
-
-    // driver -> HUB -> agent command dispatch (pushed on the agent's WS).
-    if method == "POST" && target.starts_with("/cmd") {
-        // the /cmd body sits AFTER the headers already consumed by read_head —
-        // read exactly Content-Length bytes from the raw socket.
-        let mut body = vec![0u8; content_len.min(1_048_576)];
-        if !body.is_empty() {
-            stream.read_exact(&mut body)?;
-        }
-        return handle_cmd(
-            &mut stream,
-            peer,
-            store,
-            channels,
-            header_host,
-            header_token,
-            body,
-        );
-    }
-
-    // per-machine auth for POST /state. Unknown host or
-    // bad token => 401. Tokens are minted OFFLINE by `muxmesh-hub
-    // generate-token <host>` on the pivot — there is NO registration endpoint:
-    // an unregistered machine cannot introduce itself to the hub at all.
-    if method != "POST" || !target.starts_with("/state") {
-        tracing::debug!("{peer} {method} {target} -> 404");
-        return respond(&mut stream, 404, "not found\n");
-    }
-    let host_hdr = header_host.unwrap_or_default();
-    let got_token = header_token.unwrap_or_default();
-    // M1: clone the record out of the lock, then run the KDF OUTSIDE it —
-    // otherwise every authenticated push serializes behind 100k sha256 rounds.
-    let rec = store
-        .lock()
-        .map_err(|e| std::io::Error::other(format!("lock: {e}")))?
-        .hosts
-        .get(&host_hdr)
-        .cloned();
-    match rec {
-        Some(r)
-            if got_token.len() >= muxmesh_core::PREFIX_LEN
-                && muxmesh_core::verify_token(&got_token, &r.hash) =>
-        {
-            tracing::debug!("{peer} POST /state host={host_hdr} auth=ok");
-        }
-        _ => {
-            tracing::warn!(
-                "{peer} POST /state host={host_hdr} auth=FAIL (registered: {})",
-                store.lock().map(|s| s.hosts.len()).unwrap_or(0)
-            );
-            return respond(&mut stream, 401, "unauthorized\n");
-        }
-    }
-
-    // body capped (1 MiB): an agent sends a few KB, beyond that = abuse
-    if content_len == 0 || content_len > 1_048_576 {
-        return respond(&mut stream, 400, "bad length\n");
-    }
-
-    let mut body = vec![0u8; content_len];
-    stream.read_exact(&mut body)?;
-
-    // host: X-Muxmesh-Host header (source of truth), else the payload field
-    let mut state: HostState = match serde_json::from_slice(&body) {
-        Ok(s) => s,
-        Err(e) => return respond(&mut stream, 422, &format!("invalid payload: {e}\n")),
-    };
-    if state.seen == 0 {
-        state.seen = now_unix(); // clockless agent -> stamp on receipt
-    } else {
-        // clock-skew guard: a future `seen` would stay "fresh" forever; clamp it.
-        let now = now_unix();
-        if state.seen > now + 60 {
-            state.seen = now;
-        }
-    }
-    let host_key = if host_hdr.is_empty() {
-        state.host.clone()
-    } else {
-        host_hdr.clone()
-    };
-    if host_key.is_empty() {
-        return respond(&mut stream, 400, "missing host\n");
-    }
-
-    // TRUST BOUNDARY: host and session names become tmux target strings later
-    // (poller `-t`). Whitelist them here so downstream tmux argv is provably
-    // [A-Za-z0-9_.-]+ and target injection is structurally impossible.
-    if !valid_host(&host_key) {
-        return respond(&mut stream, 400, "invalid host name\n");
-    }
-    for s in &state.sessions {
-        if !valid_name(&s.name) || (!s.active_window.is_empty() && !valid_name(&s.active_window)) {
-            // name the rejected value: tmux allows ':' in window names, our
-            // whitelist does not -> without this the 400 is undiagnosable.
-            tracing::warn!(
-                "rejecting session name='{}' active_window='{}' from host={host_hdr} (valid_name=[A-Za-z0-9_-])",
-                s.name,
-                s.active_window
-            );
-            return respond(&mut stream, 400, "invalid session name\n");
-        }
-    }
-
-    // merge under lock -> atomic write. Raw JSON doc (not StateDoc) so the
-    // out-of-band last_cmd ack mirror survives the agent's next /state merge.
-    let _g = lock
-        .lock()
-        .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-    let mut raw: serde_json::Value = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({ "hosts": {} }));
-    if !raw.get("hosts").is_some_and(|h| h.is_object()) {
-        raw["hosts"] = serde_json::json!({});
-    }
-    let hosts = raw.get_mut("hosts").unwrap();
-    // trace BEFORE the move into the map (armed flag + session/window names),
-    // so an operator can follow F10's chain (the driver reads THIS state).
-    let trace = format!(
-        "armed={} sessions=[{}]",
-        state.armed,
-        state
-            .sessions
-            .iter()
-            .map(|s| format!("{}:{}w/active={}", s.name, s.windows, s.active_window))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let mut entry = serde_json::to_value(&state).map_err(std::io::Error::other)?;
-    // carry the ack mirror across the merge (the agent payload has no last_cmd)
-    if let Some(prev) = hosts.get(&host_key).and_then(|h| h.get("last_cmd")) {
-        entry["last_cmd"] = prev.clone();
-    }
-    hosts[&host_key] = entry;
-    let json = serde_json::to_string_pretty(&raw).map_err(std::io::Error::other)?;
-    write_bytes_atomic(path, json.as_bytes())?;
-
-    tracing::debug!(
-        "state updated host={host_key} {} -> {}",
-        trace,
-        path.display()
-    );
-    tracing::info!("state updated: {host_key} {trace}");
-    respond(&mut stream, 200, "ok\n")
-}
-
-/// POST /cmd: authenticate the driver, check dst registered + WS-connected,
-/// enqueue the frame on the agent's channel, answer 202 queued immediately.
-/// The hub NEVER dials the agent — delivery happens on the agent's own socket.
-fn handle_cmd<W: Write>(
-    stream: &mut W,
-    peer: std::net::SocketAddr,
-    store: &Mutex<TokenStore>,
-    channels: &Channels,
-    header_host: Option<String>,
-    header_token: Option<String>,
-    body: Vec<u8>,
-) -> std::io::Result<()> {
-    // body capped (1 MiB): a command envelope is a few hundred bytes.
-    if body.is_empty() || body.len() > 1_048_576 {
-        return respond(stream, 400, "bad length\n");
-    }
-
-    // closed list: unknown verbs die here, before any dispatch.
-    let env: CommandEnvelope = match serde_json::from_slice(&body) {
-        Ok(e) => e,
-        Err(e) => return respond(stream, 422, &format!("invalid payload: {e}\n")),
-    };
-
-    // AUTH driver: same registry + same KDF verify as /state (KDF outside lock).
-    // dst is NOT checked before this: answering 400-before-401 would let an
-    // unauthenticated caller enumerate registered hosts.
-    let host_hdr = header_host.unwrap_or_default();
-    let got_token = header_token.unwrap_or_default();
-    let rec = store
-        .lock()
-        .map_err(|e| std::io::Error::other(format!("lock: {e}")))?
-        .hosts
-        .get(&host_hdr)
-        .cloned();
-    match rec {
-        Some(r)
-            if got_token.len() >= muxmesh_core::PREFIX_LEN
-                && muxmesh_core::verify_token(&got_token, &r.hash) =>
-        {
-            tracing::debug!("{peer} POST /cmd src={host_hdr} auth=ok");
-        }
-        _ => {
-            tracing::warn!("{peer} POST /cmd src={host_hdr} auth=FAIL");
-            return respond(stream, 401, "unauthorized\n");
-        }
-    }
-
-    let dst = env.dst.clone();
-    if dst.is_empty() || !valid_host(&dst) {
-        return respond(stream, 400, "invalid dst\n");
-    }
-    let registered = store
-        .lock()
-        .map(|s| s.hosts.contains_key(&dst))
-        .unwrap_or(false);
-    if !registered {
-        tracing::warn!("{peer} POST /cmd dst={dst} -> 403 dst not registered");
-        return respond(stream, 403, "dst not registered\n");
-    }
-    // the agent must hold a live WS channel RIGHT NOW — the hub has no other
-    // way (and no right) to reach it.
-    let enqueued = {
-        let mut ch = channels
-            .lock()
-            .map_err(|e| std::io::Error::other(format!("lock: {e}")))?;
-        match ch.get_mut(&dst) {
-            Some(c) => {
-                c.queue.push_back(Queued {
-                    id: env.id.clone(),
-                    frame: serde_json::to_string(&env).map_err(std::io::Error::other)?,
-                    at: Instant::now(),
-                });
-                true
-            }
-            None => false,
-        }
-    };
-    if !enqueued {
-        tracing::warn!("{peer} POST /cmd dst={dst} -> 409 target not connected");
-        return respond(stream, 409, "target not connected\n");
-    }
-
-    tracing::info!(
-        "{peer} POST /cmd src={host_hdr} -> queued dst={dst} id={}",
-        env.id
-    );
-    // serde-serialized (env.id is CLI-generated today, but never hand-build JSON)
-    let body = serde_json::json!({"v":1,"id":env.id,"queued":true}).to_string() + "\n";
-    respond_json(stream, &body)
-}
-
-fn respond_json<W: Write>(stream: &mut W, body: &str) -> std::io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body.as_bytes())?;
-    stream.flush()
 }
 
 fn read_doc(path: &Path) -> StateDoc {
@@ -881,36 +719,11 @@ fn purge_and_write(path: &Path, ttl: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write a minimal HTTP/1.1 response with Connection: close. Works over a raw
-/// TcpStream or a BufReader<TcpStream> (Write forwards + flushes, so the
-/// reader's own buffer can never strand the response).
-fn respond<W: Write>(stream: &mut W, code: u16, body: &str) -> std::io::Result<()> {
-    let status = match code {
-        200 => "200 OK",
-        201 => "201 Created",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        404 => "404 Not Found",
-        409 => "409 Conflict",
-        422 => "422 Unprocessable Entity",
-        503 => "503 Service Unavailable",
-        _ => "500 Internal Server Error",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body.as_bytes())?;
-    stream.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tmp_state(name: &str) -> std::path::PathBuf {
+    fn tmp_state(name: &str) -> PathBuf {
         let p = std::env::temp_dir()
             .join(format!("muxmesh-hub-test-{}-{}", std::process::id(), name))
             .join("state.json");
@@ -992,26 +805,20 @@ mod tests {
             },
         );
         write_atomic(&p, &doc).unwrap();
-        let lock = Mutex::new(());
-        record_ack(&p, &lock, "host-a", &Ack::ok(1, "c-1"));
+        let state = AppState {
+            tokens: Mutex::new(TokenStore::default()),
+            state_path: p.clone(),
+            write_lock: Mutex::new(()),
+            channels: Mutex::new(HashMap::new()),
+        };
+        record_ack(&state, "host-a", &Ack::ok(1, "c-1"));
         let raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(raw["hosts"]["host-a"]["last_cmd"]["id"], "c-1");
         assert_eq!(raw["hosts"]["host-a"]["last_cmd"]["ok"], true);
         // unknown host -> no panic, file untouched shape
-        record_ack(&p, &lock, "ghost", &Ack::err(1, "c-2", "nope"));
+        record_ack(&state, "ghost", &Ack::err(1, "c-2", "nope"));
         fs::remove_dir_all(p.parent().unwrap()).ok();
-    }
-
-    #[test]
-    fn permit_guard_caps_inflight() {
-        let mut held = Vec::new();
-        for _ in 0..MAX_INFLIGHT {
-            held.push(Permit::acquire().expect("under cap must succeed"));
-        }
-        assert!(Permit::acquire().is_none(), "over cap must be rejected");
-        drop(held);
-        assert!(Permit::acquire().is_some(), "cap restored after drop");
     }
 
     #[test]
@@ -1031,6 +838,31 @@ mod tests {
         write_atomic(&p, &doc).unwrap();
         write_atomic(&p, &doc).unwrap();
         assert!(read_doc(&p).hosts.contains_key("h"));
+        fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn merge_state_preserves_out_of_band_last_cmd() {
+        let p = tmp_state("merge-lastcmd");
+        let state = AppState {
+            tokens: Mutex::new(TokenStore::default()),
+            state_path: p.clone(),
+            write_lock: Mutex::new(()),
+            channels: Mutex::new(HashMap::new()),
+        };
+        record_ack(&state, "host-a", &Ack::ok(1, "c-9"));
+        let st = HostState {
+            host: "host-a".into(),
+            armed: true,
+            seen: now_unix(),
+            sessions: vec![],
+        };
+        let _g = state.write_lock.lock();
+        merge_state(&p, "host-a", &st).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(raw["hosts"]["host-a"]["last_cmd"]["id"], "c-9");
+        assert_eq!(raw["hosts"]["host-a"]["armed"], true);
         fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 }

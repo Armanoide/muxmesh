@@ -4,15 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# State receiver on the always-on pivot machine: listens :9997, writes
-# ~/.muxmesh/state.json atomically. std only (std::net) -> zero network
-# dependency, minimal binary, offline build.
+# State receiver on the always-on pivot machine: one axum server on a single
+# port — REST (/state GET/POST, /cmd) + WS (/agent/ws), tokio runtime.
 
 [dependencies]
 tracing = { workspace = true }
 muxmesh-core = { workspace = true }
 serde_json = { workspace = true }
-tungstenite = "0.24"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { workspace = true }
 
 [dev-dependencies]
-tungstenite = "0.24"
+futures-util = { workspace = true }
+tokio-tungstenite = "0.30"

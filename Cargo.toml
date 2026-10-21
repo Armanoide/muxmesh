@@ -9,6 +9,9 @@ license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "signal", "process", "macros"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
