@@ -79,22 +79,40 @@ struct Sender {
 
 impl AppState {
     /// Authenticate `host`+`token` against the registry. The record is cloned
-    /// out of the lock and the KDF runs OUTSIDE it — otherwise every auth
-    /// serializes behind 100k sha256 rounds.
-    fn auth_ok(&self, host: &str, token: &str) -> bool {
-        let rec = self
+    /// Authenticate a request by TOKEN ALONE: the token is the machine's
+    /// identity; X-Muxmesh-Host is a label the machine declares. Returns the
+    /// DECLARED name when the token matches its registered record (rename =
+    /// edit config.toml, no re-mint); the registered name when the machine
+    /// sends no header. None = 401. KDF runs OUTSIDE the store lock.
+    fn auth_host(&self, declared: &str, token: &str) -> Option<String> {
+        if token.len() < muxmesh_core::PREFIX_LEN {
+            return None;
+        }
+        let prefix: String = token.chars().take(muxmesh_core::PREFIX_LEN).collect();
+        // snapshot the candidate under the lock, KDF outside it.
+        let cand = self
             .tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .hosts
-            .get(host)
-            .cloned();
-        matches!(
-            rec,
-            Some(r)
-                if token.len() >= muxmesh_core::PREFIX_LEN
-                    && muxmesh_core::verify_token(token, &r.hash)
-        )
+            .iter()
+            .find(|(_, r)| r.prefix == prefix)
+            .map(|(h, r)| (h.clone(), r.hash.clone()));
+        match cand {
+            Some((registered, hash)) => {
+                if muxmesh_core::verify_token(token, &hash) {
+                    let name = if declared.is_empty() {
+                        registered
+                    } else {
+                        declared.to_string()
+                    };
+                    Some(name)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
     }
 
     /// Read a header value (names are case-insensitive; values keep their case).
@@ -225,13 +243,23 @@ async fn ws_auth_gate(
     if path == "/agent/ws" || path == "/ws" {
         let host = AppState::hdr(req.headers(), "x-muxmesh-host");
         let token = AppState::hdr(req.headers(), "x-muxmesh-token");
-        if !valid_host(&host) || !state.auth_ok(&host, &token) {
-            tracing::warn!("/agent/ws host={host} auth=FAIL -> 401 (no upgrade)");
-            return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+        // token is the identity; host is a declared label. A machine may send
+        // no host header (or rename freely) — the token decides, and the
+        // declared name becomes the key state is recorded under.
+        let authed = if host.is_empty() {
+            None
+        } else {
+            state.auth_host(&host, &token)
+        };
+        match authed {
+            Some(name) => {
+                req.extensions_mut().insert(AuthenticatedHost(name));
+            }
+            None => {
+                tracing::warn!("/agent/ws host={host} auth=FAIL -> 401 (no upgrade)");
+                return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+            }
         }
-        // single source of truth: the handler must NOT re-read attacker-
-        // influenced headers to decide identity — use what was verified here.
-        req.extensions_mut().insert(AuthenticatedHost(host));
     }
     next.run(req).await
 }
@@ -267,9 +295,11 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// POST /state: per-machine auth (unknown host or bad token => 401). Tokens
-/// are minted OFFLINE by `muxmesh-hub generate-token <host>` — there is NO
-/// registration endpoint: an unregistered machine cannot introduce itself.
+/// POST /state: auth by TOKEN (the identity); the DECLARED host name is the
+/// key state is recorded under, so renaming a machine = edit config.toml, no
+/// re-mint. Tokens are minted OFFLINE by `muxmesh-hub generate-token <host>`
+/// — there is NO registration endpoint: an unregistered token cannot introduce
+/// itself, whatever name it declares.
 async fn post_state(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -277,7 +307,9 @@ async fn post_state(
 ) -> Response {
     let host_hdr = AppState::hdr(&headers, "x-muxmesh-host");
     let got_token = AppState::hdr(&headers, "x-muxmesh-token");
-    if !state.auth_ok(&host_hdr, &got_token) {
+    // token decides; declared name (header or payload) is the label.
+    let authed = state.auth_host(&host_hdr, &got_token);
+    if authed.is_none() {
         tracing::warn!(
             "POST /state host={host_hdr} auth=FAIL (registered: {})",
             state.tokens.lock().map(|s| s.hosts.len()).unwrap_or(0)
@@ -309,11 +341,7 @@ async fn post_state(
             st.seen = now;
         }
     }
-    let host_key = if host_hdr.is_empty() {
-        st.host.clone()
-    } else {
-        host_hdr.clone()
-    };
+    let host_key = authed.unwrap(); // token-verified identity (declared label)
     if host_key.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing host\n").into_response();
     }
@@ -423,31 +451,33 @@ async fn post_cmd(
         }
     };
 
-    // AUTH driver: same registry + same KDF verify as /state (KDF outside lock).
-    // dst is NOT checked before this: answering 400-before-401 would let an
-    // unauthenticated caller enumerate registered hosts.
+    // AUTH driver: token is the identity (same as /state). The declared src
+    // must match the authenticated identity — a driver cannot impersonate
+    // another host. dst is NOT checked before auth: 400-before-401 would let
+    // an unauthenticated caller enumerate registered hosts.
     let host_hdr = AppState::hdr(&headers, "x-muxmesh-host");
     let got_token = AppState::hdr(&headers, "x-muxmesh-token");
-    if !state.auth_ok(&host_hdr, &got_token) {
-        tracing::warn!("POST /cmd src={host_hdr} auth=FAIL");
-        return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+    let authed = state.auth_host(&host_hdr, &got_token);
+    match &authed {
+        Some(name) if *name == env.src => {}
+        Some(name) => {
+            tracing::warn!("POST /cmd src={host_hdr} auth=FAIL (token = {name})");
+            return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+        }
+        None => {
+            tracing::warn!("POST /cmd src={host_hdr} auth=FAIL");
+            return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+        }
     }
 
     let dst = env.dst.clone();
     if dst.is_empty() || !valid_host(&dst) {
         return (StatusCode::BAD_REQUEST, "invalid dst\n").into_response();
     }
-    let registered = state
-        .tokens
-        .lock()
-        .map(|s| s.hosts.contains_key(&dst))
-        .unwrap_or(false);
-    if !registered {
-        tracing::warn!("POST /cmd dst={dst} -> 403 dst not registered");
-        return (StatusCode::FORBIDDEN, "dst not registered\n").into_response();
-    }
     // the agent must hold a live WS channel RIGHT NOW — the hub has no other
-    // way (and no right) to reach it.
+    // way (and no right) to reach it. A live channel is proof the dst token
+    // was authenticated at handshake, so no separate tokens.json check here:
+    // a renamed machine's channel (declared label) is reachable by its new name.
     let enqueued = {
         let ch = state.channels.lock().unwrap_or_else(|e| e.into_inner());
         match ch.get(&dst) {

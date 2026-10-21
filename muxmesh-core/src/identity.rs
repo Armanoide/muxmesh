@@ -292,6 +292,42 @@ impl TokenStore {
             .is_some_and(|rec| token.len() >= PREFIX_LEN && verify_token(token, &rec.hash))
     }
 
+    /// Authenticate a token ALONE (no host): find the registered host whose
+    /// prefix matches, then verify. The token is the identity; the host name
+    /// is a label the machine declares (rename = edit config.toml, no re-mint).
+    /// Returns None when the token is unknown or fails verification.
+    pub fn authenticate(&self, token: &str) -> Option<String> {
+        if token.len() < PREFIX_LEN {
+            return None;
+        }
+        let prefix: String = token.chars().take(PREFIX_LEN).collect();
+        self.hosts
+            .iter()
+            .find(|(_, rec)| rec.prefix == prefix)
+            .and_then(|(host, rec)| {
+                if verify_token(token, &rec.hash) {
+                    Some(host.clone())
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Rename a machine's label WITHOUT touching its token: move the record
+    /// from `old` to `new`. Returns true if renamed, false if `old` absent
+    /// or `new` already taken (collision -> caller decides).
+    pub fn rename(&mut self, old: &str, new: &str) -> bool {
+        if old == new || self.hosts.contains_key(new) {
+            return false;
+        }
+        if let Some(rec) = self.hosts.remove(old) {
+            self.hosts.insert(new.to_string(), rec);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Revoke a machine: its next request 401s, others unaffected.
     pub fn revoke(&mut self, host: &str) -> bool {
         self.hosts.remove(host).is_some()

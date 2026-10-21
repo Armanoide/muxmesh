@@ -148,7 +148,13 @@ impl Hub {
     }
 
     async fn post_cmd(&self, token: &str, body: &str) -> (u16, String) {
-        post_http(&self.bind, "/cmd", "driver", token, body).await
+        // src comes from the envelope; the header must match the token's
+        // identity (the hub rejects src != authenticated name). Parse it.
+        let src = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("src").and_then(|s| s.as_str().map(String::from)))
+            .unwrap_or_else(|| "driver".into());
+        post_http(&self.bind, "/cmd", &src, token, body).await
     }
 
     /// Fake WS agent: dial /agent/ws with host+token headers. Returns the
@@ -335,10 +341,12 @@ async fn hub_ws_flow() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // 9) unregistered dst -> 403 (registered check precedes connectivity)
+    // 9) unregistered dst -> 409 (token-decoupled design: no separate
+    // registered check — dst must hold a LIVE channel; an unknown name has
+    // none, so it is indistinguishable from "offline" and answers 409).
     let (code, text) = hub.post_cmd(&tok_drv, &envelope("c-9", "ghost")).await;
-    assert_eq!(code, 403, "unregistered dst must 403");
-    assert!(text.contains("not registered"), "body: {text}");
+    assert_eq!(code, 409, "unknown dst must 409 (no live channel)");
+    assert!(text.contains("not connected"), "body: {text}");
 
     // 10) legacy path /ws (old agents dial it): same handler, same auth gate
     let mut agent2 = hub.ws_connect_path("/ws", dst, &tok_dst).await;
@@ -347,8 +355,7 @@ async fn hub_ws_flow() {
     let frame = Hub::recv_text(&mut agent2).await;
     assert!(frame.contains("\"id\":\"c-10\""), "frame: {frame}");
 
-    // 11) reconnect + replay of the same id on /agent/ws: pushed again (no
-    // dedup — the agent's job, documented).
+    // 11) reconnect + replay of the same id on /agent/ws: pushed again (no    // dedup — the agent's job, documented).
     let mut agent3 = hub.ws_connect(dst, &tok_dst).await;
     let (code, _) = hub.post_cmd(&tok_drv, &envelope("c-6", dst)).await;
     assert_eq!(code, 202, "replay queues again");
@@ -357,6 +364,23 @@ async fn hub_ws_flow() {
         frame.contains("\"id\":\"c-6\""),
         "same id re-pushed: {frame}"
     );
+
+    // 12) RENAMED MACHINE, SAME TOKEN: the token is the identity, the name is
+    // a label. agent-a dials /agent/ws declaring "agent-renamed" with the
+    // SAME token -> 101, and /cmd addressed to "agent-renamed" queues.
+    // No re-mint needed; the old label is replaced on connect (gen guard).
+    let mut renamed = hub.ws_connect("agent-renamed", &tok_dst).await;
+    let (code, _) = hub
+        .post_cmd(&tok_drv, &envelope_src("c-12", "driver", "agent-renamed"))
+        .await;
+    assert_eq!(code, 202, "renamed dst (same token) must queue: {code}");
+    let frame = Hub::recv_text(&mut renamed).await;
+    assert!(frame.contains("\"id\":\"c-12\""), "renamed push: {frame}");
+}
+
+/// envelope with explicit src (rename tests).
+fn envelope_src(id: &str, src: &str, dst: &str) -> String {
+    format!("{{\"v\":1,\"id\":\"{id}\",\"src\":\"{src}\",\"dst\":\"{dst}\",\"cmd\":{{\"type\":\"BarHide\"}},\"ts\":1}}")
 }
 
 /// Regression guard for the 5.07s killer: a QUIET channel (no frames, no
