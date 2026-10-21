@@ -152,16 +152,8 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         Some(o) => o.trim().to_string(),
         None => return 1,
     };
-    let host = match armed_host_of_current_window(cfg) {
-        Some(h) => h,
-        None => {
-            tracing::info!("no armed window (no live ssh to an armed host here)");
-            return 1;
-        }
-    };
 
-    // hidden-state: read the window option (empty => shown)
-    tracing::debug!("bar-toggle: armed host={host}");
+    // hidden-state of THIS server's bar (window option, survives presses)
     let hidden_now = muxmesh_core::poll::tmux_out(
         &base,
         &["show-window-option", "-t", &wid, "@muxmesh-bar-hidden"],
@@ -169,35 +161,43 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     .map(|o| o.ends_with("on"))
     .unwrap_or(false);
 
-    let (cmd, next) = if hidden_now {
-        (Command::BarShow, "on")
-    } else {
-        (Command::BarHide, "off")
-    };
+    let host = armed_host_of_current_window(cfg);
 
-    let port: u16 = std::env::var("MUXMESH_CMD_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9998);
-    // /cmd is authenticated by the TARGET agent with ITS own token (minted
-    // on the hub for <host>). The driver may forward its own token only when
-    // it IS the registered peer (same name); otherwise export the target's
-    // token as MUXMESH_CMD_TOKEN. A wrong secret still 401s — no bypass.
-    let token = std::env::var("MUXMESH_CMD_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
-    let env = CommandEnvelope {
-        v: 1,
-        id: format!("c-{}", now_ts()),
-        src: hostname_short(),
-        cmd,
-        ts: now_ts(),
-    };
-    match send_cmd(&host, port, &token, &env) {
-        Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
-            tracing::debug!("bar-toggle: agent ack, state -> {}", next);
-            // persist the new state on the window (survives across presses)
+    // Parent/child roles are decided by the KEYSTROKE's server, not by us:
+    // - F10 lands on the driver's server while an armed ssh has focus ->
+    //   this server is the PARENT: hide its own bar, pass control down.
+    // - F10 pressed inside the nested remote tmux traverses ssh and lands
+    //   on the CHILD's server, where armed_host_of_current_window finds no
+    //   outbound ssh -> local branch below.
+    match host {
+        // PARENT side (driver): a live armed ssh is in this window. The parent
+        // bar yields the screen to the child: hide LOCAL, then forward F10
+        // into the focused pane as W.P (%pane_id does not traverse nested ssh
+        // — verified in tmux-remote) so the remote server's own binding shows
+        // ITS bar. One bar on screen: the child's. Next press reverses.
+        Some(h) if !hidden_now => {
+            muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
+            if let Some(p) = muxmesh_core::poll::tmux_out(
+                &base,
+                &["display", "-p", "#{window_index}.#{pane_index}"],
+            ) {
+                let p = p.trim().to_string();
+                if !p.is_empty() {
+                    muxmesh_core::poll::run_tmux(&base, &["send-keys", "-t", &p, "F10"]);
+                }
+            }
+            muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
+            muxmesh_core::poll::run_tmux(
+                &base,
+                &["set-window-option", "-t", &wid, "@muxmesh-bar-hidden", "on"],
+            );
+            println!("muxmesh: parent bar hidden, control passed to {h}");
+            0
+        }
+        // PARENT side, second press: restore the local bar and tell the child
+        // (via its agent) to hide its bar again — back to badge-only view.
+        Some(h) => {
+            muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
             muxmesh_core::poll::run_tmux(
                 &base,
                 &[
@@ -205,22 +205,62 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     "-t",
                     &wid,
                     "@muxmesh-bar-hidden",
-                    if next == "off" { "on" } else { "off" },
+                    "off",
                 ],
             );
-            println!("muxmesh: bar {next} on {host}");
-            0
+            let port: u16 = std::env::var("MUXMESH_CMD_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(9998);
+            let token = std::env::var("MUXMESH_CMD_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
+            let env = CommandEnvelope {
+                v: 1,
+                id: format!("c-{}", now_ts()),
+                src: hostname_short(),
+                cmd: Command::BarHide,
+                ts: now_ts(),
+            };
+            match send_cmd(&h, port, &token, &env) {
+                Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
+                    println!("muxmesh: parent bar shown, {h} bar hidden");
+                    0
+                }
+                Ok(resp) => {
+                    // child unreachable: parent bar is back either way, report softly
+                    eprintln!(
+                        "muxmesh-cli bar-toggle: {h} agent replied: {}",
+                        resp.lines().next().unwrap_or("")
+                    );
+                    1
+                }
+                Err(e) => {
+                    eprintln!("muxmesh-cli bar-toggle: {h}:{port}: {e}");
+                    1
+                }
+            }
         }
-        Ok(resp) => {
-            eprintln!(
-                "muxmesh-cli bar-toggle: agent replied: {}",
-                resp.lines().next().unwrap_or("")
+        // CHILD side (or no armed ssh): toggle THIS server's bar locally —
+        // pure tmux, no network. Covers case 1b/3 (F10 pressed inside the
+        // nested remote tmux) and any local-only window.
+        None => {
+            let next = if hidden_now { "on" } else { "off" };
+            muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", next]);
+            muxmesh_core::poll::run_tmux(
+                &base,
+                &[
+                    "set-window-option",
+                    "-t",
+                    &wid,
+                    "@muxmesh-bar-hidden",
+                    if hidden_now { "off" } else { "on" },
+                ],
             );
-            1
-        }
-        Err(e) => {
-            eprintln!("muxmesh-cli bar-toggle: {host}:{port}: {e}");
-            1
+            muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
+            println!("muxmesh: local bar {next}");
+            0
         }
     }
 }
