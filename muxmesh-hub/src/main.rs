@@ -149,6 +149,10 @@ fn main() {
                 // backpressure BEFORE spawning: over cap -> 503, no thread, no read.
                 match Permit::acquire() {
                     Some(permit) => {
+                        // timeout for short HTTP requests ONLY — the accept
+                        // loop cannot know the route yet, so /ws connections get
+                        // it cleared below before handle_ws (a 5s read timeout
+                        // would kill every persistent channel, observed live).
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         // no Nagle: the 101 handshake reply must reach the peer
@@ -175,6 +179,10 @@ fn main() {
                         // /ws upgrade: handled on its own thread; the persistent
                         // connection holds one permit by design (cap 64 agents).
                         if is_ws {
+                            // persistent channel: no read timeout — a quiet agent
+                            // must not be dropped after 5s (tungstenite ping/pong
+                            // is the liveness mechanism, not a socket timeout).
+                            let _ = stream.set_read_timeout(None);
                             let ws_stream = match stream.try_clone() {
                                 Ok(s) => s,
                                 Err(_) => continue,

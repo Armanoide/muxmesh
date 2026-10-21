@@ -271,9 +271,16 @@ impl AgentConfig {
     }
 
     /// WebSocket URL of the hub's persistent command channel. The agent dials
-    /// OUT to the hub here; the hub never dials the agent.
+    /// OUT to the hub here; the hub never dials the agent. The hub host may
+    /// be "host" or "host:port" (poll.hub style) — strip any embedded port so
+    /// the URL never becomes the invalid ws://host:9997:9998/ws.
     pub fn ws_url(&self) -> String {
-        format!("ws://{}:{}/ws", self.hub, self.port)
+        let hub = self
+            .hub
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(&self.hub);
+        format!("ws://{hub}:{}/ws", self.port)
     }
 }
 
