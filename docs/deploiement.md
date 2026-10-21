@@ -1,60 +1,23 @@
-# muxmesh — déploiement : zéro commande à la main
+# muxmesh — déploiement
 
-Règle : **aucun composant ne se lance à la main** au quotidien. Chaque machine
-déclare ses services au gestionnaire d'init du système ; lui les démarre au
-boot, les redémarre s'ils meurent. `./muxmesh-hub` à la main = uniquement le
-debug ponctuel, jamais l'usage normal.
+> [!warning] Mode actuel : manuel, jusqu'à stabilisation (décision Norbert 2026-10-21)
+> Hub et agent se lancent **à la main** sur chaque machine. Pas de launchd ni
+> systemd tant que la chaîne F10 n'est pas stable en UAT. Les démons qui
+> meurent quand on ferme le terminal sont un comportement ASSUMÉ à ce stade.
+> Le passage en services (launchd/systemd) se fera quand tout sera vert.
 
 ## Qui lance quoi (et pourquoi)
 
-| Machine | Rôles | Lancé par |
+| Machine | Rôles | Lancé par (manuel, terminal dédié) |
 |---|---|---|
-| Pivot (Mini aujourd'hui, node1/NAS demain) | `muxmesh-hub` + `muxmesh-agent` (hub et agent cohabitent) | launchd (`com.muxmesh.hub.plist` + `com.muxmesh.agent.plist`) |
-| MacBook (driver) | tmux (bindings F10) + poller embarque dans l'agent | launchd (`com.muxmesh.agent.plist`) + tmux au login |
-| Autres serveurs | `muxmesh-agent` | systemd unit (modèle ci-dessous) |
+| Pivot (Mini aujourd'hui, node1/NAS demain) | `muxmesh-hub` + `muxmesh-agent` (hub et agent cohabitent) | `muxmesh-hub -v >> ~/.muxmesh/hub.log 2>&1` puis `muxmesh-agent -v >> ~/.muxmesh/agent.log 2>&1` |
+| MacBook (driver) | tmux (bindings F10) + poller embarqué dans l'agent | `muxmesh-agent` (le poller est dedans) + tmux au login |
+| Autres serveurs | `muxmesh-agent` | idem, terminal ou `nohup` |
 
-Le **poll** n'a pas à être lancé à la main : c'est un service du driver, comme
-le hub l'est du pivot. Le **badge** se met tout seul dès que l'agent du
-destinataire tourne — c'est le design : tu ouvres ton terminal, `ssh`, badge.
+Le **poll** n'a jamais à être lancé à la main : il est embarqué dans hub et
+agent. Le **badge** se met tout seul dès que l'agent du destinataire tourne.
 
-## macOS (Mini + MacBook)
 
-Les plists existent (`launchd/`). Installation sur chaque machine :
-
-```bash
-# Mini (pivot) : hub + agent
-mkdir -p ~/.muxmesh
-sed 's/USER/norbert/g' launchd/com.muxmesh.hub.plist  > ~/Library/LaunchAgents/com.muxmesh.hub.plist
-sed 's/USER/norbert/g' launchd/com.muxmesh.agent.plist > ~/Library/LaunchAgents/com.muxmesh.agent.plist
-launchctl load ~/Library/LaunchAgents/com.muxmesh.hub.plist
-launchctl load ~/Library/LaunchAgents/com.muxmesh.agent.plist
-
-# MacBook (driver) : poll + tmux
-sed 's/USER/norbert/g' launchd/com.muxmesh.poll.plist > ~/Library/LaunchAgents/com.muxmesh.poll.plist
-launchctl load ~/Library/LaunchAgents/com.muxmesh.poll.plist
-```
-
-`RunAtLoad + KeepAlive` = démarre au login, redémarre s'il meurt. Rien d'autre à faire.
-
-## Linux (node1/NAS demain) — modèle systemd
-
-```ini
-# /etc/systemd/system/muxmesh-hub.service  (pivot)
-[Unit]
-Description=muxmesh hub (state pivot)
-After=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/muxmesh-hub
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-```
-```bash
-systemctl enable --now muxmesh-hub   # une seule fois, puis oublié
-```
 
 ## Ce qui reste manuel (assumé, court)
 
@@ -83,8 +46,9 @@ mm_9f3a…(43 car., affiché UNE SEULE FOIS)
   + préfixe 8 car. pour le lookup. Vol de `tokens.json` ne donne pas les tokens.
 - **Rotation sans redémarrage** : agent et hub relisent leurs fichiers de secrets
   à chaque requête — coller un nouveau token dans `token` suffit.
-- `/cmd` : le driver passe **par le hub** (le hub authentifie le driver, relaie
-  avec le token de la cible) → les ports 9998 des agents peuvent fermer au LAN.
+- `/cmd` : le driver parle **directement à l'agent cible** (POST sur son port
+  9998, LAN only) ; le hub ne relaie jamais une commande — il n'agrège que
+  l'état. L'agent authentifie avec SON token (`MUXMESH_CMD_TOKEN` côté driver).
 - Révocation : supprimer l'entrée de `tokens.json` (ou régénérer) → la machine
   reçoit 401 et s'arrête proprement, les autres intactes.
 
@@ -95,8 +59,8 @@ mm_9f3a…(43 car., affiché UNE SEULE FOIS)
 
 ## Statut de cette règle
 
-- ✅ plists hub/agent/poll écrits (RunAtLoad+KeepAlive)
-- ❌ **manque** : installation launchd jamais faite sur tes machines (c'est toi qui appliques)
+- Mode manuel ASSUMÉ tant que l'UAT F10 n'est pas stable (launchd/systemd retirés du repo le 2026-10-21).
+- À faire quand tout sera vert : réécrire plists + unit systemd et basculer.
 
 ## Pare-feu macOS — le piège du port 9997 (symptôme réel)
 
@@ -122,7 +86,7 @@ Niveaux `tracing` : ERROR / WARN / INFO (défaut) / DEBUG.
 - Sans option : uniquement l’essentiel (démarrage, `push=ok`, erreurs).
 - `-v` ou `--verbose` (hub, agent, cli) : équivalent `RUST_LOG=muxmesh=debug`
   — chaque requête GET/POST /state, chaque décision bar-toggle, chaque appel tmux raté.
-- `MUXMESH_DEBUG=true` : debug global sans toucher aux args (pratique sous launchd).
+- `MUXMESH_DEBUG=true` : debug global sans toucher aux args.
 - `RUST_LOG` explicite gagne toujours (`RUST_LOG=muxmesh_hub=trace,...`).
 
 Exemples :

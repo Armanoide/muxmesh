@@ -48,7 +48,6 @@ muxmesh/
 ├── muxmesh-agent/  # per-machine daemon (push /state, serve /cmd)
 ├── muxmesh-cli/    # driver client (placeholder, brique 3)
 ├── muxmesh-cli/    # driver client: badge poller (`poll`), state tree (`tree`), keys (brique 3)
-└── launchd/        # macOS service templates (Linux: systemd units)
 ```
 
 ## Quick start

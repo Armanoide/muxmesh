@@ -284,7 +284,7 @@ pub fn fetch_state(hub_addr: &str) -> StateDoc {
         Err(e) => {
             // dedupe: log the first failure and every 15th (~30s at 2s poll)
             // note: process-global counter — assumes one poller per process (true today).
-            // so a down hub doesn't spam stderr under launchd KeepAlive.
+            // so a down hub doesn't spam stderr when supervised (later: launchd/systemd).
             static FAILS: AtomicU64 = AtomicU64::new(0);
             let n = FAILS.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(15) {
