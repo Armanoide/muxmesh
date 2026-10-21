@@ -2,8 +2,11 @@
 #
 # ATUIN RULE: this file is COMMIT-ABLE (no secrets). Every secret lives in
 # its own 0600 file under ~/.config/muxmesh/:
-#   token     — this machine's hub token, pasted once after:
-#               muxmesh-hub generate-token <host>   (run on the pivot)
+#   token       — this machine's hub token, pasted once after:
+#                 muxmesh-hub generate-token <host>   (run on the pivot)
+#   relay-token — the SECOND value printed by generate-token: lets THIS agent
+#                 accept hub-relayed /cmd (the hub keeps the same secret in
+#                 ~/.muxmesh/relay/<host>.token). Env: MUXMESH_RELAY_TOKEN_PATH.
 #
 #   cp config.toml.example ~/.config/muxmesh/config.toml
 
@@ -15,8 +18,13 @@ state_path = "~/.muxmesh/state.json"
 # per-machine token registry written by the hub (digests + prefixes only,
 # NEVER raw tokens). Env: MUXMESH_TOKENS.
 tokens_path = "~/.muxmesh/tokens.json"
+# port the hub relays POST /cmd to on the target agent (same default as
+# agent.cmd_port). Relay secrets: ~/.muxmesh/relay/<host>.token (0600,
+# written by generate-token). Env: MUXMESH_HUB_CMD_PORT (hub outbound).
+# Note: MUXMESH_CMD_PORT retargets the agent listen port and the CLI hub port.
+cmd_port = 9998
 # no auto-registration: mint each machine's token here with
-#   muxmesh-hub generate-token <host>   (printed once, paste into agent's token file)
+#   muxmesh-hub generate-token <host>   (prints TWO tokens once: machine + relay)
 
 [poll]
 # where the poller fetches live state ("host" or "host:port"). On a DRIVER
@@ -39,8 +47,9 @@ port = 9997
 host = ""
 # seconds between two heartbeats pushed to the hub.
 interval = 15
-# local HTTP port where the agent serves POST /cmd (clients send closed-list
-# commands here). 0 disables command execution. Env: MUXMESH_CMD_PORT.
+# local HTTP port where the agent serves POST /cmd. In the hub-relay flow it
+# receives commands FORWARDED by the hub (driver -> hub -> agent, never
+# driver -> agent direct). 0 disables command execution. Env: MUXMESH_CMD_PORT.
 cmd_port = 9998
 # local tmux socket the agent controls ("" => tmux default). Env: MUXMESH_TMUX_SOCKET.
 tmux_socket = ""

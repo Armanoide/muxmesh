@@ -136,6 +136,11 @@ fn main() {
     if muxmesh_core::read_token().as_str().is_empty() {
         tracing::warn!("no token (~/.config/muxmesh/token) -> the hub will reject (401). Mint one: muxmesh-hub generate-token {}", cfg.host);
     }
+    // hub-relayed /cmd is authenticated with the relay token (same mint,
+    // second printed value). Absent => hub-relayed commands 401 here.
+    if muxmesh_core::read_relay_token().as_str().is_empty() {
+        tracing::warn!("no relay token (~/.config/muxmesh/relay-token) -> hub-relayed /cmd will 401. Paste the second value of: muxmesh-hub generate-token {}", cfg.host);
+    }
     tracing::info!("host={} -> {url} (interval {}s)", cfg.host, cfg.interval);
 
     // Embedded badge poller: the agent's own machine gets @muxmesh-status
@@ -209,11 +214,12 @@ fn serve_cmd(cfg: &muxmesh_core::AgentConfig) {
             Ok(mut stream) => {
                 let cfg = cfg.clone();
                 thread::spawn(move || {
-                    // token re-read per request: rotation without restart
+                    // secrets re-read per request: rotation without restart
                     let tok = muxmesh_core::read_token().as_str().to_string();
+                    let relay = muxmesh_core::read_relay_token().as_str().to_string();
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                    if let Err(e) = handle_cmd(&mut stream, &cfg, &tok) {
+                    if let Err(e) = handle_cmd(&mut stream, &cfg, &tok, &relay) {
                         tracing::error!("/cmd: {e}");
                     }
                 });
@@ -257,6 +263,7 @@ fn handle_cmd(
     stream: &mut std::net::TcpStream,
     cfg: &muxmesh_core::AgentConfig,
     token: &str,
+    relay_token: &str,
 ) -> std::io::Result<()> {
     use muxmesh_core::{httpd, token_matches, Ack, CommandEnvelope};
 
@@ -269,9 +276,25 @@ fn handle_cmd(
         }
     };
 
-    if !token_matches(token, req.header("x-muxmesh-token").unwrap_or("")) {
-        tracing::warn!("/cmd: STOP at auth — token mismatch (empty token file? rotated?)");
-        return httpd::respond(stream, 401, "text/plain", b"unauthorized\n");
+    // two auth paths: the hub relays with the per-host relay secret, a legacy
+    // direct client still authenticates with this machine's own token.
+    // trace which path matched — never the secret itself.
+    let got = req.header("x-muxmesh-token").unwrap_or("");
+    let auth = if token_matches(relay_token, got) {
+        Some("relay")
+    } else if token_matches(token, got) {
+        Some("direct")
+    } else {
+        None
+    };
+    match auth {
+        Some(mode) => tracing::debug!("/cmd: auth={mode}"),
+        None => {
+            tracing::warn!(
+                "/cmd: STOP at auth — token mismatch (own or relay file absent? rotated?)"
+            );
+            return httpd::respond(stream, 401, "text/plain", b"unauthorized\n");
+        }
     }
 
     if req.method == "GET" && req.path.starts_with("/ping") {
@@ -368,5 +391,19 @@ mod tests {
     #[test]
     fn hostname_is_not_empty() {
         assert!(!hostname().is_empty());
+    }
+
+    #[test]
+    fn cmd_auth_accepts_relay_or_direct_denies_other() {
+        use muxmesh_core::token_matches;
+        let own = "own-token-aaaa";
+        let relay = "relay-token-bbbb";
+        // relay secret wins (hub-relayed), own token still works (legacy direct)
+        assert!(token_matches(relay, relay));
+        assert!(token_matches(own, own));
+        // neither matches a foreign or empty token
+        assert!(!token_matches(relay, own));
+        assert!(!token_matches(own, relay));
+        assert!(!token_matches("", ""));
     }
 }

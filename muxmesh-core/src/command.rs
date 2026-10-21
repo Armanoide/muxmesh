@@ -39,6 +39,10 @@ pub struct CommandEnvelope {
     pub id: String,
     /// canonical name of the sending client (e.g. "client-a").
     pub src: String,
+    /// destination machine (hub-relayed commands: driver -> hub -> agent).
+    /// serde default empty so old agents/hub tolerate its absence (v:1 kept).
+    #[serde(default)]
+    pub dst: String,
     pub cmd: Command,
     /// unix timestamp (seconds) of emission.
     pub ts: u64,
@@ -218,6 +222,7 @@ mod tests {
             v: 1,
             id: "c-1".into(),
             src: "client-a".into(),
+            dst: "host-b".into(),
             cmd: Command::NewWindow {
                 session: "main".into(),
             },
@@ -227,6 +232,27 @@ mod tests {
         assert!(json.contains("\"type\":\"NewWindow\""));
         let back: CommandEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn dst_roundtrip_and_default_empty() {
+        // hub-relayed envelope carries the destination machine
+        let env = CommandEnvelope {
+            v: 1,
+            id: "c-1".into(),
+            src: "client-a".into(),
+            dst: "host-b".into(),
+            cmd: Command::BarHide,
+            ts: 1,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"dst\":\"host-b\""));
+        let back: CommandEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(env, back);
+        // an old client that omits dst still deserializes (empty = direct)
+        let legacy = r#"{"v":1,"id":"c","src":"x","cmd":{"type":"BarHide"},"ts":1}"#;
+        let env: CommandEnvelope = serde_json::from_str(legacy).unwrap();
+        assert_eq!(env.dst, "");
     }
 
     #[test]

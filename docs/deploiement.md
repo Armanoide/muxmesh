@@ -33,22 +33,31 @@ n'existe pas — un scanner qui le trouve reçoit `404`).
 ```
 Mac Mini (pivot)                          machine à appairer
 $ muxmesh-hub generate-token 10.0.10.7
-mm_9f3a…(43 car., affiché UNE SEULE FOIS)
+mm_9f3a…(43 car., token MACHINE)   rl_7c2b…(43 car., secret RELAY) — affichés UNE SEULE FOIS
    │ tokens.json : {host: {prefix, hash, created}} — jamais le clair
-   └──────────── tu colles le token, une fois ────────────►  ~/.config/muxmesh/token (0600)
-                                                            l'agent le relit à chaque push,
-                                                            aucun redémarrage nécessaire
+   │ ~/.muxmesh/relay/<host>.token (0600) — le hub relaie /cmd avec, relu à chaque requête
+   ├──────────── tu colles le token MACHINE, une fois ─────►  ~/.config/muxmesh/token (0600)
+   └──────────── tu colles le secret RELAY, une fois ──────►  ~/.config/muxmesh/relay-token (0600)
+                                                             l'agent accepte alors les /cmd
+                                                             relayés par le hub
 ```
 
 - **Token par machine** : une machine compromise se remplace en régénérant son
   token (`generate-token <host>` révoque l'ancien immédiatement), les autres intactes.
-- **Le hub ne stocke jamais le secret** : hash SHA-256 itéré ×100 000 (sel aléatoire)
+- **Le hub ne stocke jamais le secret MACHINE** : hash SHA-256 itéré ×100 000 (sel aléatoire)
+- **Exception assumée : les secrets de RELAI** (`~/.muxmesh/relay/<host>.token`) sont en clair 0600 sur le pivot — le hub doit re-signer chaque relais, un hash ne suffit pas. Pivot compromis ⇒ `generate-token <host>` pour les faire tourner.
   + préfixe 8 car. pour le lookup. Vol de `tokens.json` ne donne pas les tokens.
 - **Rotation sans redémarrage** : agent et hub relisent leurs fichiers de secrets
   à chaque requête — coller un nouveau token dans `token` suffit.
-- `/cmd` : le driver parle **directement à l'agent cible** (POST sur son port
-  9998, LAN only) ; le hub ne relaie jamais une commande — il n'agrège que
-  l'état. L'agent authentifie avec SON token (`MUXMESH_CMD_TOKEN` côté driver).
+- `/cmd` : le driver parle **au hub** (`POST /cmd`, `dst: <host>` dans le
+  corps) ; le hub authentifie le driver (même registre que `/state`), exige
+  que la cible soit **armée+fraîche** (sinon `403 target not armed`), puis
+  **relaie** la commande à `<host>:hub.cmd_port` (défaut 9998) signée avec le
+  secret de relais de cet hôte (`~/.muxmesh/relay/<host>.token`). Jamais de
+  driver→agent direct (décision opérateur 2026-10-21). Côté agent : son token
+  (legacy direct) OU le relay-token sont acceptés. LAN only, verbes fermés.
+  Sans fichier de relais : `502 no relay secret for <host>` → relancer
+  `generate-token <host>`.
 - Révocation : supprimer l'entrée de `tokens.json` (ou régénérer) → la machine
   reçoit 401 et s'arrête proprement, les autres intactes.
 

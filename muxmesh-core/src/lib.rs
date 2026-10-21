@@ -12,9 +12,9 @@ pub mod state;
 
 pub use command::{valid_host, valid_name, Ack, Command, CommandEnvelope};
 pub use config::{
-    agent_poll_hub, config_dir, expand_tilde, read_token, token_matches, AgentConfig, HubConfig,
-    Token,
+    agent_poll_hub, config_dir, expand_tilde, hub_relay_path, read_relay_token, read_token,
+    token_matches, AgentConfig, HubConfig, Token,
 };
 pub use error::CoreError;
-pub use identity::{verify_token, TokenRecord, TokenStore, PREFIX_LEN};
+pub use identity::{new_token, verify_token, TokenRecord, TokenStore, PREFIX_LEN};
 pub use state::{now_unix, HostState, RemoteSession, StateDoc};

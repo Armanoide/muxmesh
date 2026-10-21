@@ -1,4 +1,4 @@
-//! Send closed-list commands to a remote agent (`POST /cmd`).
+//! Send closed-list commands to a remote agent VIA THE HUB (`POST /cmd`).
 //!
 //!   muxmesh-cli send <host> <command> [args...]
 //!     send host-a NewWindow main
@@ -6,9 +6,11 @@
 //!     send host-a FocusWindow main 2
 //!     send host-a AttachOrDetach main
 //!
-//! The host's port comes from agent.cmd_port (default :9998) — the client and
-//! the agent share config.toml, so both agree on the port. Token is added from
-//! ~/.config/muxmesh/token. std::net only -> offline build.
+//! Operator rule: agent→hub only, never driver→agent direct. The CLI POSTs to
+//! the hub (poll.hub), the envelope carries `dst: <host>`; the hub checks the
+//! target is armed+fresh and relays to dst:hub.cmd_port with that host's
+//! relay secret. The driver authenticates with its own token
+//! (~/.config/muxmesh/token, MUXMESH_CMD_TOKEN overrides). std::net only.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -39,8 +41,8 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
     }
 }
 
-/// POST /cmd to host:port. Returns the raw ack body. HTTP/1.1 + Connection:
-/// close (agent litigates Content-Length); std only.
+/// POST /cmd to host:port (the hub, in the relay flow). Returns the raw ack
+/// body. HTTP/1.1 + Connection: close (agent litigates Content-Length); std only.
 pub fn send_cmd(
     host: &str,
     port: u16,
@@ -53,11 +55,12 @@ pub fn send_cmd(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
-    // The agent parses the request line with read_line, which buffers up to
+    // The hub/agent parse the request line with read_line, which buffers up to
     // 8 KiB: if it has already swallowed our headers into its buffer, the
     // body must arrive in a SEPARATE TCP segment or it waits forever.
     let req = format!(
-        "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Host: {}\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        env.src,
         body.len()
     );
     stream
@@ -201,10 +204,13 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     match host {
         // PARENT side: driver presses F10 with an armed ssh pane focused.
         Some(h) => {
+            // commands flow driver -> HUB -> agent (never direct to the host):
+            // POST to poll.hub, dst in the envelope, hub relays + re-signs.
+            let (hub_host, hub_port) = split_host_port(&cfg.poll_hub);
             let port: u16 = std::env::var("MUXMESH_CMD_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(9998);
+                .unwrap_or(hub_port);
             let token = std::env::var("MUXMESH_CMD_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty())
@@ -214,17 +220,18 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     v: 1,
                     id: format!("c-{}", now_ts()),
                     src: hostname_short(),
+                    dst: h.clone(),
                     cmd: verb,
                     ts: now_ts(),
                 };
-                match send_cmd(&h, port, &token, &env) {
+                match send_cmd(hub_host, port, &token, &env) {
                     Ok(resp) if resp.starts_with("HTTP/1.1 200") => {
-                        tracing::info!("bar-toggle: {h}:{port} acked {label}");
+                        tracing::info!("bar-toggle: hub {hub_host}:{port} relayed {label} to {h}");
                         true
                     }
                     other => {
                         tracing::error!(
-                            "bar-toggle: STOP at step 5 — {h}:{port} {label}: {:?}",
+                            "bar-toggle: STOP at step 5 — hub {hub_host}:{port} {label} for {h}: {:?}",
                             other.map(|r| r.lines().next().unwrap_or("").to_string())
                         );
                         false
@@ -242,8 +249,8 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
                 let ok = post(Command::BarShow, "BarShow");
                 println!(
-                    "muxmesh: parent bar hidden{} — remote {h} bar shown",
-                    if ok { "" } else { " (remote unreachable)" }
+                    "muxmesh: parent bar hidden{} — remote {h} bar shown (via hub)",
+                    if ok { "" } else { " (hub relay failed)" }
                 );
                 if ok {
                     0
@@ -267,8 +274,8 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 muxmesh_core::poll::run_tmux(&base, &["refresh-client", "-S"]);
                 let ok = post(Command::BarHide, "BarHide");
                 println!(
-                    "muxmesh: parent bar shown{} — remote {h} bar hidden",
-                    if ok { "" } else { " (remote unreachable)" }
+                    "muxmesh: parent bar shown{} — remote {h} bar hidden (via hub)",
+                    if ok { "" } else { " (hub relay failed)" }
                 );
                 if ok {
                     0
@@ -303,15 +310,16 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     }
 }
 
-/// `muxmesh-cli send <host> <verb> [args...]`. Port/token come from shared config.
-/// Returns a small exit code: 0 ok, 1 failure, 2 usage.
-pub fn run_send(_cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
+/// `muxmesh-cli send <host> <verb> [args...]` — POSTed to the HUB, which
+/// relays to <host> after checking it is armed+fresh. Returns a small exit
+/// code: 0 ok, 1 failure, 2 usage.
+pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     if args.len() < 2 {
         eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach|BarHide|BarShow> [args]");
         return 2;
     }
     let host = &args[0];
-    // the network peer is a host/IP, not a tmux name -> valid_host (dots ok)
+    // the destination is a hub host key, not a tmux name -> valid_host (dots ok)
     if !muxmesh_core::valid_host(host) {
         eprintln!("muxmesh-cli send: invalid host (must match [A-Za-z0-9_.-])");
         return 2;
@@ -328,21 +336,26 @@ pub fn run_send(_cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
         return 2;
     }
 
-    // the agent cmd port is shared config; reuse agent.cmd_port default 9998.
+    // driver -> hub -> agent: POST to poll.hub, dst in the envelope.
+    let (hub_host, hub_port) = split_host_port(&cfg.poll_hub);
     let port: u16 = std::env::var("MUXMESH_CMD_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(9998);
-    let token = muxmesh_core::read_token().as_str().to_string();
+        .unwrap_or(hub_port);
+    let token = std::env::var("MUXMESH_CMD_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
 
     let env = CommandEnvelope {
         v: 1,
         id: format!("c-{}", now_ts()),
         src: hostname_short(),
+        dst: host.clone(),
         cmd,
         ts: now_ts(),
     };
-    match send_cmd(host, port, &token, &env) {
+    match send_cmd(hub_host, port, &token, &env) {
         Ok(resp) => {
             println!("{resp}");
             if resp.starts_with("HTTP/1.1 200") {
@@ -352,9 +365,28 @@ pub fn run_send(_cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
             }
         }
         Err(e) => {
-            eprintln!("muxmesh-cli send: {e}");
+            eprintln!("muxmesh-cli send: hub {hub_host}:{port}: {e}");
             1
         }
+    }
+}
+
+/// Split "host:port" / "[v6]:port" into (host, port-or-default-9997).
+fn split_host_port(addr: &str) -> (&str, u16) {
+    let a = addr.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        if let Some((h, tail)) = rest.split_once(']') {
+            let p = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(9997);
+            return (h, p);
+        }
+        return (a, 9997);
+    }
+    match a.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, p.parse().unwrap_or(9997)),
+        _ => (a, 9997),
     }
 }
 
@@ -417,12 +449,24 @@ mod tests {
             v: 1,
             id: "c-1".into(),
             src: "client-a".into(),
+            dst: "host-a".into(),
             cmd: Command::NewWindow {
                 session: "main".into(),
             },
             ts: 1,
         };
         let json = serde_json::to_vec(&env).unwrap();
-        assert!(String::from_utf8_lossy(&json).contains("\"type\":\"NewWindow\""));
+        let text = String::from_utf8_lossy(&json);
+        assert!(text.contains("\"type\":\"NewWindow\""));
+        // the hub needs dst to route the relay
+        assert!(text.contains("\"dst\":\"host-a\""));
+    }
+
+    #[test]
+    fn split_host_port_handles_v4_v6_bare() {
+        assert_eq!(split_host_port("10.0.10.3:9997"), ("10.0.10.3", 9997));
+        assert_eq!(split_host_port("10.0.10.3"), ("10.0.10.3", 9997));
+        assert_eq!(split_host_port("[::1]:9998"), ("::1", 9998));
+        assert_eq!(split_host_port("[::1]"), ("::1", 9997));
     }
 }

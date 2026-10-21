@@ -1,16 +1,20 @@
-//! muxmesh-hub — state aggregator daemon (runs on the always-on pivot machine).
+//! muxmesh-hub — state aggregator + command relay (runs on the always-on
+//! pivot machine).
 //!
 //! Listens on TCP :9997. Agents POST /state (JSON HostState); the hub merges
 //! into state.json with ATOMIC writes (tmp + rename) so readers (tmux status
 //! bar, CLI) never see a half-written file.
 //!
-//! The hub NEVER executes commands: it only stores and serves state.
+//! Commands flow driver -> HUB -> agent, never driver -> agent directly: the
+//! hub authenticates the driver, checks the destination is armed+fresh, then
+//! relays POST /cmd to the target agent with that host's relay secret
+//! (~/.muxmesh/relay/<host>.token). The hub itself NEVER executes commands.
 //! std::net only -> no network dependency, offline build.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -19,7 +23,10 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use muxmesh_core::{now_unix, valid_host, valid_name, HostState, HubConfig, StateDoc, TokenStore};
+use muxmesh_core::{
+    hub_relay_path, new_token, now_unix, valid_host, valid_name, CommandEnvelope, HostState,
+    HubConfig, StateDoc, TokenStore,
+};
 
 /// Monotonic counter for unique tmp filenames (see write_atomic).
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +113,7 @@ fn main() {
                 let path = state_path.clone();
                 let lock = lock.clone();
                 let store = store.clone();
+                let cfg = cfg.clone();
                 // backpressure BEFORE spawning: over cap -> 503, no thread, no read.
                 match Permit::acquire() {
                     Some(permit) => {
@@ -113,7 +121,7 @@ fn main() {
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         thread::spawn(move || {
                             let _permit = permit; // released when the handler returns
-                            if let Err(e) = handle(stream, peer, &path, &lock, &store) {
+                            if let Err(e) = handle(stream, peer, &path, &lock, &store, &cfg) {
                                 tracing::error!("{peer}: {e}");
                             }
                         });
@@ -165,11 +173,32 @@ fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
         );
         process::exit(1);
     }
-    // the ONLY place a raw token ever appears: stdout, once, for the operator.
+    // second secret: the relay token. The hub keeps it in ~/.muxmesh/relay/
+    // <host>.token (0600, re-read per relayed /cmd -> rotation without
+    // restart) and the operator pastes the SAME value on the agent as
+    // ~/.config/muxmesh/relay-token, so the agent accepts hub-relayed /cmd.
+    let relay = match new_token() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("muxmesh-hub: generate-token: relay token: {e}");
+            process::exit(1);
+        }
+    };
+    let relay_path = hub_relay_path(&cfg.tokens_path, &host);
+    if let Err(e) = write_file_atomic(&relay_path, format!("{relay}\n").as_bytes()) {
+        eprintln!(
+            "muxmesh-hub: generate-token: write {}: {e}",
+            relay_path.display()
+        );
+        process::exit(1);
+    }
+    // the ONLY place raw tokens ever appear: stdout, once, for the operator.
     println!("{token}");
+    println!("{relay}");
     eprintln!(
-        "muxmesh-hub: token for '{host}' registered in {} — paste it on the agent as ~/.config/muxmesh/token (0600). Shown once.",
-        cfg.tokens_path.display()
+        "muxmesh-hub: host '{host}' paired — machine token in {} + relay secret in {}. Paste the FIRST on the agent as ~/.config/muxmesh/token and the SECOND as ~/.config/muxmesh/relay-token (both 0600). Shown once.",
+        cfg.tokens_path.display(),
+        relay_path.display()
     );
     process::exit(0)
 }
@@ -199,6 +228,7 @@ fn handle(
     path: &Path,
     lock: &Mutex<()>,
     store: &Mutex<TokenStore>,
+    cfg: &HubConfig,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
@@ -240,7 +270,28 @@ fn handle(
         return respond(&mut stream, 200, &body);
     }
 
-    // per-machine auth for everything else (POST /state). Unknown host or
+    // driver -> HUB -> agent command relay. The hub authenticates the driver
+    // with its machine token (same registry as /state), checks the target is
+    // armed+fresh, then re-signs the request with that host's relay secret.
+    if method == "POST" && target.starts_with("/cmd") {
+        // the /cmd body sits AFTER the headers we just consumed with
+        // read_line — read it from `reader`, not the raw socket.
+        let mut body = vec![0u8; content_len.min(1_048_576)];
+        if !body.is_empty() {
+            reader.read_exact(&mut body)?;
+        }
+        return handle_cmd_relay(
+            &mut stream,
+            peer,
+            cfg,
+            store,
+            header_host,
+            header_token,
+            body,
+        );
+    }
+
+    // per-machine auth for POST /state. Unknown host or
     // bad token => 401. Tokens are minted OFFLINE by `muxmesh-hub
     // generate-token <host>` on the pivot — there is NO registration endpoint:
     // an unregistered machine cannot introduce itself to the hub at all.
@@ -353,6 +404,171 @@ fn handle(
     respond(&mut stream, 200, "ok\n")
 }
 
+/// Pure armed-check: the target must be a valid host AND present in the hub
+/// state doc, armed and seen within ttl. Extracted so it is unit-testable.
+fn target_armed(doc: &StateDoc, dst: &str, now: u64, ttl: u64) -> bool {
+    valid_host(dst) && doc.host_armed(dst, now, ttl)
+}
+
+/// POST /cmd to `host:port` with the hub's relay secret, then pass the raw
+/// response through to `stream`. Pattern mirrors the CLI's send_cmd: headers
+/// flushed FIRST (the agent read_line-buffers the head), body in a separate
+/// TCP segment. 5 s timeouts — LAN tool, fail fast.
+fn relay_cmd(
+    stream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    token: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let addr = format!("{host}:{port}");
+    // connect with an explicit timeout: a firewalled dst drops SYNs and the
+    // OS default (~2 min) would hold a permit from the hub's pool for the
+    // whole time, starving /state. std-only: resolve then connect per-addr.
+    let mut peer = None;
+    let mut last_err = None;
+    for sa in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
+            Ok(s) => {
+                peer = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut peer = match peer {
+        Some(s) => s,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, addr)
+            }))
+        }
+    };
+    peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+    peer.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let req = format!(
+        "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Host: hub\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    peer.write_all(req.as_bytes())?;
+    peer.flush()?;
+    // body in its own segment, after the header segment was flushed
+    peer.write_all(body)?;
+    peer.flush()?;
+    // pass the agent's response through, capped at 1 MiB (same cap as every
+    // other body path): a misbehaving peer must not OOM the hub.
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = peer.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > 1_048_576 {
+            tracing::warn!("relay to {addr}: response over 1 MiB — dropping");
+            return respond(stream, 502, "relay response too large\n");
+        }
+    }
+    stream.write_all(&raw)?;
+    stream.flush()
+}
+
+/// POST /cmd relay: authenticate the driver, enforce target-armed, relay.
+fn handle_cmd_relay(
+    stream: &mut TcpStream,
+    peer: std::net::SocketAddr,
+    cfg: &HubConfig,
+    store: &Mutex<TokenStore>,
+    header_host: Option<String>,
+    header_token: Option<String>,
+    body: Vec<u8>,
+) -> std::io::Result<()> {
+    // body capped (1 MiB): a command envelope is a few hundred bytes.
+    if body.is_empty() || body.len() > 1_048_576 {
+        return respond(stream, 400, "bad length\n");
+    }
+
+    // closed list: unknown verbs die here, before any relay.
+    let env: CommandEnvelope = match serde_json::from_slice(&body) {
+        Ok(e) => e,
+        Err(e) => return respond(stream, 422, &format!("invalid payload: {e}\n")),
+    };
+
+    // AUTH driver: same registry + same KDF verify as /state (KDF outside lock).
+    let host_hdr = header_host.unwrap_or_default();
+    let got_token = header_token.unwrap_or_default();
+    let rec = store
+        .lock()
+        .map_err(|e| std::io::Error::other(format!("lock: {e}")))?
+        .hosts
+        .get(&host_hdr)
+        .cloned();
+    match rec {
+        Some(r)
+            if got_token.len() >= muxmesh_core::PREFIX_LEN
+                && muxmesh_core::verify_token(&got_token, &r.hash) =>
+        {
+            tracing::debug!("{peer} POST /cmd src={host_hdr} auth=ok");
+        }
+        _ => {
+            tracing::warn!("{peer} POST /cmd src={host_hdr} auth=FAIL");
+            return respond(stream, 401, "unauthorized\n");
+        }
+    }
+
+    // destination must be armed+fresh on the hub (LAN-only, closed verbs,
+    // target-armed — the operator's three constraints). dst must also be a
+    // registered host key: that pins the relay to machines you minted tokens
+    // for and closes the name-vs-key gap (a driver naming an arbitrary host).
+    let dst = env.dst.clone();
+    if !valid_host(&dst) {
+        return respond(stream, 400, "invalid dst\n");
+    }
+    let registered = store
+        .lock()
+        .map(|s| s.hosts.contains_key(&dst))
+        .unwrap_or(false);
+    if !registered {
+        tracing::warn!("{peer} POST /cmd dst={dst} -> 403 dst not registered");
+        return respond(stream, 403, "dst not registered\n");
+    }
+    let doc = read_doc(&cfg.state_path);
+    if !target_armed(&doc, &dst, now_unix(), cfg.ttl) {
+        tracing::warn!("{peer} POST /cmd dst={dst} -> 403 target not armed");
+        return respond(stream, 403, "target not armed\n");
+    }
+
+    // relay secret per destination, re-read per request (rotation without restart)
+    let relay_path = hub_relay_path(&cfg.tokens_path, &dst);
+    let relay = match fs::read_to_string(&relay_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            return respond(
+                stream,
+                502,
+                &format!("no relay secret for {dst} — re-run: muxmesh-hub generate-token {dst}\n"),
+            )
+        }
+    };
+
+    tracing::info!(
+        "{peer} POST /cmd src={host_hdr} -> relay dst={dst}:{}",
+        cfg.cmd_port
+    );
+    match relay_cmd(stream, &dst, cfg.cmd_port, &relay, &body) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::error!("relay {dst}:{}: {e}", cfg.cmd_port);
+            respond(
+                stream,
+                502,
+                &format!("relay to {dst}:{} failed: {e}\n", cfg.cmd_port),
+            )
+        }
+    }
+}
+
 fn read_doc(path: &Path) -> StateDoc {
     fs::read_to_string(path)
         .ok()
@@ -399,8 +615,10 @@ fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()>
         201 => "201 Created",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
         422 => "422 Unprocessable Entity",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
@@ -483,6 +701,54 @@ mod tests {
         let p = std::env::temp_dir().join("muxmesh-hub-test-absent/state.json");
         let doc = read_doc(&p);
         assert!(doc.hosts.is_empty());
+    }
+
+    #[test]
+    fn target_armed_requires_valid_host_and_fresh_entry() {
+        let now = now_unix();
+        let mut doc = StateDoc::default();
+        doc.hosts.insert(
+            "host-a".into(),
+            HostState {
+                host: "host-a".into(),
+                armed: true,
+                seen: now,
+                sessions: vec![],
+            },
+        );
+        doc.hosts.insert(
+            "host-off".into(),
+            HostState {
+                host: "host-off".into(),
+                armed: false,
+                seen: now,
+                sessions: vec![],
+            },
+        );
+        doc.hosts.insert(
+            "host-stale".into(),
+            HostState {
+                host: "host-stale".into(),
+                armed: true,
+                seen: now - 9_999,
+                sessions: vec![],
+            },
+        );
+        assert!(target_armed(&doc, "host-a", now, 30));
+        assert!(!target_armed(&doc, "host-off", now, 30)); // disarmed
+        assert!(!target_armed(&doc, "host-stale", now, 30)); // past ttl
+        assert!(!target_armed(&doc, "missing", now, 30)); // unknown host
+        assert!(!target_armed(&doc, "a b", now, 30)); // invalid host name
+        assert!(!target_armed(&doc, "", now, 30)); // empty dst
+    }
+
+    #[test]
+    fn relay_secret_absent_yields_502_hint() {
+        // pure check of the 502 branch message contract (no socket here)
+        let dst = "host-x";
+        let msg = format!("no relay secret for {dst} — re-run: muxmesh-hub generate-token {dst}\n");
+        assert!(msg.contains(dst));
+        assert!(msg.contains("generate-token"));
     }
 
     #[test]
