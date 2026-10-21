@@ -18,4 +18,7 @@ tmux set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:
 # bare name works once set-environment above has taken effect.
 CLI="$CURRENT_DIR/bin/muxmesh-cli"
 [ -x /usr/local/bin/muxmesh-cli ] && CLI=/usr/local/bin/muxmesh-cli
-tmux bind-key -n F10 run-shell "$CLI bar-toggle"
+# -v: every F10 press leaves a full trace (steps + STOP points) in
+# ~/.muxmesh/bar-toggle.log — the parent/child bar dance is invisible
+# otherwise. Line-buffered by tracing; file append, never truncate.
+tmux bind-key -n F10 run-shell "$CLI bar-toggle -v 2>>$HOME/.muxmesh/bar-toggle.log"
