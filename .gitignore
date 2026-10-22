@@ -11,3 +11,8 @@ state.json
 
 # Local config: we commit the template (config.toml.example), not the real copy
 config.toml
+
+# Binaires Linux pre-buildes : JAMAIS en git (13 MB de blobs).
+# Survivent sur le disque pour Dockerfile.e2e.overlay (conteneur opencode,
+# cleverrouille au build) ; git keep-ignore, .dockerignore ne les filtre pas.
+bin-linux/

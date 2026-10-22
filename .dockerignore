@@ -8,3 +8,6 @@ state.json
 token
 *.token
 config.toml
+# NOTE : bin-linux/ est volontairement ABSENT de ce fichier — le build
+# local du conteneur (overlay) en a besoin dans son contexte. Il nentre
+# jamais dans git (voir .gitignore).
