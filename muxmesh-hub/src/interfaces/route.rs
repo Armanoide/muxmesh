@@ -28,7 +28,7 @@ pub async fn get_state(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// POST /state: auth by TOKEN (the identity); the DECLARED host name is the
+/// POST /state (compat): auth by TOKEN (the identity); the DECLARED host name is the
 /// key state is recorded under, so renaming a machine = edit config.toml, no
 /// re-mint. Tokens are minted OFFLINE by `muxmesh-hub generate-token <host>`
 /// — there is NO registration endpoint: an unregistered token cannot introduce

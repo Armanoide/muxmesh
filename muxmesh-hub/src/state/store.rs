@@ -105,7 +105,7 @@ pub fn record_ack(path: &Path, host: &str, ack: &muxmesh_core::Ack) {
     if !raw.get("hosts").is_some_and(|h| h.is_object()) {
         raw["hosts"] = serde_json::json!({});
     }
-    // the ack may arrive BEFORE the agent's first POST /state (test flow and
+    // the ack may arrive BEFORE the agent's first state report (test flow and
     // cold start alike) — create the host entry rather than drop the ack.
     if !raw["hosts"].get(host).is_some_and(|h| h.is_object()) {
         raw["hosts"][host] = serde_json::json!({});

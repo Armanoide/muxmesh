@@ -1,15 +1,16 @@
 //! muxmesh-hub — state aggregator + command dispatcher (runs on the always-on
 //! pivot machine).
 //!
-//! One axum server on ONE port (tokio runtime). Agents POST /state (JSON
-//! HostState); the hub merges into state.json with ATOMIC writes (tmp +
-//! rename) so readers (tmux status bar, CLI) never see a half-written file.
+//! One axum server on ONE port (tokio runtime). Agents push their state as
+//! ReportState frames on their own WS; the hub merges into state.json with
+//! ATOMIC writes (tmp + rename) so readers (tmux status bar, CLI) never see
+//! a half-written file. POST /state stays as a compat endpoint (old agents).
 //!
 //! Commands flow driver -> HUB -> agent over the agent's OWN outbound WebSocket
 //! (/agent/ws): the hub NEVER dials an agent. Each agent holds a persistent WS
 //! session, authenticated at the handshake from headers BEFORE the upgrade
 //! (X-Muxmesh-Host + X-Muxmesh-Token = its own machine token — same registry
-//! and KDF as POST /state; 401 before any 101). A driver POSTs /cmd; the hub
+//! and KDF; 401 before any 101). A driver POSTs /cmd; the hub
 //! authenticates it, checks dst is registered + has a LIVE ws channel right
 //! now, enqueues the frame on that channel's mpsc sender and answers 202
 //! queued immediately. The agent executes tmux locally and replies with an ack
@@ -183,7 +184,7 @@ fn generate_token(cfg: &HubConfig, args: &[String]) -> ! {
     // the ONLY place raw tokens ever appear: stdout, once, for the operator.
     println!("{token}");
     eprintln!(
-        "muxmesh-hub: host '{host}' paired — machine token in {}. Paste it on the agent as ~/.config/muxmesh/token (0600). The agent uses it for POST /state and its /agent/ws handshake. Shown once.",
+        "muxmesh-hub: host '{host}' paired — machine token in {}. Paste it on the agent as ~/.config/muxmesh/token (0600). The agent uses it for its /agent/ws handshake. Shown once.",
         cfg.tokens_path.display()
     );
     process::exit(0)

@@ -131,7 +131,11 @@ impl Hub {
             .env("MUXMESH_POLL_HUB", "127.0.0.1:1")
             .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(if std::env::var_os("MM_KEEP_DIR").is_some() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .expect("spawn hub");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -237,11 +241,16 @@ impl Hub {
 
 impl Drop for Hub {
     fn drop(&mut self) {
+        // diagnostic tests keep the dir so state.json can be inspected on failure
+        if std::env::var_os("MM_KEEP_DIR").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        } else {
+            eprintln!("hub dir kept: {}", self.dir.display());
+        }
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -408,4 +417,41 @@ async fn quiet_channel_survives_past_old_timeout() {
         frame.contains("\"id\":\"c-quiet\""),
         "frame after silence: {frame}"
     );
+}
+
+/// WS state push: an agent sends `ReportState` on its own /agent/ws and the
+/// hub merges it into state.json (the path that replaces HTTP POST /state).
+/// Identity = the authenticated handshake host, not the payload.
+#[tokio::test]
+async fn hub_merges_ws_report_state() {
+    let mut hub = Hub::new();
+    let tok_dst = hub.mint("agent-a");
+    hub.spawn();
+
+    let mut agent = hub.ws_connect("agent-a", &tok_dst).await;
+    let frame = r#"{"v":1,"id":"s-1","src":"agent-a","dst":"hub","ts":1,"cmd":{"type":"ReportState","state":{"host":"agent-a","armed":true,"seen":1,"sessions":[{"name":"main","windows":2,"active_window":"0"}]}}}"#;
+    agent
+        .send(Message::Text(frame.into()))
+        .await
+        .expect("send ReportState");
+
+    // poll state.json until the merge lands (the merge is async on the hub).
+    let state_path = hub.dir.join("state.json");
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(&state_path) {
+            if raw.contains("\"agent-a\"") {
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let h = &v["hosts"]["agent-a"];
+                assert_eq!(h["armed"], serde_json::json!(true), "state: {raw}");
+                assert_eq!(h["sessions"][0]["name"], serde_json::json!("main"));
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "state.json never got agent-a"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

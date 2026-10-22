@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use muxmesh_core::Ack;
+use muxmesh_core::{Ack, HostState};
 
-use crate::state::{record_ack, record_agent_log, AppState, Sender};
+use crate::state::{merge_state, record_ack, record_agent_log, AppState, Sender};
 
 static WS_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -59,7 +59,23 @@ pub async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppSta
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<Ack>(&text) {
+                        // order matters: a ReportState frame also parses as an
+                        // Ack (serde ignores unknown fields), so check it FIRST.
+                        if let Some(st) = report_state(&text) {
+                            // agent -> hub state push (replaces HTTP POST /state).
+                            // Identity = the authenticated WS host, never the
+                            // payload's own host field.
+                            let _g = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+                            match merge_state(&state.state_path, &host, &st) {
+                                Ok(trace) => tracing::info!(
+                                    "/agent/ws host={host} state {trace}"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "/agent/ws host={host}: state merge: {e}"
+                                ),
+                            }
+                        } else {
+                            match serde_json::from_str::<Ack>(&text) {
                             Ok(ack) => {
                                 tracing::info!(
                                     "/agent/ws host={host} ack id={} ok={}{}",
@@ -78,6 +94,7 @@ pub async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppSta
                                 } else {
                                     tracing::debug!("/agent/ws host={host}: non-ack frame ignored");
                                 }
+                            }
                             }
                         }
                     }
@@ -115,4 +132,18 @@ pub async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppSta
         }
     }
     tracing::info!("/agent/ws host={host} disconnected (gen {gen})");
+}
+
+/// Parse an agent state-push frame `{"cmd":{"type":"ReportState","state":{..}}}`.
+/// None for acks/log frames. Cheap pre-check on the substring before the
+/// full parse — a state frame is identified by its verb, nothing else.
+fn report_state(text: &str) -> Option<HostState> {
+    if !text.contains("\"ReportState\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("cmd")?.get("type")?.as_str()? != "ReportState" {
+        return None;
+    }
+    serde_json::from_value(v.get("cmd")?.get("state")?.clone()).ok()
 }
