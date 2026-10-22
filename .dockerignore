@@ -8,3 +8,4 @@ state.json
 token
 *.token
 config.toml
+bin-linux/

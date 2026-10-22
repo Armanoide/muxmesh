@@ -264,6 +264,10 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 // child is live: hide local bar, then cut control (prefix None +
                 // key-table muxmesh-remote). F10 stays bound in that table, so the
                 // parent still intercepts press 2 (safety ring).
+                // shortcut: switchc only works with an ATTACHED client (headless =
+                // "no current client", verified 3.3a) — harmless: the key-table is
+                // cosmetic, prefix None is what actually delegates, and press 2 is
+                // detected by re-reading the prefix, not by table membership.
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
                 let cut =
                     muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "None"]);
