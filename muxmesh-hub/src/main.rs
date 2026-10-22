@@ -775,6 +775,7 @@ mod tests {
                 armed: true,
                 seen: 1_700_000_000,
                 sessions: vec![],
+                parents: vec![],
             },
         );
         write_atomic(&p, &doc).unwrap();
@@ -795,6 +796,7 @@ mod tests {
                 armed: true,
                 seen: now,
                 sessions: vec![],
+                parents: vec![],
             },
         );
         doc.hosts.insert(
@@ -804,6 +806,7 @@ mod tests {
                 armed: true,
                 seen: now - 9_999,
                 sessions: vec![],
+                parents: vec![],
             },
         );
         write_atomic(&p, &doc).unwrap();
@@ -832,6 +835,7 @@ mod tests {
                 armed: true,
                 seen: now_unix(),
                 sessions: vec![],
+                parents: vec![],
             },
         );
         write_atomic(&p, &doc).unwrap();
@@ -863,6 +867,7 @@ mod tests {
                 armed: true,
                 seen: 1,
                 sessions: vec![],
+                parents: vec![],
             },
         );
         write_atomic(&p, &doc).unwrap();
@@ -886,6 +891,7 @@ mod tests {
             armed: true,
             seen: now_unix(),
             sessions: vec![],
+            parents: vec![],
         };
         let _g = state.write_lock.lock();
         merge_state(&p, "host-a", &st).unwrap();

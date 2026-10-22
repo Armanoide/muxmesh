@@ -28,6 +28,10 @@ pub enum Command {
     BarHide,
     /// restore the status bar on the target: `set -g status on`.
     BarShow,
+    /// take back delegated control (press-2 answer from the child, routed by
+    /// the hub): restore the default prefix, rebind F10, show the bar. Sent
+    /// BY the child TO its parent after the child's F10 traversed ssh.
+    ParentReclaim,
 }
 
 /// Envelope of a command sent by a client.
@@ -117,13 +121,20 @@ impl Command {
             Command::NewSession { name } => vec![name],
             Command::FocusWindow { session, window } => vec![session, window],
             Command::AttachOrDetach { session } => vec![session],
-            Command::BarHide | Command::BarShow => vec![],
+            Command::BarHide | Command::BarShow | Command::ParentReclaim => vec![],
         }
     }
 
     /// Are all args of the command valid?
     pub fn args_valid(&self) -> bool {
         self.names().iter().all(|n| valid_name(n))
+    }
+
+    /// Extra argv for `bind-key -n F10 run-shell <cmd>` when re-binding F10
+    /// after a delegation. Only meaningful for ParentReclaim; the agent builds
+    /// it from its own binary path (it knows where muxmesh-cli lives).
+    pub fn is_parent_reclaim(&self) -> bool {
+        matches!(self, Command::ParentReclaim)
     }
 
     /// Full tmux argv for the closed list (never shell-interpolated).
@@ -154,6 +165,12 @@ impl Command {
             Command::BarShow => {
                 vec!["set".into(), "-g".into(), "status".into(), "on".into()]
             }
+            Command::ParentReclaim => {
+                // marker argv: the real work (bind F10, restore prefix, bar on)
+                // runs in execute() as separate tmux calls — tmux takes ONE
+                // command per invocation, a joined argv = "too many arguments".
+                vec![]
+            }
         }
     }
 
@@ -166,6 +183,7 @@ impl Command {
             Command::FocusWindow { session, window } => format!("{session}:{window}"),
             // global option, no -t target
             Command::BarHide | Command::BarShow => String::new(),
+            Command::ParentReclaim => String::new(),
         }
     }
 
@@ -187,6 +205,51 @@ impl Command {
             } else {
                 vec!["attach-session".into(), "-d".into(), "-t".into(), target]
             }
+        } else if self.is_parent_reclaim() {
+            // tmux takes ONE command per invocation — run the three steps as
+            // separate calls. Order = safety: rebind F10 FIRST (so the parent
+            // can always toggle again), then restore the prefix (the keyboard
+            // comes back), then the bar. Each step is audited; a failed prefix
+            // restore still leaves F10 working = recovery path.
+            let cli = if std::path::Path::new("/usr/local/bin/muxmesh-cli").is_file() {
+                "/usr/local/bin/muxmesh-cli".to_string()
+            } else if let Ok(dir) = std::env::var("MUXMESH_BIN_DIR") {
+                format!("{dir}/muxmesh-cli")
+            } else {
+                "muxmesh-cli".to_string()
+            };
+            let cmd = format!("{cli} bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1");
+            let steps: [(&str, Vec<&str>); 3] = [
+                ("bind-key", vec!["-n", "F10", "run-shell", &cmd]),
+                ("set-option", vec!["-gu", "prefix"]),
+                ("set-option", vec!["-g", "status", "on"]),
+            ];
+            let mut all_ok = true;
+            for (verb, args) in steps {
+                let out = Proc::new("tmux")
+                    .arg("-S")
+                    .arg(socket)
+                    .args(std::iter::once(verb).chain(args.iter().copied()))
+                    .output()
+                    .map_err(|e| format!("spawn tmux {verb}: {e}"))?;
+                eprintln!(
+                    "muxmesh-agent: exec ts={} verb={verb} target=F10/prefix/status ok={}",
+                    now_unix(),
+                    out.status.success()
+                );
+                if !out.status.success() {
+                    all_ok = false;
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if !err.is_empty() {
+                        eprintln!("muxmesh-agent: reclaim step {verb} stderr: {err}");
+                    }
+                }
+            }
+            return if all_ok {
+                Ok(())
+            } else {
+                Err("reclaim step failed (see audit)".into())
+            };
         } else {
             self.tmux_argv()
         };

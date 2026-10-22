@@ -211,6 +211,38 @@ pub fn window_ssh_host(base: &[String], wid: &str) -> Option<String> {
     None
 }
 
+/// Host keys of live `ssh` CLIENTS on this machine — i.e. machines we are
+/// currently dialing OUT to (we are their parent). Inside an inbound ssh there
+/// is no ssh client process here, so a pure target returns empty — its own
+/// parents come from `parents_of` (the hub directory), not from here.
+pub fn ssh_parent_hosts() -> Vec<String> {
+    let out = match Command::new("ps").args(["-eo", "args"]).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return vec![],
+    };
+    let mut hosts: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(ssh_target_of)
+        .map(|h| h.split_once('@').map(|(_, h)| h).unwrap_or(&h).to_string())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Parent hub keys that currently have a live ssh INTO `me`: scan every other
+/// host's reported outbound ssh targets (`parents`) for us. This is how the
+/// child finds whom to answer on press 2 — the parent's own registration says
+/// who it dialed, and we are the machine it dialed into. First match wins;
+/// multiple simultaneous inbound ssh sessions to one child are not supported.
+pub fn parents_of(doc: &StateDoc, me: &str) -> Vec<String> {
+    doc.hosts
+        .iter()
+        .filter(|(h, st)| *h != me && st.parents.iter().any(|t| t == me))
+        .map(|(h, _)| h.clone())
+        .collect()
+}
+
 /// Target host if the given pid's own command line is `ssh <host>`.
 fn ssh_host_of_pid(pid: u32) -> Option<String> {
     let cmd = Command::new("ps")

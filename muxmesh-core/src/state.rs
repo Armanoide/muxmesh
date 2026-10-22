@@ -31,6 +31,12 @@ pub struct HostState {
     pub armed: bool,
     /// unix timestamp (seconds) of emission by the agent
     pub seen: u64,
+    /// host keys that currently have a live `ssh` INTO this machine. The
+    /// child fills this from the hub directory (`parents_of`): every other
+    /// registered host whose live ssh targets include us. Empty = no known
+    /// parent (local-only machine, or ssh from an unregistered address).
+    #[serde(default)]
+    pub parents: Vec<String>,
     /// local tmux sessions (virtual tree). Empty if no tmux.
     #[serde(default)]
     pub sessions: Vec<RemoteSession>,
@@ -85,6 +91,7 @@ mod tests {
             armed,
             seen,
             sessions: vec![],
+            parents: vec![],
         }
     }
 

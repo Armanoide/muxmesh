@@ -133,6 +133,7 @@ fn build_state(host: &str, socket: &str) -> HostState {
         armed,
         seen: now_unix(),
         sessions,
+        parents: muxmesh_core::poll::ssh_parent_hosts(),
     }
 }
 
