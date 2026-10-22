@@ -85,7 +85,7 @@ pub async fn ws_channel(
 }
 
 /// Dial the hub's /agent/ws with X-Muxmesh-Host + X-Muxmesh-Token (own
-/// machine token — the same identity as POST /state, zero relay tokens).
+/// machine token — the same identity that signs commands and state reports).
 #[allow(clippy::result_large_err)] // tungstenite::Error is theirs, not ours to box
 async fn connect_with_auth(
     url: &str,

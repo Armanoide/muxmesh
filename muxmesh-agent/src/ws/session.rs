@@ -3,13 +3,14 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use muxmesh_core::{Ack, CommandEnvelope};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::tmux::{resolve_socket, tmux_prefix_and_status, tmux_sessions};
+use crate::tmux::{build_state, resolve_socket, tmux_prefix_and_status, tmux_sessions};
 use crate::ws::{Ws, MAX_MISSED_PONGS, PING_INTERVAL};
 
 /// Read pushed frames until the socket dies: reader (dispatch+ack), writer
@@ -46,23 +47,54 @@ pub async fn ws_session(
     // writer task: the ONLY owner of the sink. Central-log lines from the
     // tracing layer arrive on `log_rx` and are forwarded as {"log":...} frames;
     // the hub appends them to its hub.log (one file for the whole fleet).
+    // The heartbeat lives here too: every cfg.interval, a ReportState frame
+    // carries the local tmux state to the hub (replaces HTTP POST /state) —
+    // one channel, one clock. Quiet at INFO unless armed/sessions CHANGES.
     // shortcut: lines emitted while the WS is DOWN are lost (stderr keeps
     // them) — add replay-on-reconnect if the hub must hold full history.
     let tx2 = tx.clone();
+    let cfg_w = cfg.clone();
     let writer = async move {
+        let mut beat = tokio::time::interval(Duration::from_secs(cfg_w.interval.max(1)));
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = (false, usize::MAX);
         loop {
             tokio::select! {
                 biased;
+                // acks queued by the reader go out first: a command answer is
+                // more urgent than a log line or the next state photo.
+                Some(msg) = rx.recv() => {
+                    if sink.send(msg).await.is_err() {
+                        return; // socket error -> session over
+                    }
+                }
                 Ok(line) = log_rx.recv() => {
                     let frame = format!("{{\"log\":{}}}", serde_json::json!(line));
                     if tx2.send(Message::Text(frame.into())).is_err() {
                         return;
                     }
                 }
-                Some(msg) = rx.recv() => {
-                    if sink.send(msg).await.is_err() {
-                        return; // socket error -> session over
+                _ = beat.tick() => {
+                    let state = build_state(&cfg_w.host, &resolve_socket(&cfg_w));
+                    let frame = serde_json::json!({
+                        "v": 1,
+                        "id": format!("s-{}", muxmesh_core::now_unix()),
+                        "src": cfg_w.host,
+                        "dst": "hub",
+                        "ts": muxmesh_core::now_unix(),
+                        "cmd": { "type": "ReportState", "state": state },
+                    });
+                    if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
+                        return; // socket error -> session over; reconnect resyncs
                     }
+                    if (state.armed, state.sessions.len()) != last {
+                        tracing::info!(
+                            "armed={} sessions={} push=ok (ws)",
+                            state.armed,
+                            state.sessions.len()
+                        );
+                    }
+                    last = (state.armed, state.sessions.len());
                 }
             }
         }
@@ -146,6 +178,12 @@ pub fn dispatch_command(
             env.id,
             env.dst
         );
+        return None;
+    }
+    // ReportState is agent->hub only: a hub that pushes one back (bug or
+    // malice) is ignored — never executed, never acked.
+    if env.cmd.is_report_state() {
+        tracing::warn!("ws: ignoring inbound ReportState id={} (agent->hub only)", env.id);
         return None;
     }
     tracing::info!("ws: command id={} src={} cmd={:?}", env.id, env.src, env.cmd);

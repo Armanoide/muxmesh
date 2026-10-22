@@ -1,28 +1,28 @@
 //! muxmesh-agent — daemon on a remote machine (tokio + tokio-tungstenite).
 //!
-//! Reads its LOCAL tmux (unix socket, free) and POSTs the state to the hub
-//! (ureq — short outbound HTTP, blocking is fine). No ssh, no forwarded SSH
-//! agent consulted -> no credential-manager popups.
+//! Reads its LOCAL tmux (unix socket, free) and pushes the state on its OWN
+//! OUTBOUND WebSocket every interval as a ReportState frame. No HTTP, no ssh,
+//! no forwarded SSH agent consulted -> no credential-manager popups.
 //!
-//! Commands arrive on the agent's OWN OUTBOUND WebSocket (/agent/ws): the
-//! agent dials the hub at startup and holds the channel open forever
-//! (reconnect loop, exponential backoff 1s->30s, reset on success). The hub
-//! NEVER dials the agent — the agent serves NOTHING inbound. A pushed
-//! CommandEnvelope (dst == own host) executes on the live tmux socket and the
-//! agent replies with an ack frame {v,id,ok,err}.
+//! Commands arrive on the same WS (/agent/ws): the agent dials the hub at
+//! startup and holds the channel open forever (reconnect loop, exponential
+//! backoff 1s->30s, reset on success). The hub NEVER dials the agent — the
+//! agent serves NOTHING inbound. A pushed CommandEnvelope (dst == own host)
+//! executes on the live tmux socket and the agent replies with an ack frame
+//! {v,id,ok,err}.
 //!
 //! Keepalive: the agent sends a WS ping every 30 s; tungstenite answers the
 //! hub's pings automatically (never reply manually). Two consecutive sent
 //! pings without a pong -> drop the connection -> reconnect loop.
 //!
-//! Cadence: heartbeat every 15 s by default (MUXMESH_INTERVAL). tmux alive -> armed:true.
-//! tmux absent -> armed:false (the hub disarms at TTL).
+//! Cadence: ReportState every 15 s by default (MUXMESH_INTERVAL), on the WS.
+//! tmux alive -> armed:true. tmux absent -> armed:false (the hub disarms at TTL).
 //!
 //! Layout (lm-sanaga conventions):
 //!   tmux.rs     local tmux scan + socket resolution (the only tmux spawns)
 //!   ws.rs       outbound channel: dial, hold, reconnect forever
 //!   session.rs  one live session: reader/writer/pinger/watchdog + dispatch
-//!   main.rs     bootstrap: config, log channel, heartbeat thread, WS loop
+//!   main.rs     bootstrap: config, log channel, WS loop
 
 mod tmux;
 #[path = "ws.rs"]
@@ -30,11 +30,7 @@ mod ws;
 
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
-use muxmesh_core::HostState;
-
-use crate::tmux::build_state;
 use crate::ws::session::WsLogLayer;
 
 fn main() {
@@ -47,17 +43,21 @@ fn main() {
     let (log_tx, log_rx) = tokio::sync::broadcast::channel::<String>(512);
     muxmesh_core::log::init_with_extra(Box::new(WsLogLayer(log_tx)));
     let cfg = muxmesh_core::AgentConfig::load();
-    let url = cfg.url();
 
     // The machine token is minted OFFLINE on the hub (`muxmesh-hub
     // generate-token <host>`) and pasted here as ~/.config/muxmesh/token.
-    // It signs BOTH POST /state and the /agent/ws handshake. The file is
-    // re-read per push/per reconnect, so pasting (or rotating) it takes
+    // It signs the /agent/ws handshake (state and commands share the channel).
+    // The file is re-read per reconnect, so pasting (or rotating) it takes
     // effect without restarting the agent. Absent => 401s, with a hint.
     if muxmesh_core::read_token().as_str().is_empty() {
         tracing::warn!("no token (~/.config/muxmesh/token) -> the hub will reject (401). Mint one: muxmesh-hub generate-token {}", cfg.host);
     }
-    tracing::info!("host={} -> {url} (interval {}s)", cfg.host, cfg.interval);
+    tracing::info!(
+        "host={} -> {} (interval {}s)",
+        cfg.host,
+        cfg.ws_url(),
+        cfg.interval
+    );
 
     // Embedded badge poller: the agent's own machine gets @muxmesh-status
     // badges automatically. It targets the agent's own push target
@@ -70,77 +70,19 @@ fn main() {
         thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
     }
 
-    // heartbeat: debug per cycle (quiet at default INFO); WARN on push failure;
-    // INFO only when armed/sessions state CHANGES — a running agent must not
-    // spam the pane it lives in. Blocking ureq+tmux -> dedicated std::thread
-    // (same pattern as the poller), off the tokio runtime.
+    // heartbeat: state pushed on the WS every interval (see session.rs —
+    // same armed/sessions log rules: quiet at INFO unless state CHANGES).
     let ws = ws::ws_channel(Arc::new(cfg.clone()), log_rx);
-    {
-        let cfg = cfg.clone();
-        thread::spawn(move || {
-            let mut last = (false, usize::MAX);
-            loop {
-                let token = muxmesh_core::read_token();
-                let state = build_state(&cfg.host, &tmux::resolve_socket(&cfg));
-                let ok = push(&cfg.url(), &cfg.host, token.as_str(), &state);
-                tracing::debug!(
-                    "armed={} sessions={} push={}",
-                    state.armed,
-                    state.sessions.len(),
-                    if ok { "ok" } else { "FAIL" }
-                );
-                if !ok {
-                    tracing::warn!(
-                        "armed={} sessions={} push=FAIL",
-                        state.armed,
-                        state.sessions.len()
-                    );
-                } else if (state.armed, state.sessions.len()) != last {
-                    tracing::info!(
-                        "armed={} sessions={} push=ok",
-                        state.armed,
-                        state.sessions.len()
-                    );
-                }
-                last = (state.armed, state.sessions.len());
-                thread::sleep(Duration::from_secs(cfg.interval));
-            }
-        });
-    }
 
-    // tokio runtime for the WS channel only (the threads above stay std).
+    // tokio runtime for the WS channel only (the poller thread stays std).
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(ws); // the WS channel reconnects forever; main just keeps it alive
-}
-
-/// POST the state to the hub. Returns true on HTTP 2xx.
-fn push(url: &str, host: &str, token: &str, state: &HostState) -> bool {
-    let body = match serde_json::to_vec(state) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("serialize state: {e}");
-            return false;
-        }
-    };
-    match ureq::post(url)
-        .set("X-Muxmesh-Host", host)
-        .set("X-Muxmesh-Token", token)
-        .send_bytes(&body)
-    {
-        Ok(resp) => {
-            tracing::debug!("POST {url} -> {}", resp.status());
-            resp.status() < 300
-        }
-        Err(e) => {
-            tracing::warn!("POST {url} -> error {e}");
-            false
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::build_state;
 
     #[test]
     fn build_state_has_host_and_seen() {
@@ -190,6 +132,15 @@ mod tests {
         let ack: muxmesh_core::Ack =
             serde_json::from_str(&ws::session::dispatch_command(&c, "me", mine).unwrap()).unwrap();
         assert_eq!(ack.id, "c-3");
+    }
+
+    #[test]
+    fn dispatch_ignores_report_state_a_hub_might_push() {
+        // ReportState is agent->hub only; if a (malicious or buggy) hub pushed
+        // one back, the agent must not execute it nor ack it.
+        let c = cfg();
+        let rs = r#"{"v":1,"id":"s-1","src":"hub","dst":"me","ts":1,"cmd":{"type":"ReportState","state":{"host":"me","armed":false,"seen":1}}}"#;
+        assert_eq!(ws::session::dispatch_command(&c, "me", rs), None);
     }
 
     #[test]
