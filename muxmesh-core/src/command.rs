@@ -219,9 +219,10 @@ impl Command {
                 "muxmesh-cli".to_string()
             };
             let cmd = format!("{cli} bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1");
-            let steps: [(&str, Vec<&str>); 3] = [
+            let steps: [(&str, Vec<&str>); 4] = [
                 ("bind-key", vec!["-n", "F10", "run-shell", &cmd]),
                 ("set-option", vec!["-gu", "prefix"]),
+                ("switch-client", vec!["-T", "root"]),
                 ("set-option", vec!["-g", "status", "on"]),
             ];
             let mut all_ok = true;

@@ -11,15 +11,15 @@ CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PATH: the tmux server's run-shell does not read shell rc files; its PATH is
 # frozen at server start, so /usr/local/bin (where `just install` puts the
 # binaries) may be missing -> F10 127. Inject it explicitly, here and now.
-tmux set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:$PATH"
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-environment -g PATH "$CURRENT_DIR/bin:/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:$PATH"
 
 # Declare the user options the poller writes. tmux rejects set of an
 # unknown @-option ("invalid option"), so window-scope defaults must exist
 # before the first badge update. The bar's hidden state is NOT stored here:
 # tmux itself answers `show-options -g status` (verified 3.3a) — no flag to
 # maintain, no scope footgun.
-tmux set-window-option -gq @muxmesh-armed-win 0
-tmux set-window-option -gq @muxmesh-status ""
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-window-option -gq @muxmesh-armed-win 0
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-window-option -gq @muxmesh-status ""
 
 # F10: one-bar toggle against the armed remote host (Rust decides everything).
 # Absolute path first (PATH is frozen at server start -> 127 otherwise); the
@@ -31,9 +31,9 @@ CLI="$CURRENT_DIR/bin/muxmesh-cli"
 # otherwise. Line-buffered by tracing; file append, never truncate.
 # mkdir -p first: a missing ~/.muxmesh makes the shell's stderr redirect fail
 # *before* exec -> F10 dies silently with exit 1 (observed on the driver).
-# stdout redirected too: tmux run-shell shows non-zero-exit output as
+# stdout redirected too: tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} run-shell shows non-zero-exit output as
 # "#[cell]..." noise on the status line; keep tmux's view clean.
-tmux run-shell "mkdir -p $HOME/.muxmesh"
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} run-shell "mkdir -p $HOME/.muxmesh"
 
 # TRACE (diagnostic double-fire MacBook): `prefix2` is unused, so we borrow it
 # as a keystroke probe. prefix2 C-b means: first C-b lands in table prefix2,
@@ -42,10 +42,10 @@ tmux run-shell "mkdir -p $HOME/.muxmesh"
 #   - 2 KEY lines for 2 physical F10 = terminal is innocent, logic bug here
 #   - 4 KEY lines = the MacBook terminal sends F10 twice (ESC O P + ESC [21~)
 # shortcut: diagnostic only — remove once the double-fire is settled.
-tmux bind-key -T prefix2 -n F10 "\
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T prefix2 -n F10 "\
   run-shell 'printf \"KEY %s F10\\n\" \"\$(date +%H:%M:%S)\" >> \$HOME/.muxmesh/keys.log'; \
   switch-client -T root"
-tmux set-option -g prefix2 C-b
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-option -g prefix2 C-b
 
 # F10 here is the LOCAL/parent binding. In delegated mode bar-toggle UNBINDS
 # it and cuts the prefix to None (tmux-remote's exact mechanism): the parent
@@ -54,7 +54,10 @@ tmux set-option -g prefix2 C-b
 # restores the prefix and shows the bar again. The parent's keyboard is never
 # the recovery path, so a deaf parent can never strand the user.
 CMD="$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1"
-tmux bind-key -T root -n F10 run-shell "$CMD"
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T root -n F10 run-shell "$CMD"
+# table off: tmux auto-creates it on bind; bar-toggle switch-client -T off
+# puts the client to sleep there, where F10 still wakes it (local reclaim).
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T off -n F10 run-shell "$CMD"
 # NOTE: tmux's own bind-key takes ONE argument for the command — do NOT write
 # `bind-key run-shell "..."` unquoted, word splitting makes run-shell see
 # several arguments ("too many arguments") -> tpm exits 1 (observed tmux 3.3a).
