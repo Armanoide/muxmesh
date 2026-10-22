@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 muxmesh-core = { workspace = true }
 serde_json = { workspace = true }
 ureq = "2"

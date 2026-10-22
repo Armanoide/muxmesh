@@ -143,7 +143,11 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
     let _args = muxmesh_core::log::parse_verbose_flag(&args);
-    muxmesh_core::log::init();
+    // Central-log channel: every agent log line goes to stderr AND, when the
+    // WS is up, to the hub's hub.log (one file for the whole fleet).
+    // broadcast so each reconnected WS session gets its own receiver.
+    let (log_tx, log_rx) = tokio::sync::broadcast::channel::<String>(512);
+    muxmesh_core::log::init_with_extra(Box::new(WsLogLayer(log_tx)));
     let cfg = muxmesh_core::AgentConfig::load();
     let url = cfg.url();
 
@@ -172,7 +176,7 @@ async fn main() {
     // INFO only when armed/sessions state CHANGES — a running agent must not
     // spam the pane it lives in. Blocking ureq+tmux -> dedicated std::thread
     // (same pattern as the poller), off the tokio runtime.
-    let ws = ws_channel(Arc::new(cfg.clone()));
+    let ws = ws_channel(Arc::new(cfg.clone()), log_rx);
     {
         let cfg = cfg.clone();
         thread::spawn(move || {
@@ -215,7 +219,10 @@ async fn main() {
 /// (never the token).
 /// shortcut: no jitter on the backoff — fine at homelab scale, add jitter if
 /// many agents ever hammer a restarting hub.
-async fn ws_channel(cfg: Arc<muxmesh_core::AgentConfig>) {
+async fn ws_channel(
+    cfg: Arc<muxmesh_core::AgentConfig>,
+    mut log_rx: tokio::sync::broadcast::Receiver<String>,
+) {
     let url = {
         // core's ws_url() is the legacy /ws path; the axum hub serves both,
         // canonical /agent/ws wins.
@@ -236,7 +243,7 @@ async fn ws_channel(cfg: Arc<muxmesh_core::AgentConfig>) {
         match connect_with_auth(&url, &cfg.host, &token).await {
             Ok((ws, resp)) => {
                 tracing::info!("ws: connected to {url} (status {})", resp.status());
-                ws_session(&cfg, ws).await;
+                ws_session(&cfg, ws, &mut log_rx).await;
                 tracing::warn!("ws: channel closed -> reconnecting");
                 backoff = Duration::from_secs(1); // success resets the ramp
             }
@@ -306,10 +313,13 @@ async fn connect_with_auth(
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn ws_session(cfg: &muxmesh_core::AgentConfig, ws: Ws) {
-    let (mut sink, mut stream) = ws.split();
-    // liveness counters are SESSION-local: statics shared across reconnects
-    // would corrupt the missed-pong accounting between sessions.
+async fn ws_session(
+    cfg: &muxmesh_core::AgentConfig,
+    ws: Ws,
+    log: &mut tokio::sync::broadcast::Receiver<String>,
+) {
+    let (mut sink, mut stream) = ws.split(); // liveness counters are SESSION-local: statics shared across reconnects
+                                             // would corrupt the missed-pong accounting between sessions.
     let last_ping_seq = Arc::new(AtomicU64::new(0)); // last ping WE sent
     let alive_seq = Arc::new(AtomicU64::new(0)); // last ping the hub answered
                                                  // outbound frames (acks + keepalive pings) go through one channel so a
@@ -331,11 +341,28 @@ async fn ws_session(cfg: &muxmesh_core::AgentConfig, ws: Ws) {
         }
     };
 
-    // writer task: the ONLY owner of the sink.
-    let writer = async {
-        while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                return; // socket error -> session over
+    // writer task: the ONLY owner of the sink. Central-log lines from the
+    // tracing layer arrive on `log` and are forwarded as {"log":...} frames;
+    // the hub appends them to its hub.log (one file for the whole fleet).
+    // shortcut: lines emitted while the WS is DOWN are lost (stderr keeps
+    // them) — add replay-on-reconnect if the hub must hold full history.
+    let tx2 = tx.clone();
+    let mut log_rx = log.resubscribe();
+    let writer = async move {
+        loop {
+            tokio::select! {
+                biased;
+                Ok(line) = log_rx.recv() => {
+                    let frame = format!("{{\"log\":{}}}", serde_json::json!(line));
+                    if tx2.send(Message::Text(frame.into())).is_err() {
+                        return;
+                    }
+                }
+                Some(msg) = rx.recv() => {
+                    if sink.send(msg).await.is_err() {
+                        return; // socket error -> session over
+                    }
+                }
             }
         }
     };
@@ -393,6 +420,42 @@ async fn ws_session(cfg: &muxmesh_core::AgentConfig, ws: Ws) {
         _ = pinger => {}
         _ = writer => {}
         _ = watchdog => {}
+    }
+}
+
+/// tracing layer: every log event becomes {"log":"<formatted line>"} on the
+/// agent's outbound WS channel (the hub appends it to central hub.log).
+/// Non-blocking: a full/closed channel drops the line (stderr still has it).
+struct WsLogLayer(tokio::sync::broadcast::Sender<String>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WsLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct C(Option<String>);
+        impl tracing::field::Visit for C {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                if f.name() == "message" {
+                    self.0 = Some(v.to_string());
+                }
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if self.0.is_none() && f.name() == "message" {
+                    self.0 = Some(format!("{v:?}"));
+                }
+            }
+        }
+        let mut c = C(None);
+        event.record(&mut c);
+        if let Some(msg) = c.0 {
+            let level = event.metadata().level();
+            let line = format!("{level} {msg}");
+            // best effort: no receiver up (WS down) = Err, stderr remains the
+            // durable record. Never block a log call on the network.
+            let _ = self.0.send(line);
+        }
     }
 }
 

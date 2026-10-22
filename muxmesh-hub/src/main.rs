@@ -65,6 +65,9 @@ const MAX_CMD_BODY: usize = 1_048_576;
 struct AppState {
     tokens: Mutex<TokenStore>,
     state_path: PathBuf,
+    /// central log: every agent's WS-emitted log line lands here, one file
+    /// for the whole mesh (see record_agent_log).
+    log_path: PathBuf,
     write_lock: Mutex<()>,
     channels: Mutex<HashMap<String, Sender>>,
 }
@@ -175,11 +178,24 @@ fn main() {
     }
 }
 
+/// Central mesh log: derived from state.json's directory (state.json and its
+/// parent dir are operator-configured, so the log travels with them). The
+/// hub appends every agent's WS-emitted log line here, one file for the
+/// whole fleet: `tail -f ~/.muxmesh/hub.log` on the pivot shows machine_a,
+/// machine_b and the hub itself, interleaved and timestamped.
+fn log_path_for(state_path: &std::path::Path) -> std::path::PathBuf {
+    state_path
+        .parent()
+        .map(|d| d.join("hub.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("hub.log"))
+}
+
 /// Build the router and serve until the listener dies.
 async fn run(cfg: HubConfig, store: TokenStore) -> std::io::Result<()> {
     let state = Arc::new(AppState {
         tokens: Mutex::new(store),
         state_path: cfg.state_path.clone(),
+        log_path: log_path_for(&cfg.state_path),
         write_lock: Mutex::new(()),
         channels: Mutex::new(HashMap::new()),
     });
@@ -575,7 +591,16 @@ async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppState>)
                                 );
                                 record_ack(&state, &host, &ack);
                             }
-                            Err(e) => tracing::warn!("/agent/ws host={host}: bad ack frame: {e}"),
+                            // NOT an ack: a forwarded log line from the agent's
+                            // tracing layer ({"log":...}). Append verbatim to the
+                            // central hub.log — one file, every machine.
+                            Err(_) => {
+                                if let Some(line) = agent_log_line(&text) {
+                                    record_agent_log(&state, &host, &line);
+                                } else {
+                                    tracing::debug!("/agent/ws host={host}: non-ack frame ignored");
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Pong(_))) => missed = 0,
@@ -612,6 +637,37 @@ async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppState>)
         }
     }
     tracing::info!("/agent/ws host={host} disconnected (gen {gen})");
+}
+
+/// Extract a forwarded log line from an agent WS frame: {"log":"<text>"}.
+/// Anything else is None (the frame stays ignored, as before).
+fn agent_log_line(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get("log")?.as_str().map(|s| s.to_string())
+}
+
+/// Append one agent log line to the central hub.log: ts + host + level tag
+/// kept as-is from the agent's own formatting. Best effort, never fails the
+/// WS session. shortcut: append per line — batch if log volume ever matters.
+fn record_agent_log(state: &AppState, host: &str, line: &str) {
+    let _g = state.write_lock.lock();
+    use std::io::Write;
+    if let Some(dir) = state.log_path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&state.log_path)
+    {
+        Ok(mut f) => {
+            let ts = now_unix();
+            if writeln!(f, "{ts} {host} {line}").is_err() {
+                tracing::debug!("hub.log write: io error");
+            }
+        }
+        Err(e) => tracing::warn!("hub.log open {}: {e}", state.log_path.display()),
+    }
 }
 
 /// Mirror an agent ack into state.json's last_cmd (best effort — the driver
@@ -842,6 +898,7 @@ mod tests {
         let state = AppState {
             tokens: Mutex::new(TokenStore::default()),
             state_path: p.clone(),
+            log_path: log_path_for(&p),
             write_lock: Mutex::new(()),
             channels: Mutex::new(HashMap::new()),
         };
@@ -882,6 +939,7 @@ mod tests {
         let state = AppState {
             tokens: Mutex::new(TokenStore::default()),
             state_path: p.clone(),
+            log_path: log_path_for(&p),
             write_lock: Mutex::new(()),
             channels: Mutex::new(HashMap::new()),
         };
