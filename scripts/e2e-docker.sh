@@ -53,6 +53,16 @@ docker run --rm --entrypoint muxmesh-hub -v "$VOL":/data \
 TOK_MINI=$(cat /tmp/mm-tok-mini); TOK_MBP=$(cat /tmp/mm-tok-mbp)
 echo "  minted tokens for mac_mini + macbook (volume, before server start)"
 
+# SSH keypair so macbook can open a REAL `ssh mac_mini` (no simulation). Generated
+# on the host into /tmp, copied into the shared volume; mm-mini authorizes it.
+rm -f /tmp/mm-id_e2e /tmp/mm-id_e2e.pub
+ssh-keygen -t ed25519 -N '' -f /tmp/mm-id_e2e -C muxmesh-e2e >/dev/null
+docker run --rm -v "$VOL":/data -v /tmp/mm-id_e2e.pub:/key.pub:ro alpine \
+  sh -c 'cp /key.pub /data/id_e2e.pub' >/dev/null 2>&1 || \
+docker run --rm -v "$VOL":/data debian:bookworm-slim \
+  sh -c 'cp /key.pub /data/id_e2e.pub' >/dev/null
+echo "  ssh keypair generated (macbook -> mac_mini, passwordless)"
+
 log "hub (loads the pre-minted tokens.json at startup)"
 docker run -d --name "$HUB" --network "$NET" -v "$VOL":/data \
   -e MUXMESH_BIND=0.0.0.0:9997 \
@@ -67,11 +77,11 @@ for i in $(seq 1 50); do
   sleep 0.2
 done
 
-log "agents (each = its own tmux server)"
-docker run -d --name "$MINI" --network "$NET" \
+log "agents (each = its own tmux server; mac_mini also runs sshd)"
+docker run -d --name "$MINI" --network "$NET" -v "$VOL":/data \
   -e MUXMESH_HOST=mac_mini -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_MINI" -e MUXMESH_SOCKET="$SOCK_MINI" -e RUST_LOG=debug \
-  "$IMAGE" sh -c "tmux -S $SOCK_MINI new-session -d -s main; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_MINI' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; muxmesh-agent" >/dev/null
+  "$IMAGE" sh -c "/opt/muxmesh/sshd-setup.sh sh -c 'tmux -S $SOCK_MINI new-session -d -s main; mkdir -p ~/.config/muxmesh; printf %s \"$TOK_MINI\" > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent'" >/dev/null
 
 docker run -d --name "$MBP" --network "$NET" \
   -e MUXMESH_HOST=macbook -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
@@ -86,15 +96,25 @@ for i in $(seq 1 60); do
 done
 echo "  state: $(docker exec "$HUB" cat /data/state.json)"
 
-log "arm the macbook window toward mac_mini (fake ssh) + run poller once"
-# detached so the fake ssh stays alive across docker exec calls (a plain
-# exec exits with the pane and tmux kills it).
-docker exec -d "$MBP" tmux -S "$SOCK_MBP" new-window -t main: "bash /opt/muxmesh/arm-ssh.sh mac_mini"
-sleep 1
-# the embedded poller runs every 2s; force one pass against the live hub so
-# @muxmesh-armed-win is set on the fake-ssh window before we press.
-docker exec "$MBP" sh -c "MUXMESH_SOCKET=$SOCK_MBP MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli poll --once" 2>&1 | tail -2 || true
-sleep 1
+log "arm the macbook window toward mac_mini (REAL ssh)"
+# copy the private key into macbook, then open a genuine `ssh mac_mini` in a
+# tmux window. The sshd on mac_mini accepts it (authorized key), so the pane
+# holds a real `ssh mac_mini` process — exactly what the poller detects. No
+# simulation, no argv hacks.
+docker cp /tmp/mm-id_e2e "$MBP":/root/.ssh/id_e2e >/dev/null
+docker exec "$MBP" sh -c 'chmod 600 /root/.ssh/id_e2e'
+# ssh with a pty (-t) so the session persists; BatchMode avoids any prompt.
+docker exec "$MBP" tmux -S "$SOCK_MBP" new-window -t main: \
+  "ssh -t -i /root/.ssh/id_e2e -o BatchMode=yes -o StrictHostKeyChecking=no mac_mini 'sleep 3600'"
+# wait for the poller (every 2s) to arm @muxmesh-armed-win toward mac_mini.
+ARMED=""
+for i in $(seq 1 30); do
+  ARMED=$(docker exec "$MBP" tmux -S "$SOCK_MBP" list-windows -a -F '#{window_id} #{@muxmesh-armed-win}' | awk '$2!=""{print $1; exit}')
+  [ -n "$ARMED" ] && break
+  sleep 0.5
+done
+echo "  armed window: ${ARMED:-NONE}"
+docker exec "$MBP" ps -eo pid,ppid,args | grep '[s]sh mac_mini' || echo "  WARN: no live ssh mac_mini"
 
 log "PRE: both bars visible (status on)"
 assert_eq "$(docker exec "$MINI" tmux -S "$SOCK_MINI" show-options -g status | awk '{print $2}')" "on" "mac_mini bar visible before test"

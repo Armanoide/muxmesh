@@ -13,14 +13,15 @@ RUN cargo build --release --workspace
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux procps openssh-client ca-certificates \
+    tmux procps openssh-client openssh-server ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/muxmesh
 COPY --from=build /src/target/release/muxmesh-hub /usr/local/bin/
 COPY --from=build /src/target/release/muxmesh-agent /usr/local/bin/
 COPY --from=build /src/target/release/muxmesh-cli /usr/local/bin/
-# tpm-style plugin entry + a fake-ssh helper used to arm a window in E2E.
+# tpm-style plugin entry + sshd bootstrap so mac_mini accepts a REAL ssh from
+# macbook (no simulated ssh process — the poller sees a genuine `ssh mac_mini`).
 COPY muxmesh.tmux /opt/muxmesh/muxmesh.tmux
-COPY scripts/e2e-arm-ssh.sh /opt/muxmesh/arm-ssh.sh
+COPY scripts/e2e-sshd.sh /opt/muxmesh/sshd-setup.sh
 RUN chmod +x /opt/muxmesh/*.sh /usr/local/bin/muxmesh-*
 ENTRYPOINT []
