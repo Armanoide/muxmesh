@@ -12,26 +12,26 @@ pub fn run_why(cfg: &HubConfig) -> u8 {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
-    let base = muxmesh_core::poll::tmux_base(&socket);
+    let base = muxmesh_core::tmux::tmux_base(&socket);
 
     println!("muxmesh-cli why — hub = {}", cfg.poll_hub);
 
     // 1. current window
-    let wid = match muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"]) {
+    let wid = match muxmesh_core::tmux::tmux_out(&base, &["display", "-p", "#{window_id}"]) {
         Some(w) => w.trim().to_string(),
         None => {
             println!("X no tmux server / no current window (run inside tmux)");
             return 1;
         }
     };
-    let wname = muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_name}"])
+    let wname = muxmesh_core::tmux::tmux_out(&base, &["display", "-p", "#{window_name}"])
         .unwrap_or_default()
         .trim()
         .to_string();
     println!("* window {wid} \"{wname}\"");
 
     // 2. panes + process trees
-    let pids = muxmesh_core::poll::pane_pids(&base, &wid).unwrap_or_default();
+    let pids = muxmesh_core::tmux::pane_pids(&base, &wid).unwrap_or_default();
     if pids.is_empty() {
         println!("X no panes found for this window");
     }
@@ -39,7 +39,7 @@ pub fn run_why(cfg: &HubConfig) -> u8 {
     for pid in &pids {
         println!("  pane pid {pid}:");
         print_tree(*pid, "    ");
-        if let Some(h) = muxmesh_core::poll::pane_ssh_host(*pid) {
+        if let Some(h) = muxmesh_core::tmux::pane_ssh_host(*pid) {
             println!("    -> live ssh client, target = {h}");
             ssh_targets.push(h);
         }

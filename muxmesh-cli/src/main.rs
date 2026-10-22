@@ -13,7 +13,10 @@
 //!
 //! std + muxmesh-core only -> offline build.
 
+mod bar;
 mod send;
+mod tmux_state;
+mod transport;
 mod why;
 
 use std::process;
@@ -34,7 +37,7 @@ fn main() {
         "tree" => tree(&cfg, args.iter().any(|a| a == "--local")),
         "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
-        "bar-toggle" => std::process::exit(send::run_bar_toggle(&cfg) as i32),
+        "bar-toggle" => std::process::exit(bar::run(&cfg) as i32),
         "why" => std::process::exit(why::run_why(&cfg) as i32),
         other => {
             let _ = other;

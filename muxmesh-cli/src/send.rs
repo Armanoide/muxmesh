@@ -1,29 +1,17 @@
-//! Send closed-list commands to a remote agent VIA THE HUB (`POST /cmd`).
+//! Closed-list command parsing + `muxmesh-cli send <host> <verb>` entry.
 //!
-//!   muxmesh-cli send <host> <command> [args...]
-//!     send host-a NewWindow main
-//!     send host-a NewSession build
-//!     send host-a FocusWindow main 2
-//!     send host-a AttachOrDetach main
-//!
-//! Operator rule: the hub NEVER dials an agent. Each agent holds a persistent
-//! OUTBOUND WebSocket (/ws) to the hub; the CLI POSTs /cmd to the hub
-//! (poll.hub), the envelope carries `dst: <host>`; the hub authenticates the
-//! driver, checks dst is registered + WS-connected right now (else 409),
-//! enqueues the frame on that agent's channel and answers 202 queued. The
-//! driver authenticates with its own token (~/.config/muxmesh/token,
-//! MUXMESH_CMD_TOKEN overrides). std::net only.
-
-use std::io::{Read, Write};
-use std::net::TcpStream;
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! The wire lives in transport.rs, the F10 state machine in bar.rs, tmux
+//! reads in tmux_state.rs. This file owns only: CLI words -> Command, and the
+//! plain `send` subcommand (driver -> hub -> agent).
 
 use muxmesh_core::{Command, CommandEnvelope};
 
+use crate::transport;
+
 /// Build a Command from CLI words. Returns None on unknown verb / arity.
 pub fn parse_command(words: &[String]) -> Option<Command> {
-    match words.first().map(|s| s.as_str())? {
+    let verb = words.first()?.as_str();
+    match verb {
         "NewWindow" => Some(Command::NewWindow {
             session: words.get(1)?.clone(),
         }),
@@ -39,460 +27,7 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
         }),
         "BarHide" => Some(Command::BarHide),
         "BarShow" => Some(Command::BarShow),
-        // child -> parent answer on press 2; not meant for manual `send` but
-        // valid there too (drives the same reclaim).
-        "ParentReclaim" => Some(Command::ParentReclaim),
         _ => None,
-    }
-}
-
-/// POST /cmd to host:port (the hub; it queues on the target's WS channel).
-/// Returns the raw response body. HTTP/1.1 + Connection: close; std only.
-pub fn send_cmd(
-    host: &str,
-    port: u16,
-    token: &str,
-    env: &CommandEnvelope,
-) -> Result<String, String> {
-    let addr = format!("{host}:{port}");
-    let body = serde_json::to_vec(env).map_err(|e| e.to_string())?;
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("{addr}: {e}"))?;
-    // headers flushed first, body in its own segment (harmless with axum, kept).
-    let req = format!(
-        "POST /cmd HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-Muxmesh-Host: {}\r\nX-Muxmesh-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        env.src,
-        body.len()
-    );
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
-    // body in its own segment, after the header segment was flushed (see above)
-    stream.write_all(&body).map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
-    // EAGAIN-safe read: this environment has surfaced spurious WouldBlock on
-    // blocking sockets; retry on Interrupted/WouldBlock-with-data instead of
-    // aborting the whole send on the first hiccup.
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(String::from_utf8_lossy(&raw).into_owned())
-}
-
-fn now_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// `muxmesh-cli armed-host` — print the remote host of the CURRENT tmux
-/// window if a live `ssh <host>` sits in it AND <host> is armed+fresh on the
-/// hub. Exit 1 otherwise. This is what F8/F9 call to pick the send target.
-pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
-    match armed_host_of_current_window(cfg) {
-        Some(h) => {
-            println!("{h}");
-            0
-        }
-        None => 1,
-    }
-}
-
-/// The armed remote host of the current window, if any. Detection is live
-/// (pgrep walk + hub state), NOT the @muxmesh-armed-win badge option — the
-/// badge is display-only; the decision always re-runs in Rust.
-fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String> {
-    let socket = std::env::var("MUXMESH_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let base = muxmesh_core::poll::tmux_base(&socket);
-    let wid = muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
-    let wid = wid.trim().to_string();
-    let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
-
-    // LIVE scan first: pane pids -> ssh target. This is the precise answer
-    // and it also yields the host name needed for BarShow/BarHide routing.
-    if let Some(h) = muxmesh_core::poll::window_ssh_host(&base, &wid) {
-        tracing::debug!("armed-host: live ssh target in window {wid} = '{h}'");
-        if !muxmesh_core::valid_host(&h) {
-            tracing::debug!("window {wid}: ssh target '{h}' rejected by valid_host");
-            return None;
-        }
-        if doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
-            tracing::debug!("armed-host: '{h}' armed+fresh on hub -> ARMED");
-            return Some(h);
-        }
-        let known: Vec<&String> = doc.hosts.keys().collect();
-        tracing::debug!(
-            "ssh target '{h}' not armed on hub (known hosts: {known:?}; hub={})",
-            cfg.poll_hub
-        );
-        return None;
-    }
-
-    // Badge fallback: the embedded poller armed this window by pane scan every
-    // interval and wrote @muxmesh-armed-win=1 + '@muxmesh-status  REMOTE <host> '.
-    // If OUR live scan missed the ssh (deep process tree: zsh -> node -> ssh
-    // exceeds the depth cap; observed prod MacBook: press 1 fell to local
-    // toggle, never delegated -> 'control never returns'), trust the badge and
-    // recover the host name from @muxmesh-status so BarShow still routes.
-    let badge = muxmesh_core::poll::tmux_out(
-        &base,
-        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-armed-win"],
-    )
-    .map(|o| o.trim() == "1")
-    .unwrap_or(false);
-    if !badge {
-        tracing::debug!("window {wid}: no live ssh and badge not armed -> None");
-        return None;
-    }
-    let status = muxmesh_core::poll::tmux_out(
-        &base,
-        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-status"],
-    )
-    .unwrap_or_default();
-    // '@muxmesh-status' format is exactly " REMOTE <host> " (poll.rs).
-    let host = status
-        .trim()
-        .strip_prefix("REMOTE ")
-        .map(|r| r.trim().to_string())
-        .filter(|h| muxmesh_core::valid_host(h))
-        .unwrap_or_default();
-    if host.is_empty() {
-        tracing::warn!(
-            "window {wid}: badge armed but @muxmesh-status '{status}' has no host -> None"
-        );
-        return None;
-    }
-    if !doc.host_armed(&host, muxmesh_core::now_unix(), cfg.ttl) {
-        tracing::debug!("badge host '{host}' not armed+fresh on hub -> None");
-        return None;
-    }
-    tracing::info!(
-        "window {wid}: live scan missed ssh, badge says armed -> trusting '{host}' (deep process tree)"
-    );
-    Some(host)
-}
-
-/// The exact run-shell command F10 must carry, for re-binding it after a
-/// delegation (press 2 / rollback). Same shape as muxmesh.tmux's bind: the
-/// log redirect keeps tmux's status line clean and leaves a full trace.
-fn f10_cmd() -> String {
-    let cli = if std::path::Path::new("/usr/local/bin/muxmesh-cli").is_file() {
-        "/usr/local/bin/muxmesh-cli".to_string()
-    } else if let Ok(dir) = std::env::var("MUXMESH_BIN_DIR") {
-        format!("{dir}/muxmesh-cli")
-    } else {
-        "muxmesh-cli".to_string()
-    };
-    format!("{cli} bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1")
-}
-
-/// `muxmesh-cli bar-toggle` — the whole F10 logic, no if-shell in tmux.
-/// Finds the armed host of the current window (live detection), reads the
-/// bar's hidden state from tmux itself (`show-options -g status` — tmux is
-/// the source of truth, no local flag), and POSTs BarHide or BarShow.
-pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
-    let socket = std::env::var("MUXMESH_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let base = muxmesh_core::poll::tmux_base(&socket);
-    // TRACE: millisecond timestamp + PID of every invocation, so the log shows
-    // if ONE physical F10 fires bar-toggle TWICE (double-fire MacBook).
-    let t0 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    tracing::info!(
-        "bar-toggle: START ts={t0} pid={} (hub={}, socket={:?})",
-        std::process::id(),
-        cfg.poll_hub,
-        socket
-    );
-    let wid = match muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"]) {
-        Some(o) => o.trim().to_string(),
-        None => {
-            tracing::error!("bar-toggle: STOP at step 1 — no tmux server / no current window");
-            return 1;
-        }
-    };
-
-    // hidden-state of THIS server's bar: tmux itself knows. `status` is a
-    // server-global option; after `set -g status off`, show-options answers
-    // "status off" (verified on tmux 3.3a). No local flag to maintain — the
-    // old @muxmesh-bar-hidden window option was fragile (scope) and redundant.
-    let hidden_now = muxmesh_core::poll::tmux_out(&base, &["show-options", "-g", "status"])
-        .map(|o| o.trim().ends_with("off"))
-        .unwrap_or(false);
-    tracing::debug!("bar-toggle: step 1 ok — window {wid}, bar-hidden={hidden_now}");
-
-    // Delegated state of the PARENT (only meaningful when a host is armed):
-    // `prefix None` = control delegated to the child (press 1 cut it, tmux-
-    // remote's mechanism); anything else (C-b, C-a…) = parent holds control.
-    // A CHILD server may legitimately run prefix None in its own config, so
-    // this is never consulted on the child branch (host=None). Exact match so
-    // a custom prefix is never mistaken for delegated (ECC P2). 3.3a verified.
-    let delegated = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-        .map(|o| o.trim() == "None")
-        .unwrap_or(false);
-
-    let host = armed_host_of_current_window(cfg);
-    tracing::info!(
-        "bar-toggle: step 2 — armed host = {:?}, delegated={delegated}",
-        host
-    );
-
-    // Parent/child roles are decided by the KEYSTROKE's server, not by us:
-    // - F10 lands on the driver's server while an armed ssh has focus ->
-    //   this server is the PARENT: press 1 DELEGATES (BarShow remote, hide
-    //   local bar, prefix None + unbind F10 — tmux-remote's exact mechanism).
-    //   While delegated the parent is DEAF to F10: press 2 traverses ssh and
-    //   fires on the CHILD (local branch below), which answers BarHide over
-    //   the hub WS; the parent's poller applies it and reclaims control.
-    // - F10 pressed inside the nested remote tmux traverses ssh and lands
-    //   on the CHILD's server, where armed_host_of_current_window finds no
-    //   outbound ssh -> local branch below (child-only toggle / press 2).
-    match host {
-        // PARENT side: driver presses F10 with an armed ssh pane focused.
-        Some(h) => {
-            // commands flow driver -> HUB -> agent's WS (never direct to the
-            // host): POST to poll.hub, dst in the envelope, hub queues + pushes.
-            let (hub_host, hub_port) = split_host_port(&cfg.poll_hub);
-            let port: u16 = std::env::var("MUXMESH_CMD_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(hub_port);
-            let token = std::env::var("MUXMESH_CMD_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
-            let post = |verb: Command, label: &str| -> bool {
-                let env = CommandEnvelope {
-                    v: 1,
-                    id: format!("c-{}", now_ts()),
-                    src: driver_host(),
-                    dst: h.clone(),
-                    cmd: verb,
-                    ts: now_ts(),
-                };
-                match send_cmd(hub_host, port, &token, &env) {
-                    Ok(resp) if resp.starts_with("HTTP/1.1 202") => {
-                        tracing::info!("bar-toggle: hub {hub_host}:{port} queued {label} for {h} (pushed on its /ws channel)");
-                        true
-                    }
-                    other => {
-                        tracing::error!(
-                            "bar-toggle: STOP at step 5 — hub {hub_host}:{port} {label} for {h}: {:?}",
-                            other.map(|r| r.lines().next().unwrap_or("").to_string())
-                        );
-                        false
-                    }
-                }
-            };
-
-            if !delegated {
-                // press 1: delegate control to the child. GUARD — never hand over
-                // the keyboard blindly: only cut the prefix if BarShow is ACKed by
-                // the hub (child reachable). If the child is down we keep control.
-                let ok = post(Command::BarShow, "BarShow");
-                if !ok {
-                    tracing::error!("bar-toggle: STOP — child unreachable, NOT delegating (parent keeps prefix+bar)");
-                    println!("muxmesh: remote {h} unreachable — control NOT delegated (parent keeps the keyboard)");
-                    return 1;
-                }
-                // child is live: hide local bar, then hand the keyboard over —
-                // samoshkin's canonical OFF mode (tmux-remote/tmux-nested use
-                // it too): prefix None + switch-client -T off. The parent goes
-                // deaf to EVERYTHING except F10, which stays bound in table
-                // `off` (muxmesh.tmux). Press 2 traverses ssh into the CHILD's
-                // tmux (local branch), and whichever path fires — the child's
-                // ParentReclaim over the hub or the parent's own off-table
-                // binding — restores prefix + table root + bar. No unbind:
-                // unbinding F10 killed the parent's recovery path and stranded
-                // control at the child (MacBook symptom, fixed here).
-                muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
-                // switch-client is per-CLIENT state: headless servers (E2E, no
-                // attached client) answer "no current client" — prefix None
-                // still delegates the keyboard there, so failure is a warning.
-                let deaf =
-                    muxmesh_core::poll::tmux_run(&base, &["switch-client", "-T", "off"]);
-                // TRACE: confirm in the log that deafness was applied (the
-                // client's key table is per-client state, read it back).
-                let table = muxmesh_core::poll::tmux_out(
-                    &base,
-                    &["display-message", "-p", "#{client_key_table}"],
-                )
-                .map(|o| o.trim().to_string())
-                .unwrap_or_default();
-                tracing::info!(
-                    "bar-toggle: DEAFNESS applied — switch-client ok={deaf} client_key_table='{table}' ts={t0}"
-                );
-                let cut =
-                    muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "None"]);
-                // ECC P0: never claim DELEGATED without re-reading tmux — a
-                // silently failed prefix cut would leave control undelegated.
-                let now = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-                    .map(|o| o.trim() == "None")
-                    .unwrap_or(false);
-                if !cut || !now {
-                    // rollback: the keyboard never left the parent's hands.
-                    muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
-                    muxmesh_core::poll::run_tmux(
-                        &base,
-                        &["bind-key", "-n", "F10", "run-shell", &f10_cmd()],
-                    );
-                    muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
-                    tracing::error!(
-                        "bar-toggle: prefix move FAILED — rolled back, parent keeps control"
-                    );
-                    println!("muxmesh: delegation FAILED (prefix cut refused) — parent keeps the keyboard");
-                    return 1;
-                }
-                println!("muxmesh: control DELEGATED to {h} — press F10 again (child) to reclaim");
-                0
-            } else {
-                // press 2 arriving HERE while delegated: F10 fired on the
-                // PARENT — either via its off-table binding (the canonical
-                // samoshkin return path: client table is `off`, F10 bound in
-                // `off`), or a stray press while the table was still root.
-                // Either way this IS the user asking for control back, so the
-                // parent reclaims NOW, locally, no network round-trip: prefix
-                // restored + table back to root (F10 off-table goes dormant by
-                // itself) + bar on. Then tell the child to hide its bar via
-                // the hub (best-effort: if the hub is down the child's bar
-                // stays, but the parent's keyboard is back = never stranded).
-                muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
-                muxmesh_core::poll::run_tmux(&base, &["switch-client", "-T", "root"]);
-                muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
-                // l'enfant doit éteindre sa barre (one-bar) : BarHide vers lui via hub.
-                post(Command::BarHide, "BarHide");
-                // ECC P0 : vérifier que le parent est bien réveillé (re-read tmux).
-                let prefix_back =
-                    muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-                        .map(|o| o.trim() != "None")
-                        .unwrap_or(false);
-                let f10_back = muxmesh_core::poll::tmux_out(&base, &["list-keys", "-T", "root"])
-                    .map(|k| k.contains("F10"))
-                    .unwrap_or(false);
-                tracing::info!(
-                    "bar-toggle: PARENT self-reclaim on press2 — prefix_back={prefix_back} f10_back={f10_back} ts={t0}"
-                );
-                println!("muxmesh: control RECLAIMED (F10 revif sur le parent)");
-                0
-            }
-        }
-        // CHILD side (or no armed ssh): toggle THIS server's bar locally. Two
-        // real paths:
-        // 1. F10 pressed inside the nested remote tmux (user not delegating);
-        // 2. PRESS 2 while DELEGATED (tmux-remote's mechanism): the parent cut
-        //    its prefix and unbound F10, so the keystroke traverses ssh and
-        //    fires HERE. We hide our bar AND answer BarHide back to the parent
-        //    over the hub (/cmd, dst = the host that armed an ssh into us,
-        //    from the hub's directory). The parent's agent applies it: prefix
-        //    restored + F10 rebound + bar on -> control reclaimed without any
-        //    keystroke reaching the deaf parent.
-        None => {
-            // Pas d'armed ssh sur CETTE fenetre. Deux sous-cas :
-            // (a) cette machine EST déléguée (prefix=None posé par un presse1
-            //     précédent ici) -> le presse2 arrive sur le parent lui-même.
-            //     Le parent SE RÉVEILLE : restore prefix + table root + bar on,
-            //     et dit à l'enfant de cacher sa barre via le hub. C'est le
-            //     reclaim local qui remplace l'ancien "ignored" (bug MacBook :
-            //     F10 ne répondait plus au presse2 sur le parent).
-            // (b) machine normale non déléguée -> simple toggle local de la barre.
-            if delegated {
-                muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
-                muxmesh_core::poll::run_tmux(&base, &["switch-client", "-T", "root"]);
-                muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
-                // l'enfant doit éteindre sa barre (one-bar) : BarHide via hub,
-                // best-effort. On ne connait plus l'armed host (fenetre sans ssh),
-                // donc on laisse answer_parent_bar_hide trouver le parent par le hub.
-                if !cfg.poll_hub.is_empty() {
-                    answer_parent_bar_hide(cfg);
-                }
-                let prefix_back =
-                    muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-                        .map(|o| o.trim() != "None")
-                        .unwrap_or(false);
-                let f10_back = muxmesh_core::poll::tmux_out(&base, &["list-keys", "-T", "root"])
-                    .map(|k| k.contains("F10"))
-                    .unwrap_or(false);
-                tracing::info!(
-                    "bar-toggle: PARENT self-reclaim (no armed ssh, delegated=true) — prefix_back={prefix_back} f10_back={f10_back} ts={t0}"
-                );
-                println!("muxmesh: control RECLAIMED (F10 revif sur le parent)");
-                return 0;
-            }
-            let next = if hidden_now { "on" } else { "off" };
-            tracing::info!(
-                "bar-toggle: CHILD/local branch ts={t0} — no armed ssh here, toggling THIS server's bar -> status {next}"
-            );
-            // tmux redraws the bar by itself after set status — no refresh-client.
-            muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", next]);
-            if next == "off" && !cfg.poll_hub.is_empty() {
-                answer_parent_bar_hide(cfg);
-            }
-            println!("muxmesh: local bar {next}");
-            0
-        }
-    }
-}
-
-/// Answer a press-2 back to the parent: find who armed an ssh INTO us (the
-/// hub's directory knows every host's live ssh clients) and POST BarHide to
-/// them via the hub. Best-effort: if no parent is found or the hub is down,
-/// F10 on the parent still self-heals via press-2 reclaim — never block the
-/// local bar toggle on the network.
-fn answer_parent_bar_hide(cfg: &muxmesh_core::HubConfig) {
-    let me = driver_host();
-    let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
-    let parent = match muxmesh_core::poll::parents_of(&doc, &me).into_iter().next() {
-        Some(p) => p,
-        None => {
-            tracing::info!(
-                "child: no host has a live ssh into '{me}' — local-only toggle, nothing to answer"
-            );
-            return;
-        }
-    };
-    let (hub_host, hub_port) = split_host_port(&cfg.poll_hub);
-    let port: u16 = std::env::var("MUXMESH_CMD_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(hub_port);
-    let token = std::env::var("MUXMESH_CMD_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
-    let env = CommandEnvelope {
-        v: 1,
-        id: format!("c-{}", now_ts()),
-        src: me.clone(),
-        dst: parent.clone(),
-        cmd: Command::ParentReclaim,
-        ts: now_ts(),
-    };
-    match send_cmd(hub_host, port, &token, &env) {
-        Ok(resp) if resp.starts_with("HTTP/1.1 202") => {
-            tracing::info!(
-                "child: answered press-2 -> ParentReclaim queued for parent '{parent}' via hub"
-            );
-        }
-        other => {
-            tracing::warn!(
-                "child: answer to hub failed: {:?}",
-                other.map(|r| r.lines().next().unwrap_or("").to_string())
-            );
-        }
     }
 }
 
@@ -523,25 +58,16 @@ pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     }
 
     // driver -> hub -> agent: POST to poll.hub, dst in the envelope.
-    let (hub_host, hub_port) = split_host_port(&cfg.poll_hub);
-    let port: u16 = std::env::var("MUXMESH_CMD_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(hub_port);
-    let token = std::env::var("MUXMESH_CMD_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| muxmesh_core::read_token().as_str().to_string());
-
+    let (hub_host, hub_port) = transport::hub_endpoint(cfg);
     let env = CommandEnvelope {
         v: 1,
-        id: format!("c-{}", now_ts()),
-        src: driver_host(),
+        id: format!("c-{}", transport::now_ts()),
+        src: transport::driver_host(),
         dst: host.clone(),
         cmd,
-        ts: now_ts(),
+        ts: transport::now_ts(),
     };
-    match send_cmd(hub_host, port, &token, &env) {
+    match transport::send_cmd(&hub_host, hub_port, &transport::cmd_token(), &env) {
         Ok(resp) => {
             println!("{resp}");
             if resp.starts_with("HTTP/1.1 202") {
@@ -552,60 +78,23 @@ pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
             }
         }
         Err(e) => {
-            eprintln!("muxmesh-cli send: hub {hub_host}:{port}: {e}");
+            eprintln!("muxmesh-cli send: hub {hub_host}:{hub_port}: {e}");
             1
         }
     }
 }
 
-/// Split "host:port" / "[v6]:port" into (host, port-or-default-9997).
-fn split_host_port(addr: &str) -> (&str, u16) {
-    let a = addr.trim();
-    if let Some(rest) = a.strip_prefix('[') {
-        if let Some((h, tail)) = rest.split_once(']') {
-            let p = tail
-                .strip_prefix(':')
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(9997);
-            return (h, p);
+/// `muxmesh-cli armed-host` — print the armed remote host of the current
+/// window if a live `ssh <host>` sits in it AND <host> is armed+fresh on the
+/// hub. Exit 1 otherwise. This is what F8/F9 call to pick the send target.
+pub fn run_armed_host(cfg: &muxmesh_core::HubConfig) -> u8 {
+    match crate::tmux_state::armed_host_of_current_window(cfg) {
+        Some(h) => {
+            println!("{h}");
+            0
         }
-        return (a, 9997);
+        None => 1,
     }
-    match a.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => (h, p.parse().unwrap_or(9997)),
-        _ => (a, 9997),
-    }
-}
-
-/// Identity for the hub: MUST equal the agent's canonical host name (the key
-/// in tokens.json and the X-Muxmesh-Host the agent sends). `hostname -s` is
-/// NOT that — macOS mDNS advertises "MacBook-Pro-de-Norbert.local", so -s
-/// yields a name the hub never registered -> 401 on every POST /cmd.
-/// Same resolution order as AgentConfig::host: env > config.toml agent.host
-/// (load_map flattens [agent] to "agent.host") > hostname -s fallback.
-fn driver_host() -> String {
-    if let Ok(h) = std::env::var("MUXMESH_HOST") {
-        let h = h.trim().to_string();
-        if !h.is_empty() {
-            return h;
-        }
-    }
-    let map = muxmesh_core::load_map();
-    let h = map.get("agent.host").cloned().unwrap_or_default();
-    if !h.is_empty() {
-        return h;
-    }
-    hostname_short()
-}
-
-fn hostname_short() -> String {
-    std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "client".into())
 }
 
 #[cfg(test)]
@@ -672,9 +161,9 @@ mod tests {
 
     #[test]
     fn split_host_port_handles_v4_v6_bare() {
-        assert_eq!(split_host_port("10.0.10.3:9997"), ("10.0.10.3", 9997));
-        assert_eq!(split_host_port("10.0.10.3"), ("10.0.10.3", 9997));
-        assert_eq!(split_host_port("[::1]:9998"), ("::1", 9998));
-        assert_eq!(split_host_port("[::1]"), ("::1", 9997));
+        assert_eq!(transport::split_host_port("10.0.10.3:9997"), ("10.0.10.3", 9997));
+        assert_eq!(transport::split_host_port("10.0.10.3"), ("10.0.10.3", 9997));
+        assert_eq!(transport::split_host_port("[::1]:9998"), ("::1", 9998));
+        assert_eq!(transport::split_host_port("[::1]"), ("::1", 9997));
     }
 }
