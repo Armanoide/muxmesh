@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use muxmesh_core::HostState;
 
-use crate::ws::session::WsLogLayer;
 use crate::tmux::build_state;
+use crate::ws::session::WsLogLayer;
 
 fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default. Token = separate file.
@@ -44,7 +44,6 @@ fn main() {
     let _args = muxmesh_core::log::parse_verbose_flag(&args);
     // Central-log channel: every agent log line goes to stderr AND, when the
     // WS is up, to the hub's hub.log (one file for the whole fleet).
-    // broadcast so each reconnected WS session gets its own receiver.
     let (log_tx, log_rx) = tokio::sync::broadcast::channel::<String>(512);
     muxmesh_core::log::init_with_extra(Box::new(WsLogLayer(log_tx)));
     let cfg = muxmesh_core::AgentConfig::load();
