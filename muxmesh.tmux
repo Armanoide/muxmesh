@@ -35,13 +35,12 @@ CLI="$CURRENT_DIR/bin/muxmesh-cli"
 # "#[cell]..." noise on the status line; keep tmux's view clean.
 tmux run-shell "mkdir -p $HOME/.muxmesh"
 
-# F10 is the parent's safety ring: it MUST stay reachable even when control is
-# delegated to the child. tmux resolves a keystroke on the server BEFORE it
-# reaches the pane/ssh, so F10 (no-prefix binding) always belongs to the parent.
-# Delegation = MOVE the prefix to M-a, never `None`: with prefix None the parent
-# is deaf to every key (F10 included) and press 2 never comes back (observed on
-# the real MacBook). With M-a: F10 still fires here, C-b falls through to the
-# child's own tmux, and M-a remains the parent's emergency prefix.
+# F10 here is the LOCAL/parent binding. In delegated mode bar-toggle UNBINDS
+# it and cuts the prefix to None (tmux-remote's exact mechanism): the parent
+# goes fully deaf, press 2 traverses ssh into the child's tmux, and the child
+# answers ParentReclaim over the hub — the parent's agent rebinds this F10,
+# restores the prefix and shows the bar again. The parent's keyboard is never
+# the recovery path, so a deaf parent can never strand the user.
 CMD="$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1"
 tmux bind-key -T root -n F10 run-shell "$CMD"
 # NOTE: tmux's own bind-key takes ONE argument for the command — do NOT write
