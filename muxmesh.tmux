@@ -41,10 +41,14 @@ tmux run-shell "mkdir -p $HOME/.muxmesh"
 # always intercepts it. Phase 2 delegates control by moving the parent into a
 # custom table (muxmesh-remote) with prefix None; F10 stays bound there so
 # press 2 always returns control (restore prefix + bar), even if the child died.
-BIND="run-shell \"$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1\""
-tmux bind-key -T root -n F10 $BIND
+# NOTE: tmux's own bind-key takes ONE argument for the command — do NOT write
+# `bind-key run-shell "..."` unquoted, word splitting makes run-shell see
+# several arguments ("too many arguments") -> tpm exits 1 (observed tmux 3.3a).
+CMD="$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1"
+tmux bind-key -T root -n F10 run-shell "$CMD"
 # Custom table for delegated mode. Created implicitly by bind-key -T (tmux 3.3a
 # has no new-key-table). Same F10 action as root: the bar-toggle binary reads
 # `prefix` to know it is in REMOTE state and restores instead of delegating.
-tmux bind-key -T muxmesh-remote -n F10 $BIND
+tmux bind-key -T muxmesh-remote -n F10 run-shell "$CMD"
+exit 0
 
