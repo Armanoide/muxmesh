@@ -75,7 +75,7 @@ docker run --rm -v "$VOL":/data -v /tmp/mm-id_e2e.pub:/key.pub:ro "$IMAGE" \
 echo "  ssh keypair generated ($HOST_A -> $HOST_B, passwordless)"
 
 log "machine_c = hub (loads the pre-minted tokens.json at startup)"
-docker run -d --name "$HUB" --network "$NET" -v "$VOL":/data \
+docker run -d --name "$HUB" --network "$NET" --network-alias "$HOST_C" -v "$VOL":/data \
   -e MUXMESH_BIND=0.0.0.0:9997 \
   -e MUXMESH_STATE=/data/state.json \
   -e MUXMESH_TOKENS=/data/tokens.json \
@@ -90,13 +90,13 @@ done
 
 log "agents (each = its own tmux server; $HOST_B also runs sshd)"
 # machine_b: target. starts sshd (authorizes machine_a key) then the agent.
-docker run -d --name "$B" --network "$NET" -v "$VOL":/data \
+docker run -d --name "$B" --network "$NET" --network-alias "$HOST_B" -v "$VOL":/data \
   -e MUXMESH_HOST="$HOST_B" -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_B" -e MUXMESH_SOCKET="$SOCK_B" -e RUST_LOG=debug \
   "$IMAGE" sh -c "/opt/muxmesh/sshd-setup.sh sh -c 'tmux -S $SOCK_B new-session -d -s main; mkdir -p ~/.config/muxmesh; printf %s \"$TOK_B\" > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent'" >/dev/null
 
 # machine_a: driver. plain agent + tmux; opens the ssh toward machine_b later.
-docker run -d --name "$A" --network "$NET" \
+docker run -d --name "$A" --network "$NET" --network-alias "$HOST_A" \
   -e MUXMESH_HOST="$HOST_A" -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_A" -e MUXMESH_SOCKET="$SOCK_A" -e RUST_LOG=debug \
   "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent" >/dev/null
@@ -113,6 +113,7 @@ log "arm machine_a window toward $HOST_B (REAL ssh)"
 # copy the private key into machine_a, then open a genuine `ssh machine_b` in a
 # tmux window. sshd on machine_b accepts it (authorized key), so the pane holds
 # a real `ssh machine_b` process — exactly what the poller detects.
+docker exec "$A" sh -c 'mkdir -p /root/.ssh && chmod 700 /root/.ssh'
 docker cp /tmp/mm-id_e2e "$A":/root/.ssh/id_e2e >/dev/null
 docker exec "$A" sh -c 'chmod 600 /root/.ssh/id_e2e'
 docker exec "$A" tmux -S "$SOCK_A" new-window -t main: \
