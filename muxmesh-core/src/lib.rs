@@ -4,10 +4,12 @@
 pub mod command;
 pub mod config;
 pub mod error;
+pub mod http;
 pub mod identity;
 pub mod log;
 pub mod poll;
 pub mod state;
+pub mod tmux;
 
 pub use command::{valid_host, valid_name, Ack, Command, CommandEnvelope};
 pub use config::{
