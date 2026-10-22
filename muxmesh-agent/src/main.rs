@@ -17,128 +17,27 @@
 //!
 //! Cadence: heartbeat every 15 s by default (MUXMESH_INTERVAL). tmux alive -> armed:true.
 //! tmux absent -> armed:false (the hub disarms at TTL).
+//!
+//! Layout (lm-sanaga conventions):
+//!   tmux.rs     local tmux scan + socket resolution (the only tmux spawns)
+//!   ws.rs       outbound channel: dial, hold, reconnect forever
+//!   session.rs  one live session: reader/writer/pinger/watchdog + dispatch
+//!   main.rs     bootstrap: config, log channel, heartbeat thread, WS loop
 
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+mod tmux;
+#[path = "ws.rs"]
+mod ws;
+
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use muxmesh_core::{now_unix, Ack, CommandEnvelope, HostState, RemoteSession};
-use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message;
+use muxmesh_core::HostState;
 
-/// Keepalive cadence: one WS ping per 30 s.
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+use crate::ws::session::WsLogLayer;
+use crate::tmux::build_state;
 
-/// Drop the connection after this many consecutive unanswered sent pings.
-const MAX_MISSED_PONGS: u64 = 2;
-
-/// Live local tmux? sessions + active window per session.
-/// Returns (armed, sessions). `socket` is the agent's configured tmux socket
-/// ("" = tmux default); when set it is passed as -S so the agent scans its
-/// own server, not /tmp/tmux-<uid>/default. Without this the agent on a custom
-/// socket never sees its tmux and posts armed=false forever.
-fn scan_tmux(socket: &str) -> (bool, Vec<RemoteSession>) {
-    // tmux ls -> "sess: 3 windows (created ...)" per line, error if no server
-    let mut cmd = Command::new("tmux");
-    if !socket.is_empty() {
-        cmd.arg("-S").arg(socket);
-    }
-    let out = match cmd
-        .args(["list-sessions", "-F", "#{session_name}\t#{session_windows}"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return (false, Vec::new()),
-    };
-    let text = String::from_utf8_lossy(&out);
-    let mut sessions = Vec::new();
-    for line in text.lines() {
-        let mut it = line.split('\t');
-        let name = it.next().unwrap_or("").to_string();
-        let windows: u32 = it.next().and_then(|w| w.parse().ok()).unwrap_or(0);
-        if name.is_empty() {
-            continue;
-        }
-        let active = active_window(socket, &name);
-        sessions.push(RemoteSession {
-            name,
-            windows,
-            active_window: active,
-        });
-    }
-    (true, sessions)
-}
-
-/// name of the active window of a local tmux session.
-fn active_window(socket: &str, session: &str) -> String {
-    let mut cmd = Command::new("tmux");
-    if !socket.is_empty() {
-        cmd.arg("-S").arg(socket);
-    }
-    let out = cmd
-        .args([
-            "list-windows",
-            "-t",
-            session,
-            "-F",
-            "#{?window_active,#{window_name},}",
-        ])
-        .output()
-        .ok();
-    match out {
-        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    }
-}
-
-/// POST the state to the hub. Returns true on HTTP 2xx.
-fn push(url: &str, host: &str, token: &str, state: &HostState) -> bool {
-    let body = match serde_json::to_vec(state) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("serialize state: {e}");
-            return false;
-        }
-    };
-    match ureq::post(url)
-        .set("X-Muxmesh-Host", host)
-        .set("X-Muxmesh-Token", token)
-        .send_bytes(&body)
-    {
-        Ok(resp) => {
-            tracing::debug!("POST {url} -> {}", resp.status());
-            resp.status() < 300
-        }
-        Err(e) => {
-            tracing::warn!("POST {url} -> error {e}");
-            false
-        }
-    }
-}
-
-/// The payload is built with muxmesh-core (state.rs) -> same contract as the hub.
-fn build_state(host: &str, socket: &str) -> HostState {
-    let (armed, sessions) = scan_tmux(socket);
-    HostState {
-        host: host.to_string(),
-        armed,
-        seen: now_unix(),
-        sessions,
-        parents: muxmesh_core::poll::ssh_parent_hosts(),
-    }
-}
-
-#[tokio::main]
-async fn main() {
+fn main() {
     // Config: env > ~/.config/muxmesh/config.toml > default. Token = separate file.
     let args: Vec<String> = std::env::args().skip(1).collect();
     // -v/--verbose anywhere -> RUST_LOG=muxmesh=debug (explicit RUST_LOG wins).
@@ -176,14 +75,14 @@ async fn main() {
     // INFO only when armed/sessions state CHANGES — a running agent must not
     // spam the pane it lives in. Blocking ureq+tmux -> dedicated std::thread
     // (same pattern as the poller), off the tokio runtime.
-    let ws = ws_channel(Arc::new(cfg.clone()), log_rx);
+    let ws = ws::ws_channel(Arc::new(cfg.clone()), log_rx);
     {
         let cfg = cfg.clone();
         thread::spawn(move || {
             let mut last = (false, usize::MAX);
             loop {
                 let token = muxmesh_core::read_token();
-                let state = build_state(&cfg.host, &resolve_socket(&cfg));
+                let state = build_state(&cfg.host, &tmux::resolve_socket(&cfg));
                 let ok = push(&cfg.url(), &cfg.host, token.as_str(), &state);
                 tracing::debug!(
                     "armed={} sessions={} push={}",
@@ -210,371 +109,34 @@ async fn main() {
         });
     }
 
-    ws.await; // the WS channel reconnects forever; main just keeps it alive
+    // tokio runtime for the WS channel only (the threads above stay std).
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(ws); // the WS channel reconnects forever; main just keeps it alive
 }
 
-/// Persistent outbound WS channel: dial /agent/ws with the machine token
-/// headers, execute pushed commands, ack them. Reconnect with exponential
-/// backoff 1s -> 30s (reset on a successful session); logs state changes only
-/// (never the token).
-/// shortcut: no jitter on the backoff — fine at homelab scale, add jitter if
-/// many agents ever hammer a restarting hub.
-async fn ws_channel(
-    cfg: Arc<muxmesh_core::AgentConfig>,
-    mut log_rx: tokio::sync::broadcast::Receiver<String>,
-) {
-    let url = {
-        // core's ws_url() is the legacy /ws path; the axum hub serves both,
-        // canonical /agent/ws wins.
-        let legacy = cfg.ws_url();
-        match legacy.strip_suffix("/ws") {
-            Some(prefix) => format!("{prefix}/agent/ws"),
-            None => legacy,
-        }
-    };
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        let token = muxmesh_core::read_token().as_str().to_string();
-        if token.is_empty() {
-            tracing::warn!("ws: no token -> retrying in 1s");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-        match connect_with_auth(&url, &cfg.host, &token).await {
-            Ok((ws, resp)) => {
-                tracing::info!("ws: connected to {url} (status {})", resp.status());
-                ws_session(&cfg, ws, &mut log_rx).await;
-                tracing::warn!("ws: channel closed -> reconnecting");
-                backoff = Duration::from_secs(1); // success resets the ramp
-            }
-            Err(e) => {
-                // revoked/bad token: 100k-round KDF per handshake is real CPU —
-                // back off hard; re-reads the token file each attempt so pasting
-                // a fresh one recovers without restart.
-                let denied = matches!(
-                    &e,
-                    tokio_tungstenite::tungstenite::Error::Http(resp) if resp.status() == 401
-                );
-                if denied {
-                    backoff = Duration::from_secs(30);
-                }
-                tracing::warn!(
-                    "ws: connect {url} failed: {e} -> retry in {}s",
-                    backoff.as_secs()
-                );
-            }
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
-    }
-}
-
-/// Dial the hub's /agent/ws with X-Muxmesh-Host + X-Muxmesh-Token (own
-/// machine token — the same identity as POST /state, zero relay tokens).
-#[allow(clippy::result_large_err)] // tungstenite::Error is theirs, not ours to box
-async fn connect_with_auth(
-    url: &str,
-    host: &str,
-    token: &str,
-) -> tokio_tungstenite::tungstenite::Result<(
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    tokio_tungstenite::tungstenite::handshake::client::Response,
-)> {
-    let mut req = url.into_client_request().map_err(|_| {
-        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid ws url",
-        ))
-    })?;
-    // header values must be visible ASCII: a malformed pasted token must not
-    // panic the agent — fail the attempt, the loop re-reads the file.
-    let (hv, tv) = match (host.parse(), token.parse()) {
-        (Ok(h), Ok(t)) => (h, t),
-        _ => {
-            tracing::error!("ws: host/token contain invalid header characters (check token file)");
-            return Err(tokio_tungstenite::tungstenite::Error::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid header value"),
-            ));
-        }
-    };
-    let h = req.headers_mut();
-    h.insert("X-Muxmesh-Host", hv);
-    h.insert("X-Muxmesh-Token", tv);
-    connect_async(req).await
-}
-
-/// Read pushed frames until the socket dies: parse the closed-list envelope,
-/// execute on the live tmux socket (Command is std-blocking; shortcut: run
-/// inline — a hung tmux client stalls the reader, acceptable at homelab
-/// scale; wrap dispatch in spawn_blocking if it ever bites), ack.
-/// Also: send our own ping every 30 s and drop the connection after
-/// MAX_MISSED_PONGS unanswered pings (dead hub). tungstenite answers hub
-/// pings with pong automatically — never reply manually.
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn ws_session(
-    cfg: &muxmesh_core::AgentConfig,
-    ws: Ws,
-    log: &mut tokio::sync::broadcast::Receiver<String>,
-) {
-    let (mut sink, mut stream) = ws.split(); // liveness counters are SESSION-local: statics shared across reconnects
-                                             // would corrupt the missed-pong accounting between sessions.
-    let last_ping_seq = Arc::new(AtomicU64::new(0)); // last ping WE sent
-    let alive_seq = Arc::new(AtomicU64::new(0)); // last ping the hub answered
-                                                 // outbound frames (acks + keepalive pings) go through one channel so a
-                                                 // single task owns the sink (a SplitSink cannot be shared).
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-
-    // ping loop: outbound keepalive, seq-stamped so pongs prove liveness.
-    let tx_p = tx.clone();
-    let last_ping_p = last_ping_seq.clone();
-    let pinger = async move {
-        let mut ping = tokio::time::interval(PING_INTERVAL);
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ping.tick().await;
-            let seq = last_ping_p.fetch_add(1, Ordering::Relaxed) + 1;
-            if tx_p.send(Message::Ping(seq.to_string().into())).is_err() {
-                return; // writer gone -> session over
-            }
-        }
-    };
-
-    // writer task: the ONLY owner of the sink. Central-log lines from the
-    // tracing layer arrive on `log` and are forwarded as {"log":...} frames;
-    // the hub appends them to its hub.log (one file for the whole fleet).
-    // shortcut: lines emitted while the WS is DOWN are lost (stderr keeps
-    // them) — add replay-on-reconnect if the hub must hold full history.
-    let tx2 = tx.clone();
-    let mut log_rx = log.resubscribe();
-    let writer = async move {
-        loop {
-            tokio::select! {
-                biased;
-                Ok(line) = log_rx.recv() => {
-                    let frame = format!("{{\"log\":{}}}", serde_json::json!(line));
-                    if tx2.send(Message::Text(frame.into())).is_err() {
-                        return;
-                    }
-                }
-                Some(msg) = rx.recv() => {
-                    if sink.send(msg).await.is_err() {
-                        return; // socket error -> session over
-                    }
-                }
-            }
-        }
-    };
-
-    let last_ping_r = last_ping_seq.clone();
-    let alive_r = alive_seq.clone();
-    let reader = async move {
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Some(ack) = dispatch_command(cfg, &cfg.host, text.as_str()) {
-                        if tx.send(Message::Text(ack.into())).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Ok(Message::Pong(data)) => {
-                    // tungstenite echoes the ping payload back verbatim: a pong
-                    // carrying our latest sent seq proves the hub is alive.
-                    let seq: u64 = String::from_utf8_lossy(&data).parse().unwrap_or(0);
-                    if seq != 0 && seq == last_ping_r.load(Ordering::Relaxed) {
-                        alive_r.store(seq, Ordering::Relaxed);
-                    }
-                }
-                Ok(Message::Close(_)) => return,
-                Ok(_) => {} // binary/ping: ping auto-answered by tungstenite
-                Err(e) => {
-                    tracing::warn!("ws: recv error: {e}");
-                    return;
-                }
-            }
-        }
-    };
-
-    // Dead-hub watchdog: MAX_MISSED_PONGS pings sent without a matching pong
-    // -> end the session so the reconnect loop takes over. A silent half-open
-    // socket surfaces here, not as a read timeout (there is none).
-    let last_ping_w = last_ping_seq.clone();
-    let alive_w = alive_seq.clone();
-    let watchdog = async move {
-        loop {
-            tokio::time::sleep(PING_INTERVAL).await;
-            let last = last_ping_w.load(Ordering::Relaxed);
-            if last.saturating_sub(alive_w.load(Ordering::Relaxed)) >= MAX_MISSED_PONGS {
-                tracing::warn!(
-                    "ws: {MAX_MISSED_PONGS} unanswered pings -> dropping connection (dead hub)"
-                );
-                return;
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = reader => {}
-        _ = pinger => {}
-        _ = writer => {}
-        _ = watchdog => {}
-    }
-}
-
-/// tracing layer: every log event becomes {"log":"<formatted line>"} on the
-/// agent's outbound WS channel (the hub appends it to central hub.log).
-/// Non-blocking: a full/closed channel drops the line (stderr still has it).
-struct WsLogLayer(tokio::sync::broadcast::Sender<String>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WsLogLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct C(Option<String>);
-        impl tracing::field::Visit for C {
-            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
-                if f.name() == "message" {
-                    self.0 = Some(v.to_string());
-                }
-            }
-            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                if self.0.is_none() && f.name() == "message" {
-                    self.0 = Some(format!("{v:?}"));
-                }
-            }
-        }
-        let mut c = C(None);
-        event.record(&mut c);
-        if let Some(msg) = c.0 {
-            let level = event.metadata().level();
-            let line = format!("{level} {msg}");
-            // best effort: no receiver up (WS down) = Err, stderr remains the
-            // durable record. Never block a log call on the network.
-            let _ = self.0.send(line);
-        }
-    }
-}
-
-/// Pure dispatch decision: envelope -> ack JSON (no socket, no exec side
-/// effects beyond the argv-scoped tmux call). dst mismatch or bad frame ->
-/// no ack (None): the hub logs the queue TTL drop instead.
-fn dispatch_command(cfg: &muxmesh_core::AgentConfig, host: &str, text: &str) -> Option<String> {
-    let env: CommandEnvelope = match serde_json::from_str(text) {
-        Ok(e) => e,
+/// POST the state to the hub. Returns true on HTTP 2xx.
+fn push(url: &str, host: &str, token: &str, state: &HostState) -> bool {
+    let body = match serde_json::to_vec(state) {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!("ws: bad frame (not a command envelope): {e}");
-            return None;
+            tracing::error!("serialize state: {e}");
+            return false;
         }
     };
-    if env.dst != host {
-        tracing::warn!(
-            "ws: ignoring command id={} dst={} (not me: {host})",
-            env.id,
-            env.dst
-        );
-        return None;
-    }
-    tracing::info!(
-        "ws: command id={} src={} cmd={:?} ts={}",
-        env.id,
-        env.src,
-        env.cmd,
-        now_unix()
-    );
-
-    let ack = if env.v != 1 {
-        Ack::err(env.v, &env.id, "unsupported v")
-    } else if !env.cmd.args_valid() {
-        Ack::err(env.v, &env.id, "invalid args")
-    } else {
-        // "" => resolve the live socket (see resolve_socket); a literal "default"
-        // fails when tmux runs from a per-user socket dir macOS rotates.
-        let socket = resolve_socket(cfg);
-        // the bar is a GLOBAL option: it hits every session/window on this
-        // socket — name them in the trace.
-        let affected = tmux_sessions(&socket);
-        tracing::info!("ws: executing on socket={socket} — affects: {affected}");
-        // TRACE (diagnostic MacBook): état AVANT/Après reclaim, horodaté —
-        // on saura si le parent a bien reçu et appliqué ParentReclaim.
-        let before = tmux_prefix_and_status(&socket);
-        match env.cmd.execute(&socket) {
-            Ok(()) => {
-                let after = tmux_prefix_and_status(&socket);
-                tracing::info!(
-                    "ws: done id={} ok — state {before} -> {after} ts={}",
-                    env.id,
-                    now_unix()
-                );
-                Ack::ok(env.v, &env.id)
-            }
-            Err(e) => {
-                tracing::error!("ws: exec failed id={} socket={socket}: {e}", env.id);
-                Ack::err(env.v, &env.id, &e)
-            }
+    match ureq::post(url)
+        .set("X-Muxmesh-Host", host)
+        .set("X-Muxmesh-Token", token)
+        .send_bytes(&body)
+    {
+        Ok(resp) => {
+            tracing::debug!("POST {url} -> {}", resp.status());
+            resp.status() < 300
         }
-    };
-    Some(serde_json::to_string(&ack).unwrap_or_else(|_| "{}".into()))
-}
-
-/// Resolve the tmux socket the agent controls: the configured one, or ""
-/// meaning "default". A stale/default socket that does not exist on disk is
-/// resolved to the live one (`tmux display -p '#{socket_path}'`) — macOS
-/// sockets live in a per-user /tmp/claude-<uid>/ style dir that changes
-/// between sessions, so a literal "default" often 404s while tmux itself
-/// knows where its socket is.
-fn resolve_socket(cfg: &muxmesh_core::AgentConfig) -> String {
-    if !cfg.tmux_socket.is_empty() && std::path::Path::new(&cfg.tmux_socket).exists() {
-        return cfg.tmux_socket.clone();
+        Err(e) => {
+            tracing::warn!("POST {url} -> error {e}");
+            false
+        }
     }
-    std::process::Command::new("tmux")
-        .args(["display-message", "-p", "#{socket_path}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| cfg.tmux_socket.clone())
-}
-
-/// prefix+status of a socket in one line, for the before/after reclaim trace.
-fn tmux_prefix_and_status(socket: &str) -> String {
-    let get = |args: &[&str]| -> String {
-        std::process::Command::new("tmux")
-            .arg("-S")
-            .arg(socket)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "?".into())
-    };
-    format!(
-        "prefix={} status={}",
-        get(&["show-options", "-gv", "prefix"]),
-        get(&["show-options", "-gv", "status"])
-    )
-}
-
-/// Human-readable list of sessions on a socket, for the exec trace.
-fn tmux_sessions(socket: &str) -> String {
-    std::process::Command::new("tmux")
-        .args([
-            "-S",
-            socket,
-            "list-sessions",
-            "-F",
-            "#{session_name}(#{session_windows}w,attached=#{?session_attached}yes#{:}no)",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).replace('\n', " "))
-        .unwrap_or_else(|| "(no sessions)".into())
 }
 
 #[cfg(test)]
@@ -612,20 +174,22 @@ mod tests {
         let c = cfg();
         // foreign dst -> ignored, no ack (hub logs the TTL drop)
         let foreign = r#"{"v":1,"id":"c-1","src":"driver","dst":"someone-else","cmd":{"type":"BarHide"},"ts":1}"#;
-        assert_eq!(dispatch_command(&c, "me", foreign), None);
+        assert_eq!(ws::session::dispatch_command(&c, "me", foreign), None);
         // bad json -> ignored
-        assert_eq!(dispatch_command(&c, "me", "not json"), None);
+        assert_eq!(ws::session::dispatch_command(&c, "me", "not json"), None);
         // bad version -> ack err (id echoed)
         let oldv =
             r#"{"v":2,"id":"c-2","src":"driver","dst":"me","cmd":{"type":"BarShow"},"ts":1}"#;
-        let ack: Ack = serde_json::from_str(&dispatch_command(&c, "me", oldv).unwrap()).unwrap();
+        let ack: muxmesh_core::Ack =
+            serde_json::from_str(&ws::session::dispatch_command(&c, "me", oldv).unwrap()).unwrap();
         assert_eq!(ack.id, "c-2");
         assert!(!ack.ok);
         // own BarHide: no live tmux here -> exec fails, but the ack must
         // echo the id (dispatch path proven without touching tmux state).
         let mine =
             r#"{"v":1,"id":"c-3","src":"driver","dst":"me","cmd":{"type":"BarHide"},"ts":1}"#;
-        let ack: Ack = serde_json::from_str(&dispatch_command(&c, "me", mine).unwrap()).unwrap();
+        let ack: muxmesh_core::Ack =
+            serde_json::from_str(&ws::session::dispatch_command(&c, "me", mine).unwrap()).unwrap();
         assert_eq!(ack.id, "c-3");
     }
 
