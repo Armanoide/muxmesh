@@ -34,4 +34,17 @@ CLI="$CURRENT_DIR/bin/muxmesh-cli"
 # stdout redirected too: tmux run-shell shows non-zero-exit output as
 # "#[cell]..." noise on the status line; keep tmux's view clean.
 tmux run-shell "mkdir -p $HOME/.muxmesh"
-tmux bind-key -n F10 run-shell "$CLI bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1"
+
+# F10 is the parent's safety ring: it MUST stay reachable even when control is
+# delegated to the child. tmux resolves a keystroke on the server BEFORE it
+# reaches the pane/ssh, so binding F10 in BOTH key-tables guarantees the parent
+# always intercepts it. Phase 2 delegates control by moving the parent into a
+# custom table (muxmesh-remote) with prefix None; F10 stays bound there so
+# press 2 always returns control (restore prefix + bar), even if the child died.
+BIND="run-shell \"$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1\""
+tmux bind-key -T root -n F10 $BIND
+# Custom table for delegated mode. Created implicitly by bind-key -T (tmux 3.3a
+# has no new-key-table). Same F10 action as root: the bar-toggle binary reads
+# `prefix` to know it is in REMOTE state and restores instead of delegating.
+tmux bind-key -T muxmesh-remote -n F10 $BIND
+
