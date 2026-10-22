@@ -96,10 +96,12 @@ docker run -d --name "$B" --network "$NET" --network-alias "$HOST_B" -v "$VOL":/
   "$IMAGE" sh -c "/opt/muxmesh/sshd-setup.sh sh -c 'tmux -S $SOCK_B new-session -d -s main; mkdir -p ~/.config/muxmesh; printf %s \"$TOK_B\" > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent'" >/dev/null
 
 # machine_a: driver. plain agent + tmux; opens the ssh toward machine_b later.
+# muxmesh.tmux is sourced on SOCK_A so the F10 bindings (root + muxmesh-remote)
+# exist, exactly like the real MacBook tpm setup.
 docker run -d --name "$A" --network "$NET" --network-alias "$HOST_A" \
   -e MUXMESH_HOST="$HOST_A" -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_A" -e MUXMESH_SOCKET="$SOCK_A" -e RUST_LOG=debug \
-  "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent" >/dev/null
+  "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; tmux -S $SOCK_A source-file /opt/muxmesh/muxmesh.tmux; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent" >/dev/null
 
 log "wait for both agents to register + WS-connect"
 for i in $(seq 1 60); do
