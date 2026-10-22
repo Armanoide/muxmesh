@@ -1,4 +1,4 @@
-# muxmesh — multi-machine tmux orchestrator over a plain HTTP pivot.
+# muxmesh — multi-machine tmux orchestrator over a plain HTTP/WS pivot.
 
 One keystroke on your driver machine opens, focuses or attaches a tmux session
 on another machine — no interactive ssh, no credential-manager popups.
@@ -8,24 +8,25 @@ on another machine — no interactive ssh, no credential-manager popups.
              │   hub (always-on machine)    │
              │   muxmesh-hub :9997          │
              │   GET /state  POST /cmd      │
-             └──▲──────────▲──────────┬─────┘
-   POST /state  │   WS /ws │          │ client reads state
-   (heartbeat)  │  (outbound│         │
-             ┌─┴──────────┐ │dial)  ┌─┴────────────┐
-             │ agent A    ├─┘       │ driver       │
-             │ tmux local │         │ F10 / send   │
-             └────────────┘         │ POST /cmd    │
-                                    └────────────────┘
+             └──▲─────────────────┬──────────┘
+   GET /state   │  WS /agent/ws │          │ client reads state
+   (readers)    │  (agents dial │         │
+             ┌─┴──────────┐ out) │      ┌─┴────────────┐
+             │ agent A    ├──────┘      │ driver       │
+             │ tmux local │  ReportState │ F10 / send   │
+             └────────────┘  + commands  │ POST /cmd    │
+                          + acks         └────────────────┘
 ```
 
 - **hub** — state aggregator + command dispatcher on any always-on machine. It
   never executes commands and it NEVER dials agents: agents hold a persistent
-  outbound WebSocket (`/ws`) to the hub. `POST /cmd` from a driver is queued
-  on the target's live WS channel (202) and pushed as a frame; the agent acks
-  on the same socket.
-- **agent** — runs on each server: pushes local tmux state (`POST /state`) and
-  dials `ws://hub/ws`, authenticating with its OWN machine token. It serves
-  NO inbound ports; commands arrive as WS frames on its own connection.
+  outbound WebSocket (`/agent/ws`) to the hub. `POST /cmd` from a driver is
+  queued on the target's live WS channel (202) and pushed as a frame; the
+  agent acks on the same socket.
+- **agent** — runs on each server: dials `ws://hub/agent/ws` with its OWN
+  machine token and uses that ONE channel for everything — a `ReportState`
+  frame every interval (the heartbeat), pushed commands in, acks out. It
+  serves NO inbound ports.
 - **cli** — driver-side: badge in the tmux status bar, keys -> `POST /cmd` to
   the **hub** (operator rule: agent→hub only, never driver→agent direct).
 
@@ -34,14 +35,14 @@ on another machine — no interactive ssh, no credential-manager popups.
 - **Closed command list, encoded in the type**: commands are an externally-tagged
   serde enum (`muxmesh-core::Command`). Unknown verbs fail deserialization (400)
   before any execution. tmux is invoked via argv, never through a shell.
-- **Zero ssh on the read path**: agents push state to the hub over HTTP; the
-  poller badges windows from `GET /state` (open, no secrets) + local pgrep.
-  No `ssh` per poll cycle, ever.
+- **Zero ssh on the read path**: agents push state to the hub on their WS
+  (`ReportState` frames); the poller badges windows from `GET /state` (open,
+  no secrets) + local pgrep. No `ssh` per poll cycle, ever.
 - **ONE machine token per host** (Atuin-like): `config.toml` is shareable and
   committed as a template; the token lives in `~/.config/muxmesh/token` (0600,
-  gitignored). The same token authenticates `POST /state` AND the `/ws`
-  handshake. Constant-time comparison; missing token = reject everything.
-  No relay tokens exist anywhere in the protocol.
+  gitignored). The same token authenticates the `/agent/ws` handshake — state
+  reports and commands share the one channel. Constant-time comparison; missing
+  token = reject everything. No relay tokens exist anywhere in the protocol.
 - **Commands flow driver → HUB → agent's socket**: the CLI POSTs `/cmd` to the
   hub with `dst: <host>` in the envelope. The hub authenticates the driver
   (same token registry as `/state`), refuses unregistered targets (403) and
@@ -63,7 +64,7 @@ on another machine — no interactive ssh, no credential-manager popups.
 muxmesh/
 ├── muxmesh-core/   # shared contract: HostState, Command (closed list), Ack, config
 ├── muxmesh-hub/    # state pivot daemon (axum + tokio, /agent/ws dispatch)
-├── muxmesh-agent/  # per-machine daemon (push /state, dial /ws, execute frames)
+├── muxmesh-agent/  # per-machine daemon (dial /agent/ws, ReportState + frames)
 ├── muxmesh-cli/    # driver client: badge poller (`poll`), state tree (`tree`), send
 ```
 
