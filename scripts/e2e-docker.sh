@@ -143,7 +143,7 @@ assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{p
 # control delegated: parent prefix must now be None and key-table muxmesh-remote.
 P1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 assert_eq "$P1" "None" "press1: $HOST_A control DELEGATED (prefix None)"
-KT1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv key-table 2>/dev/null || docker exec "$A" tmux -S "$SOCK_A" display-message -p '#{key_table}' 2>/dev/null)
+KT1=$(docker exec "$A" tmux -S "$SOCK_A" display-message -p '#{key_table}' 2>/dev/null)
 echo "  (info) key-table after press1: ${KT1:-n/a}"
 
 log "PRESS 2 (reclaim control: the step that failed on the real driver)"
