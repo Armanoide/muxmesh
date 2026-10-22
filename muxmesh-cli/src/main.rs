@@ -34,8 +34,7 @@ fn main() {
     match cmd {
         "poll" if args.iter().any(|a| a == "--once") => muxmesh_core::poll::run_once(&cfg),
         "poll" => muxmesh_core::poll::run(&cfg),
-        "tree" => tree(&cfg, args.iter().any(|a| a == "--local")),
-        "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
+        "tree" => tree(&cfg, args.iter().any(|a| a == "--local")),        "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
         "bar-toggle" => std::process::exit(bar::run(&cfg) as i32),
         "why" => std::process::exit(why::run_why(&cfg) as i32),
@@ -53,7 +52,7 @@ fn tree(cfg: &muxmesh_core::HubConfig, from_local: bool) {
     let doc = if from_local {
         muxmesh_core::poll::read_state(&cfg.state_path)
     } else {
-        match muxmesh_core::poll::fetch_hub_state(&cfg.poll_hub) {
+        match muxmesh_core::http::get_state(&cfg.poll_hub) {
             Ok(d) => d,
             Err(e) => {
                 tracing::error!("tree: hub unreachable: {e}");
