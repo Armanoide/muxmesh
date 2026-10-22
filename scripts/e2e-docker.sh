@@ -114,6 +114,21 @@ done
 echo "  state: $(docker exec "$HUB" cat /data/state.json)"
 
 log "arm machine_a window toward $HOST_B (REAL ssh)"
+# client factice ATTACHE des ici : switch-client -T off est un etat PAR
+# CLIENT — sans client attache tmux repond 'no current client' et la bascule
+# OFF mode ne peut pas etre verifiee. En prod le client est toujours attache
+# (le terminal de l'utilisateur). detach-client -a a la fin du script.
+# script(1) alloue un pty (docker exec -d n'en a pas -> tmux attach meurt
+# 'lost terminal'). Le fifo avec writer permanent (sleep, setsid) garde les
+# deux bouts ouverts quand le shell exec() se termine ; TERM explicite car
+# l'environnement du conteneur est nu. Le client reste attache jusqu'a la fin
+# du run (conteneur detruit au cleanup).
+docker exec "$A" sh -c 'rm -f /tmp/attach.fifo; mkfifo /tmp/attach.fifo'
+docker exec "$A" sh -c '(setsid sleep 3600 >/tmp/attach.fifo &); setsid sh -c "TERM=xterm-256color script -q -c \"tmux -S '"$SOCK_A"' attach -t main\" /dev/null </tmp/attach.fifo >/dev/null 2>&1 & exit"'
+sleep 2
+docker exec "$A" tmux -S "$SOCK_A" list-clients | grep -q main \
+  && echo "  fake client attached (OFF-mode verifiable)" \
+  || echo "  WARN: no attached client — key-table assertions will not hold"
 # copy the private key into machine_a, then open a genuine `ssh machine_b` in a
 # tmux window. sshd on machine_b accepts it (authorized key), so the pane holds
 # a real `ssh machine_b` process — exactly what the poller detects.
@@ -153,15 +168,15 @@ docker exec "$A" sh -c "MUXMESH_HOST=$HOST_A MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL
 sleep 1
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "off" "press1: $HOST_A bar hidden"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on"  "press1: $HOST_B bar shown (BarShow)"
-# control delegated: parent prefix None AND F10 unbound in root — the ONLY
-# guard that stops the parent from stealing press 2 (MacBook regression proved
-# switch-client -T off does not protect the keystroke path). Press 2 must
-# traverse ssh into the child; reclaim returns over the hub (ParentReclaim).
+# control delegated: parent prefix None AND attached client moved to key
+# table `off` (samoshkin OFF mode). root F10 stays bound but is INACTIVE
+# while the client sits in `off` — press 2 traverses ssh into the child, and
+# if it ever lands on the parent instead, the off-table F10 reclaims locally.
 P1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 assert_eq "$P1" "None" "press1: $HOST_A control DELEGATED (prefix None)"
-docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
-  && bad "press1: $HOST_A still binds root F10 — it would steal press 2" \
-  || ok "press1: $HOST_A root F10 unbound (parent deaf, press-2 belongs to child)"
+# key table est un etat PAR CLIENT (client attache depuis le debut du run).
+TBL=$(docker exec "$A" tmux -S "$SOCK_A" display-message -p '#{client_key_table}' 2>/dev/null || echo "")
+assert_eq "$TBL" "off" "press1: $HOST_A client in key table 'off' (deaf except F10)"
 
 log "WORKFLOW USER: presse1 -> fenetre chez B -> presse2 chez B -> fenetre chez A"
 # fenetre chez l'enfant PENDANT la delegation (le focus clavier est dans le ssh).
@@ -210,8 +225,9 @@ C2WA1=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
   && ok "CRIT2: presse1 -> fenetre creee CHEZ L'ENFANT seulement (B $C2WB0->$C2WB1, A stable $C2WA0)" \
   || bad "CRIT2: presse1 = control chez l'enfant — fenetre doit atterrir chez B seulement (B $C2WB0->$C2WB1 A $C2WA0->$C2WA1)"
 
-# PRESSE 2 CHEZ L'ENFANT (le keystroke traverse le ssh, parent sourd = unbind) :
-# l'enfant masque sa barre et repond ParentReclaim via le hub.
+# PRESSE 2 CHEZ L'ENFANT (le keystroke traverse le ssh, parent sourd = table
+# off + prefix None) : l'enfant masque sa barre et repond ParentReclaim via
+# le hub.
 docker exec "$B" sh -c "MUXMESH_HOST=$HOST_B MUXMESH_SOCKET=$SOCK_B MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 2
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "off" "press2: $HOST_B bar hidden (child answers press 2)"
@@ -219,8 +235,8 @@ assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{p
 P2=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 [ "$P2" != "None" ] && ok "press2: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2: prefix still None — parent stuck"
 docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
-  && ok "press2: $HOST_A F10 rebound (safety ring restored)" \
-  || bad "press2: $HOST_A F10 still unbound — parent deaf forever"
+  && ok "press2: $HOST_A F10 present in root (safety ring restored)" \
+  || bad "press2: $HOST_A F10 missing from root — parent deaf forever"
 
 log "CHEMIN CRITIQUE 1 (retour): une seule barre visible (A=on/B=off apres presse2)"
 # apres presse2 : le parent a la sienne allumee, l'enfant eteinte = une seule.
@@ -257,24 +273,25 @@ C2bWB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
   || bad "CRIT2-base: control local = fenetre chez le parent seulement (A $C2bWA0->$C2bWA1 B $C2bWB0->$C2bWB1)"
 
 log "CHEMIN CRITIQUE 3: presse2 SUR LE PARENT -> self-reclaim (F10 ne meurt pas)"
-# symptome reel MacBook : presse1 delegue (parent sourd), puis l'utilisateur
-# rappuie F10 SUR LE PARENT (pas dans la session ssh de l'enfant). Ancien code
-# = "ignored" -> prefix reste None + F10 reste unbound -> F10 MORT ("marche la
-# 1ere fois, plus la 2eme"). Nouveau : le parent SE REVEILLE lui-meme.
-# Etat de depart force : parent delegue (prefix None + F10 unbound), independant
-# du timing reseau, pour tester le self-reclaim seul.
+# symptome reel MacBook : presse1 delegue, puis l'utilisateur rappuie F10 SUR
+# LE PARENT (pas dans la session ssh de l'enfant). Ancien code = F10 unbound
+# + "ignored" -> prefix reste None -> F10 MORT ("marche la 1ere fois, plus la
+# 2eme"). Nouveau mecanisme samoshkin : rien n'est jamais unbound, le parent
+# delegue = prefix None + client en table 'off' ; son F10 (table off ou
+# appel direct) le REVEILLE lui-meme : prefix restaure + table root + bar on.
+# Etat de depart force : parent delegue (prefix None), independant du timing
+# reseau, pour tester le self-reclaim seul.
 docker exec "$A" tmux -S "$SOCK_A" set-option -g prefix None
-docker exec "$A" tmux -S "$SOCK_A" unbind-key -n F10
 docker exec "$A" tmux -S "$SOCK_A" set-option -g status off
-echo "  etat delege force: prefix=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix) F10=$(docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -c F10)"
+echo "  etat delege force: prefix=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)"
 # presse2 sur le PARENT (bar-toggle sans armed ssh, prefix=None -> self-reclaim)
 docker exec "$A" sh -c "MUXMESH_HOST=$HOST_A MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -2
 sleep 1
 C3P=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 [ "$C3P" != "None" ] && ok "CRIT3: presse2 parent -> prefix restaure (self-reclaim, '$C3P')" || bad "CRIT3: presse2 parent -> prefix reste None, F10 MORT"
 docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
-  && ok "CRIT3: presse2 parent -> F10 reborn (revif)" \
-  || bad "CRIT3: presse2 parent -> F10 toujours unbound, sourd pour toujours"
+  && ok "CRIT3: presse2 parent -> F10 vivant en table root" \
+  || bad "CRIT3: presse2 parent -> F10 absent de root, sourd pour toujours"
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on" "CRIT3: presse2 parent -> barre parent rallumee"
 
 log "RESULT: $PASS passed, $FAIL failed"

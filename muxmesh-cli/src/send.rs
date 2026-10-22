@@ -283,21 +283,31 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     return 1;
                 }
                 // child is live: hide local bar, then hand the keyboard over —
-                // tmux-remote's exact mechanism (verified 100% by its users):
-                // prefix None + UNBIND F10 here, so the parent becomes deaf to it
-                // and press 2 travels ssh into the CHILD's tmux, whose own F10
-                // binding runs bar-toggle on the child (local branch). The child
-                // then answers BarHide over the hub WS; our agent applies it —
-                // prefix restored + F10 rebound + bar on — and control is back.
+                // samoshkin's canonical OFF mode (tmux-remote/tmux-nested use
+                // it too): prefix None + switch-client -T off. The parent goes
+                // deaf to EVERYTHING except F10, which stays bound in table
+                // `off` (muxmesh.tmux). Press 2 traverses ssh into the CHILD's
+                // tmux (local branch), and whichever path fires — the child's
+                // ParentReclaim over the hub or the parent's own off-table
+                // binding — restores prefix + table root + bar. No unbind:
+                // unbinding F10 killed the parent's recovery path and stranded
+                // control at the child (MacBook symptom, fixed here).
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
-                muxmesh_core::poll::run_tmux(&base, &["unbind-key", "-n", "F10"]);
-                // TRACE: confirm in the log that BOTH deafness steps were issued,
-                // with what tmux answered (unbind of an existing binding = exit 0).
-                let unbind_ok = muxmesh_core::poll::tmux_out(&base, &["list-keys", "-T", "root"])
-                    .map(|k| !k.contains("F10"))
-                    .unwrap_or(false);
+                // switch-client is per-CLIENT state: headless servers (E2E, no
+                // attached client) answer "no current client" — prefix None
+                // still delegates the keyboard there, so failure is a warning.
+                let deaf =
+                    muxmesh_core::poll::tmux_run(&base, &["switch-client", "-T", "off"]);
+                // TRACE: confirm in the log that deafness was applied (the
+                // client's key table is per-client state, read it back).
+                let table = muxmesh_core::poll::tmux_out(
+                    &base,
+                    &["display-message", "-p", "#{client_key_table}"],
+                )
+                .map(|o| o.trim().to_string())
+                .unwrap_or_default();
                 tracing::info!(
-                    "bar-toggle: DEAFNESS applied — F10 unbound confirmed={unbind_ok} ts={t0}"
+                    "bar-toggle: DEAFNESS applied — switch-client ok={deaf} client_key_table='{table}' ts={t0}"
                 );
                 let cut =
                     muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "None"]);
@@ -323,22 +333,18 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 println!("muxmesh: control DELEGATED to {h} — press F10 again (child) to reclaim");
                 0
             } else {
-                // press 2 sur le PARENT pendant delegation : l'utilisateur rappuie
-                // F10 ICI (pas dans la session ssh de l'enfant). Le parent est sourd
-                // depuis le presse1 (prefix None + F10 unbound). Ancien comportement =
-                // "ignored" -> le parent restait sourd et F10 ne répondait plus (le
-                // "marche la 1ere fois, plus la 2eme" du MacBook). Le reclaim ne doit
-                // JAMAIS dépendre d'un presse2 qui traverse ssh : si le keystroke est
-                // arrivé jusqu'ici, c'est que F10 vit encore sur le parent -> il s'en
-                // sert pour SE RÉVEILLER lui-même : re-bind F10 + restore prefix + bar
-                // on. Puis on dit à l'enfant (armed host) de cacher sa barre via le hub
-                // (best-effort : si le hub est down, la barre enfant reste, mais le
-                // parent a récupéré son clavier = jamais bloqué).
-                muxmesh_core::poll::run_tmux(
-                    &base,
-                    &["bind-key", "-T", "root", "-n", "F10", "run-shell", &f10_cmd()],
-                );
+                // press 2 arriving HERE while delegated: F10 fired on the
+                // PARENT — either via its off-table binding (the canonical
+                // samoshkin return path: client table is `off`, F10 bound in
+                // `off`), or a stray press while the table was still root.
+                // Either way this IS the user asking for control back, so the
+                // parent reclaims NOW, locally, no network round-trip: prefix
+                // restored + table back to root (F10 off-table goes dormant by
+                // itself) + bar on. Then tell the child to hide its bar via
+                // the hub (best-effort: if the hub is down the child's bar
+                // stays, but the parent's keyboard is back = never stranded).
                 muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
+                muxmesh_core::poll::run_tmux(&base, &["switch-client", "-T", "root"]);
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
                 // l'enfant doit éteindre sa barre (one-bar) : BarHide vers lui via hub.
                 post(Command::BarHide, "BarHide");
@@ -371,17 +377,14 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
             // Pas d'armed ssh sur CETTE fenetre. Deux sous-cas :
             // (a) cette machine EST déléguée (prefix=None posé par un presse1
             //     précédent ici) -> le presse2 arrive sur le parent lui-même.
-            //     Le parent SE RÉVEILLE : re-bind F10 + restore prefix + bar on,
+            //     Le parent SE RÉVEILLE : restore prefix + table root + bar on,
             //     et dit à l'enfant de cacher sa barre via le hub. C'est le
             //     reclaim local qui remplace l'ancien "ignored" (bug MacBook :
             //     F10 ne répondait plus au presse2 sur le parent).
             // (b) machine normale non déléguée -> simple toggle local de la barre.
             if delegated {
-                muxmesh_core::poll::run_tmux(
-                    &base,
-                    &["bind-key", "-T", "root", "-n", "F10", "run-shell", &f10_cmd()],
-                );
                 muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
+                muxmesh_core::poll::run_tmux(&base, &["switch-client", "-T", "root"]);
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
                 // l'enfant doit éteindre sa barre (one-bar) : BarHide via hub,
                 // best-effort. On ne connait plus l'armed host (fenetre sans ssh),

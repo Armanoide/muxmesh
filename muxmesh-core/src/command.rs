@@ -219,8 +219,11 @@ impl Command {
                 "muxmesh-cli".to_string()
             };
             let cmd = format!("{cli} bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1");
-            // rebind EXACTLY as muxmesh.tmux did (table root, -T root) so the
-            // restored binding is byte-identical to the tpm one.
+            // samoshkin OFF-mode return path: F10 was never unbound (it stays
+            // bound in table `off`), so reclaim restores the prefix and sends
+            // the client back to table root — the off-table F10 then goes
+            // dormant by itself. The root bind is re-issued anyway (cheap,
+            // idempotent) so a parent that lost its binding self-heals too.
             let steps: [(&str, Vec<&str>); 3] = [
                 ("bind-key", vec!["-T", "root", "-n", "F10", "run-shell", &cmd]),
                 ("set-option", vec!["-gu", "prefix"]),

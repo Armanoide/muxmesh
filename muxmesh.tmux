@@ -47,18 +47,18 @@ tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T prefix2 -n F10 "\
   switch-client -T root"
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-option -g prefix2 C-b
 
-# F10 here is the LOCAL/parent binding. In delegated mode bar-toggle UNBINDS
-# it and cuts the prefix to None (tmux-remote's exact mechanism): the parent
-# goes fully deaf, press 2 traverses ssh into the child's tmux, and the child
-# answers ParentReclaim over the hub — the parent's agent rebinds this F10,
-# restores the prefix and shows the bar again. The parent's keyboard is never
-# the recovery path, so a deaf parent can never strand the user.
+# F10 here is the LOCAL/parent binding. In delegated mode bar-toggle cuts the
+# prefix to None and moves the attached client to key table `off` (samoshkin's
+# canonical OFF mode): the parent is deaf to every keystroke EXCEPT F10, which
+# stays bound in table `off` below. Press 2 traverses ssh into the child's
+# tmux (child hides its bar and answers ParentReclaim over the hub), OR fires
+# this off-table binding directly on the parent — both paths restore prefix +
+# table root + bar. Nothing is ever unbound: the parent keeps its own escape
+# hatch, so control can never be stranded at the child.
 CMD="$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1"
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T root -n F10 run-shell "$CMD"
-# table off: defense in depth only. The REAL guard against the parent stealing
-# press 2 is send.rs unbind-key -n F10 (delegated): switch-client protects
-# the attached client, not the keystroke path — with root F10 alive the press
-# never traverses ssh and the child bar never hides (MacBook regression).
+# table off: the delegated-mode escape hatch (see above). NOT defense in depth
+# against an unbound root F10 — nothing is unbound anymore.
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T off -n F10 run-shell "$CMD"
 # NOTE: tmux's own bind-key takes ONE argument for the command — do NOT write
 # `bind-key run-shell "..."` unquoted, word splitting makes run-shell see
