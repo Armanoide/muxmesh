@@ -32,6 +32,15 @@ pub enum Command {
     /// the hub): restore the default prefix, rebind F10, show the bar. Sent
     /// BY the child TO its parent after the child's F10 traversed ssh.
     ParentReclaim,
+    /// agent -> hub ONLY: a state report pushed on the agent's own WS every
+    /// interval (replaces the old HTTP POST /state). The hub merges it into
+    /// state.json and never routes it to another agent, so a child can never
+    /// forge its parent's bar. `state` = the HostState payload, self-named
+    /// (its `host` field is the key — same identity rule as the WS handshake).
+    /// Identity comes from the authenticated WS channel, never from a header.
+    /// (No skip_deserializing: the hub must parse it inbound; the agent's
+    /// dispatch ignores any ReportState a malicious hub might push onward.)
+    ReportState { state: serde_json::Value },
 }
 
 /// Envelope of a command sent by a client.
@@ -122,6 +131,8 @@ impl Command {
             Command::FocusWindow { session, window } => vec![session, window],
             Command::AttachOrDetach { session } => vec![session],
             Command::BarHide | Command::BarShow | Command::ParentReclaim => vec![],
+            // agent->hub state report: no tmux names, nothing to validate.
+            Command::ReportState { .. } => vec![],
         }
     }
 
@@ -135,6 +146,12 @@ impl Command {
     /// it from its own binary path (it knows where muxmesh-cli lives).
     pub fn is_parent_reclaim(&self) -> bool {
         matches!(self, Command::ParentReclaim)
+    }
+
+    /// A state report pushed by an agent on its own WS. The hub merges it into
+    /// state.json (same merge path as the legacy POST /state) and never routes it onward.
+    pub fn is_report_state(&self) -> bool {
+        matches!(self, Command::ReportState { .. })
     }
 
     /// Full tmux argv for the closed list (never shell-interpolated).
@@ -171,6 +188,12 @@ impl Command {
                 // command per invocation, a joined argv = "too many arguments".
                 vec![]
             }
+            Command::ReportState { .. } => {
+                // never executed on tmux: the hub merges it into state.json and
+                // does not route it to agents. An agent that receives one (a
+                // malicious hub) ignores it — see dispatch_command.
+                vec![]
+            }
         }
     }
 
@@ -184,6 +207,7 @@ impl Command {
             // global option, no -t target
             Command::BarHide | Command::BarShow => String::new(),
             Command::ParentReclaim => String::new(),
+            Command::ReportState { .. } => String::new(),
         }
     }
 
@@ -192,6 +216,11 @@ impl Command {
     /// Every call is audited to stderr (ts, verb, target, ok) — SPEC §7.
     pub fn execute(&self, socket: &str) -> Result<(), String> {
         use std::process::Command as Proc;
+
+        // a state report is the hub's to merge, never tmux's to run.
+        if matches!(self, Command::ReportState { .. }) {
+            return Ok(());
+        }
 
         let argv: Vec<String> = if matches!(self, Command::AttachOrDetach { .. }) {
             let target = self.target();
