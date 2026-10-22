@@ -171,14 +171,34 @@ pub fn pane_pids(base: &[String], wid: &str) -> Option<Vec<u32>> {
 
 /// Host targeted by a live `ssh <host>` in this window (first armed match wins).
 /// Used by the key bindings to know which machine F8/F9/F10 should drive.
+/// Checks each pane's OWN process first, then its descendants: a window opened
+/// with `tmux new-window 'ssh host'` has ssh as the pane pid itself, so
+/// scanning only children (pgrep -P) would never arm it.
 pub fn window_ssh_host(base: &[String], wid: &str) -> Option<String> {
     let pids = pane_pids(base, wid)?;
     for pid in pids {
+        // the pane process itself may be the ssh client (window-command panes).
+        if let Some(h) = ssh_host_of_pid(pid) {
+            return Some(h);
+        }
         if let Some(h) = pane_ssh_host(pid) {
             return Some(h);
         }
     }
     None
+}
+
+/// Target host if the given pid's own command line is `ssh <host>`.
+fn ssh_host_of_pid(pid: u32) -> Option<String> {
+    let cmd = Command::new("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !cmd.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&cmd.stdout).trim().to_string();
+    ssh_target_of(&line).map(|h| h.split_once('@').map(|(_, h)| h).unwrap_or(&h).to_string())
 }
 
 /// One pass: evaluate every window on the server, set/unset the badge option.
