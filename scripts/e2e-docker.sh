@@ -256,5 +256,26 @@ C2bWB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
   && ok "CRIT2-base: prefix+c -> fenetre CHEZ LE PARENT seulement (A $C2bWA0->$C2bWA1, B stable $C2bWB0)" \
   || bad "CRIT2-base: control local = fenetre chez le parent seulement (A $C2bWA0->$C2bWA1 B $C2bWB0->$C2bWB1)"
 
+log "CHEMIN CRITIQUE 3: presse2 SUR LE PARENT -> self-reclaim (F10 ne meurt pas)"
+# symptome reel MacBook : presse1 delegue (parent sourd), puis l'utilisateur
+# rappuie F10 SUR LE PARENT (pas dans la session ssh de l'enfant). Ancien code
+# = "ignored" -> prefix reste None + F10 reste unbound -> F10 MORT ("marche la
+# 1ere fois, plus la 2eme"). Nouveau : le parent SE REVEILLE lui-meme.
+# Etat de depart force : parent delegue (prefix None + F10 unbound), independant
+# du timing reseau, pour tester le self-reclaim seul.
+docker exec "$A" tmux -S "$SOCK_A" set-option -g prefix None
+docker exec "$A" tmux -S "$SOCK_A" unbind-key -n F10
+docker exec "$A" tmux -S "$SOCK_A" set-option -g status off
+echo "  etat delege force: prefix=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix) F10=$(docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -c F10)"
+# presse2 sur le PARENT (bar-toggle sans armed ssh, prefix=None -> self-reclaim)
+docker exec "$A" sh -c "MUXMESH_HOST=$HOST_A MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -2
+sleep 1
+C3P=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
+[ "$C3P" != "None" ] && ok "CRIT3: presse2 parent -> prefix restaure (self-reclaim, '$C3P')" || bad "CRIT3: presse2 parent -> prefix reste None, F10 MORT"
+docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
+  && ok "CRIT3: presse2 parent -> F10 reborn (revif)" \
+  || bad "CRIT3: presse2 parent -> F10 toujours unbound, sourd pour toujours"
+assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on" "CRIT3: presse2 parent -> barre parent rallumee"
+
 log "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
