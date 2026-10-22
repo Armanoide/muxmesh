@@ -209,21 +209,11 @@ impl Command {
             // tmux takes ONE command per invocation — run the three steps as
             // separate calls. Order = safety: rebind F10 FIRST (so the parent
             // can always toggle again), then restore the prefix (the keyboard
-            // comes back), then the bar. Each step is audited; a failed prefix
-            // restore still leaves F10 working = recovery path.
-            let cli = if std::path::Path::new("/usr/local/bin/muxmesh-cli").is_file() {
-                "/usr/local/bin/muxmesh-cli".to_string()
-            } else if let Ok(dir) = std::env::var("MUXMESH_BIN_DIR") {
-                format!("{dir}/muxmesh-cli")
-            } else {
-                "muxmesh-cli".to_string()
-            };
-            let cmd = format!("{cli} bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1");
-            // samoshkin OFF-mode return path: F10 was never unbound (it stays
-            // bound in table `off`), so reclaim restores the prefix and sends
-            // the client back to table root — the off-table F10 then goes
-            // dormant by itself. The root bind is re-issued anyway (cheap,
-            // idempotent) so a parent that lost its binding self-heals too.
+            // comes back), then the bar. F10 was never unbound during a
+            // delegation (it stays bound in table `off`), so restoring the
+            // prefix + table root is enough; the root bind is re-issued anyway
+            // (cheap, idempotent) so a parent that lost its binding self-heals.
+            let cmd = crate::bar_toggle_cmd();
             let steps: [(&str, Vec<&str>); 3] = [
                 ("bind-key", vec!["-T", "root", "-n", "F10", "run-shell", &cmd]),
                 ("set-option", vec!["-gu", "prefix"]),

@@ -150,11 +150,6 @@ pub fn fetch_state(hub_addr: &str) -> StateDoc {
     }
 }
 
-/// Kept as an alias: callers that name fetch_hub_state explicitly (CLI tree).
-pub fn fetch_hub_state(hub_addr: &str) -> Result<StateDoc, String> {
-    crate::http::get_state(hub_addr)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

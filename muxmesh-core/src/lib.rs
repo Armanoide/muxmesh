@@ -7,6 +7,7 @@ pub mod error;
 pub mod http;
 pub mod identity;
 pub mod log;
+pub mod paths;
 pub mod poll;
 pub mod state;
 pub mod tmux;
@@ -18,4 +19,5 @@ pub use config::{
 };
 pub use error::CoreError;
 pub use identity::{new_token, verify_token, TokenRecord, TokenStore, PREFIX_LEN};
+pub use paths::bar_toggle_cmd;
 pub use state::{now_unix, HostState, RemoteSession, StateDoc};
