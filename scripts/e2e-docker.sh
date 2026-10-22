@@ -90,10 +90,12 @@ done
 
 log "agents (each = its own tmux server; $HOST_B also runs sshd)"
 # machine_b: target. starts sshd (authorizes machine_a key) then the agent.
+# config.toml: `muxmesh-cli bar-toggle` lit poll.hub/agent.host depuis ici —
+# sans ça il tombe sur 127.0.0.1:9997 (défaut) et ne voit jamais le hub.
 docker run -d --name "$B" --network "$NET" --network-alias "$HOST_B" -v "$VOL":/data \
   -e MUXMESH_HOST="$HOST_B" -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_B" -e MUXMESH_SOCKET="$SOCK_B" -e RUST_LOG=debug \
-  "$IMAGE" sh -c "/opt/muxmesh/sshd-setup.sh sh -c 'tmux -S $SOCK_B new-session -d -s main; bash /opt/muxmesh/muxmesh.tmux; mkdir -p ~/.config/muxmesh; printf %s \"$TOK_B\" > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent'" >/dev/null
+  "$IMAGE" sh -c "/opt/muxmesh/sshd-setup.sh sh -c 'tmux -S $SOCK_B new-session -d -s main; bash /opt/muxmesh/muxmesh.tmux; mkdir -p ~/.config/muxmesh; printf %s \"$TOK_B\" > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; printf \"[agent]\\nhost = \\\"$HOST_B\\\"\\nhub = \\\"$HUB\\\"\\nport = 9997\\n[poll]\\nhub = \\\"$HUB:9997\\\"\\n\" > ~/.config/muxmesh/config.toml; exec muxmesh-agent'" >/dev/null
 
 # machine_a: driver. plain agent + tmux; opens the ssh toward machine_b later.
 # muxmesh.tmux is sourced on SOCK_A so the F10 bindings (root + muxmesh-remote)
@@ -101,7 +103,7 @@ docker run -d --name "$B" --network "$NET" --network-alias "$HOST_B" -v "$VOL":/
 docker run -d --name "$A" --network "$NET" --network-alias "$HOST_A" \
   -e MUXMESH_HOST="$HOST_A" -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_A" -e MUXMESH_SOCKET="$SOCK_A" -e RUST_LOG=debug \
-  "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; export MUXMESH_SOCKET=$SOCK_A; bash /opt/muxmesh/muxmesh.tmux > /tmp/muxtmux-A.log 2>&1; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; exec muxmesh-agent" >/dev/null
+  "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; export MUXMESH_SOCKET=$SOCK_A; bash /opt/muxmesh/muxmesh.tmux > /tmp/muxtmux-A.log 2>&1; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; printf '[agent]\nhost = \"$HOST_A\"\nhub = \"$HUB\"\nport = 9997\n[poll]\nhub = \"$HUB:9997\"\n' > ~/.config/muxmesh/config.toml; exec muxmesh-agent" >/dev/null
 
 log "wait for both agents to register + WS-connect"
 for i in $(seq 1 60); do
@@ -121,13 +123,20 @@ docker exec "$A" sh -c 'chmod 600 /root/.ssh/id_e2e'
 docker exec "$A" tmux -S "$SOCK_A" new-window -t main: \
   "ssh -t -i /root/.ssh/id_e2e -o BatchMode=yes -o StrictHostKeyChecking=no $HOST_B 'sleep 3600'"
 # wait for the poller (every 2s) to arm @muxmesh-armed-win toward machine_b.
+# $2=="1" specifically: the poller writes 0 on non-armed windows, so $2!=""
+# would match immediately on the initial bash window and exit too early.
 ARMED=""
 for i in $(seq 1 30); do
-  ARMED=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a -F '#{window_id} #{@muxmesh-armed-win}' | awk '$2!=""{print $1; exit}')
+  ARMED=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a -F '#{window_id} #{@muxmesh-armed-win}' | awk '$2=="1"{print $1; exit}')
   [ -n "$ARMED" ] && break
   sleep 0.5
 done
 echo "  armed window: ${ARMED:-NONE}"
+# focus the ssh window: bar-toggle reads the CURRENT window's armed state via
+# display -p. select-window works without an attached client (verified tmux 3.3a).
+# The poller arms @muxmesh-armed-win every 2s; we already waited for it above.
+docker exec "$A" tmux -S "$SOCK_A" select-window -t "$ARMED"
+sleep 1
 docker exec "$A" ps -eo pid,ppid,args | grep "[s]sh $HOST_B" || echo "  WARN: no live ssh $HOST_B"
 
 log "PRE: both bars visible (status on), parent prefix intact"
@@ -138,63 +147,54 @@ P0=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 [ "$P0" != "None" ] && ok "press0: $HOST_A prefix intact (LOCAL, '$P0')" || bad "press0: $HOST_A prefix already None"
 
 log "PRESS 1 (delegate control: bar-toggle in $HOST_A, armed ssh toward $HOST_B)"
-docker exec "$A" sh -c "MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
+# MUXMESH_HOST is required: inside the container, hostname -s returns the
+# container id (9e079a56cb5c), not machine_a -> the hub rejects POST /cmd 401.
+docker exec "$A" sh -c "MUXMESH_HOST=$HOST_A MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 1
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "off" "press1: $HOST_A bar hidden"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on"  "press1: $HOST_B bar shown (BarShow)"
-# control delegated: parent prefix None (tmux-remote toggle_on). F10 stays
-# bound in root AND off tables — the parent is asleep (client table off), not
-# deaf: a press that comes back to us reclaims locally.
+# control delegated: parent prefix None AND F10 unbound in root — the ONLY
+# guard that stops the parent from stealing press 2 (MacBook regression proved
+# switch-client -T off does not protect the keystroke path). Press 2 must
+# traverse ssh into the child; reclaim returns over the hub (ParentReclaim).
 P1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 assert_eq "$P1" "None" "press1: $HOST_A control DELEGATED (prefix None)"
-docker exec "$A" tmux -S "$SOCK_A" list-keys -T off | grep -q F10 \
-  && ok "press1: $HOST_A F10 bound in table off (asleep, reclaim reachable)" \
-  || bad "press1: $HOST_A no F10 in table off — parent cannot reclaim"
-# headless harness: switch-client -T off fails with 'no current client' (no
-# attached client), so delegated state = prefix None + F10 bound in off table.
-# switch-client is a no-op there; on real machines it puts the client to sleep.
+docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
+  && bad "press1: $HOST_A still binds root F10 — it would steal press 2" \
+  || ok "press1: $HOST_A root F10 unbound (parent deaf, press-2 belongs to child)"
 
-log "WORKFLOW USER: presse1 -> fenêtre chez B -> presse2 -> fenêtre chez A"
-# fenêtre chez l'enfant PENDANT la délégation : le focus clavier est dans le
-# ssh, donc tmux -t touche bien la session machine_b (session nommée créée par
-# l'sshd sur SOCK_B). Compte initial pris AVANT pour compter les +1.
+log "WORKFLOW USER: presse1 -> fenetre chez B -> presse2 chez B -> fenetre chez A"
+# fenetre chez l'enfant PENDANT la delegation (le focus clavier est dans le ssh).
 WB0=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
 docker exec "$B" tmux -S "$SOCK_B" new-window -t main:
 sleep 1
 WB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
-[ "$WB1" -eq "$((WB0+1))" ] && ok "child: fenêtre créée pendant délégation ($WB0->$WB1)" || bad "child: pas de nouvelle fenêtre chez $HOST_B ($WB0->$WB1)"
+[ "$WB1" -eq "$((WB0+1))" ] && ok "child: fenetre creee pendant delegation ($WB0->$WB1)" || bad "child: pas de nouvelle fenetre chez $HOST_B ($WB0->$WB1)"
 
-# presse 2 au parent (ssh quitté ou enfant sourd) : reclaim local.
-docker exec "$A" sh -c "MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
-sleep 1
+# PRESSE 2 CHEZ L'ENFANT (le keystroke traverse le ssh, parent sourd = unbind) :
+# l'enfant masque sa barre et repond ParentReclaim via le hub.
+docker exec "$B" sh -c "MUXMESH_HOST=$HOST_B MUXMESH_SOCKET=$SOCK_B MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
+sleep 2
+assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "off" "press2: $HOST_B bar hidden (child answers press 2)"
+assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on"  "press2: $HOST_A bar restored (ParentReclaim via hub)"
 P2=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
-[ "$P2" != "None" ] && ok "press2-local: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2-local: prefix still None — parent stuck"
-assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on" "press2-local: $HOST_A bar restored (local reclaim)"
+[ "$P2" != "None" ] && ok "press2: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2: prefix still None — parent stuck"
 docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
-  && ok "press2-local: $HOST_A F10 still bound (safety ring)" \
-  || bad "press2-local: $HOST_A F10 gone — no future toggle"
+  && ok "press2: $HOST_A F10 rebound (safety ring restored)" \
+  || bad "press2: $HOST_A F10 still unbound — parent deaf forever"
 
-# le parent a récupéré le clavier : une nouvelle fenêtre doit atterrir chez A.
+# une-seule-barre : pendant la delegation l'enfant a la sienne allumee, le parent eteinte.
+# apres reclaim c'est l'inverse. Verifie ici : bar A on, bar B off = une seule barre.
+BA=$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')
+BB=$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')
+[ "$BA" = "on" ] && [ "$BB" = "off" ] && ok "one-bar: A=$BA B=$BB (exactement une barre)" || bad "one-bar: A=$BA B=$BB — deux barres ou zero"
+
+# le parent a recupere le clavier : une nouvelle fenetre doit atterrir chez A.
 WA0=$(docker exec "$A" tmux -S "$SOCK_A" list-windows | wc -l | tr -d ' ')
 docker exec "$A" tmux -S "$SOCK_A" new-window
 sleep 1
 WA1=$(docker exec "$A" tmux -S "$SOCK_A" list-windows | wc -l | tr -d ' ')
-[ "$WA1" -eq "$((WA0+1))" ] && ok "parent: fenêtre créée après reclaim ($WA0->$WA1)" || bad "parent: pas de nouvelle fenêtre chez $HOST_A ($WA0->$WA1)"
-
-log "PRESS 3 INSIDE machine_b (réseau: child answers ParentReclaim, bonus si child équipé)"
-# the F10 is machine_b's own binding (muxmesh.tmux sourced there too); in the
-# harness we invoke bar-toggle against SOCK_B, exactly what tmux would run.
-docker exec "$B" sh -c "MUXMESH_SOCKET=$SOCK_B MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
-sleep 2
-assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "off" "press3: $HOST_B bar hidden (child local toggle)"
-# the child answered ParentReclaim over the hub; machine_a's agent applied it:
-assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on"  "press3: $HOST_A bar restored (ParentReclaim via hub)"
-# control reclaimed: parent prefix NOT None + F10 rebound (safety ring works).
-P3=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
-[ "$P3" != "None" ] && ok "press3: $HOST_A control RECLAIMED (prefix '$P3')" || bad "press3: prefix still None — parent stuck without keyboard"
-docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
-  && ok "press3: $HOST_A F10 rebound (safety ring restored)" \
-  || bad "press3: $HOST_A F10 still unbound — parent deaf forever"
+[ "$WA1" -eq "$((WA0+1))" ] && ok "parent: fenetre creee apres reclaim ($WA0->$WA1)" || bad "parent: pas de nouvelle fenetre chez $HOST_A ($WA0->$WA1)"
 
 log "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

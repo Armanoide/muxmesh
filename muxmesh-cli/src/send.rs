@@ -283,17 +283,24 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     return 1;
                 }
                 // child is live: hide local bar, then hand the keyboard over —
-                // tmux-remote's exact mechanism (toggle_on.sh): prefix None +
-                // switch-client -T off. The F10 root binding STAYS: while the
-                // client sits in table `off`, keystrokes route to it, so a press
-                // that comes back to us (ssh exited, or the child is deaf) still
-                // reaches bar-toggle — the reclaim branch below. No unbind: an
-                // unbound parent can only be reclaimed over the network, and if
-                // the child lacks muxmesh the user is stranded forever (observed).
+                // tmux-remote's exact mechanism (verified 100% by its users):
+                // prefix None + UNBIND F10 here, so the parent becomes deaf to it
+                // and press 2 travels ssh into the CHILD's tmux, whose own F10
+                // binding runs bar-toggle on the child (local branch). The child
+                // then answers BarHide over the hub WS; our agent applies it —
+                // prefix restored + F10 rebound + bar on — and control is back.
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
+                muxmesh_core::poll::run_tmux(&base, &["unbind-key", "-n", "F10"]);
+                // TRACE: confirm in the log that BOTH deafness steps were issued,
+                // with what tmux answered (unbind of an existing binding = exit 0).
+                let unbind_ok = muxmesh_core::poll::tmux_out(&base, &["list-keys", "-T", "root"])
+                    .map(|k| !k.contains("F10"))
+                    .unwrap_or(false);
+                tracing::info!(
+                    "bar-toggle: DEAFNESS applied — F10 unbound confirmed={unbind_ok} ts={t0}"
+                );
                 let cut =
                     muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "None"]);
-                let slept = muxmesh_core::poll::tmux_run(&base, &["switch-client", "-T", "off"]);
                 // ECC P0: never claim DELEGATED without re-reading tmux — a
                 // silently failed prefix cut would leave control undelegated.
                 let now = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
@@ -302,7 +309,10 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 if !cut || !now {
                     // rollback: the keyboard never left the parent's hands.
                     muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
-                    muxmesh_core::poll::run_tmux(&base, &["switch-client", "-T", "root"]);
+                    muxmesh_core::poll::run_tmux(
+                        &base,
+                        &["bind-key", "-n", "F10", "run-shell", &f10_cmd()],
+                    );
                     muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
                     tracing::error!(
                         "bar-toggle: prefix move FAILED — rolled back, parent keeps control"
@@ -310,29 +320,22 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     println!("muxmesh: delegation FAILED (prefix cut refused) — parent keeps the keyboard");
                     return 1;
                 }
-                tracing::info!(
-                    "bar-toggle: DELEGATED ts={t0} — prefix None, client table off (F10 binding kept for local reclaim), sleep={slept}"
-                );
-                println!("muxmesh: control DELEGATED to {h} — press F10 again to reclaim");
+                println!("muxmesh: control DELEGATED to {h} — press F10 again (child) to reclaim");
                 0
             } else {
-                // press 2 RECLAIM, local (tmux-remote's toggle_off.sh): F10
-                // landed back on the PARENT — either the ssh was exited or the
-                // child has no F10 binding. Reclaim without the network: prefix
-                // unset + client back in root table + bar on. The keystroke
-                // reached us through the off-table F10 binding, so recovery never
-                // depends on the child or the hub. Double-fire is harmless: the
-                // second pass sees prefix restored and toggles the bar only.
-                muxmesh_core::poll::run_tmux(&base, &["set-option", "-gu", "prefix"]);
-                muxmesh_core::poll::run_tmux(&base, &["switch-client", "-T", "root"]);
-                muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
-                let back = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-                    .map(|o| o.trim() != "None")
-                    .unwrap_or(false);
+                // press 2 arriving HERE means F10 fired on the PARENT while it
+                // should have been deaf (prefix None + F10 unbound). Observed on
+                // the real MacBook: a no-prefix F10 binding kept double-firing
+                // (4 presses in 9s for 2 physical ones), so while delegated the
+                // parent must NOT act on keystrokes at all — press 2 belongs to
+                // the child. This branch now only self-heals stale state (e.g.
+                // the user ran bar-toggle by hand); it changes nothing visible.
                 tracing::info!(
-                    "bar-toggle: RECLAIMED local ts={t0} — prefix unset confirmed={back}, table root, bar on"
+                    "bar-toggle: PARENT press 2 while delegated — ignored (press 2 belongs to the child)"
                 );
-                println!("muxmesh: control RECLAIMED from {h} (local)");
+                println!(
+                    "muxmesh: delegated to {h} — press F10 inside the remote session to reclaim"
+                );
                 0
             }
         }

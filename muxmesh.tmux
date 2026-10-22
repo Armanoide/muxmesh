@@ -55,8 +55,10 @@ tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-option -g prefix2 C-b
 # the recovery path, so a deaf parent can never strand the user.
 CMD="$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1"
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T root -n F10 run-shell "$CMD"
-# table off: tmux auto-creates it on bind; bar-toggle switch-client -T off
-# puts the client to sleep there, where F10 still wakes it (local reclaim).
+# table off: defense in depth only. The REAL guard against the parent stealing
+# press 2 is send.rs unbind-key -n F10 (delegated): switch-client protects
+# the attached client, not the keystroke path — with root F10 alive the press
+# never traverses ssh and the child bar never hides (MacBook regression).
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T off -n F10 run-shell "$CMD"
 # NOTE: tmux's own bind-key takes ONE argument for the command — do NOT write
 # `bind-key run-shell "..."` unquoted, word splitting makes run-shell see

@@ -219,10 +219,11 @@ impl Command {
                 "muxmesh-cli".to_string()
             };
             let cmd = format!("{cli} bar-toggle -v >>$HOME/.muxmesh/bar-toggle.log 2>&1");
-            let steps: [(&str, Vec<&str>); 4] = [
-                ("bind-key", vec!["-n", "F10", "run-shell", &cmd]),
+            // rebind EXACTLY as muxmesh.tmux did (table root, -T root) so the
+            // restored binding is byte-identical to the tpm one.
+            let steps: [(&str, Vec<&str>); 3] = [
+                ("bind-key", vec!["-T", "root", "-n", "F10", "run-shell", &cmd]),
                 ("set-option", vec!["-gu", "prefix"]),
-                ("switch-client", vec!["-T", "root"]),
                 ("set-option", vec!["-g", "status", "on"]),
             ];
             let mut all_ok = true;
@@ -234,7 +235,7 @@ impl Command {
                     .output()
                     .map_err(|e| format!("spawn tmux {verb}: {e}"))?;
                 eprintln!(
-                    "muxmesh-agent: exec ts={} verb={verb} target=F10/prefix/status ok={}",
+                    "muxmesh-agent: exec ts={} verb={verb} ok={}",
                     now_unix(),
                     out.status.success()
                 );
@@ -246,6 +247,15 @@ impl Command {
                     }
                 }
             }
+            // switch-client -T root is best-effort: headless servers (no attached
+            // client) answer "no current client" — the keyboard path does not run
+            // there at all, so failing must not mark the reclaim as failed.
+            let woke = Proc::new("tmux")
+                .arg("-S")
+                .arg(socket)
+                .args(["switch-client", "-T", "root"])
+                .output();
+            tracing::debug!("reclaim: switch-client -T root ok={}", woke.map(|o| o.status.success()).unwrap_or(false));
             return if all_ok {
                 Ok(())
             } else {
