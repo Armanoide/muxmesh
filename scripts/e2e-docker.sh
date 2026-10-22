@@ -171,6 +171,44 @@ sleep 1
 WB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
 [ "$WB1" -eq "$((WB0+1))" ] && ok "child: fenetre creee pendant delegation ($WB0->$WB1)" || bad "child: pas de nouvelle fenetre chez $HOST_B ($WB0->$WB1)"
 
+# ============================================================================
+# CHEMINS CRITIQUES (définition utilisateur — à vérifier ABSOLUMENT à chaque
+# run E2E, bloquants : si l'un tombe, le test doit FAIL).
+#
+# CHEMIN CRITIQUE 1 — UNE SEULE BARRE VISIBLE :
+#   - F10 (presse 1) => la barre de l'ENFANT s'affiche SEULE
+#     (barre parent eteinte, barre enfant allumee) => A=off B=on
+#   - F10 (presse 2) => la barre du PARENT s'affiche SEULE
+#     (barre enfant eteinte, barre parent allumee) => A=on B=off
+#   Jamais deux barres, jamais zero barre, a aucun moment.
+#
+# CHEMIN CRITIQUE 2 — DELEGATE CONTROL :
+#   - F10 (presse 1) => l'ENFANT a le control : prefix+c cree une fenetre
+#     CHEZ L'ENFANT (et seulement chez l'enfant).
+#   - F10 (presse 2) => le PARENT recupere le control : prefix+c cree une
+#     fenetre CHEZ LE PARENT (et seulement chez le parent).
+# ============================================================================
+
+log "CHEMIN CRITIQUE 1: une seule barre visible (A=off/B=on apres presse1)"
+# apres presse1 : l'enfant a la sienne allumee, le parent eteinte = une seule.
+C1A=$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')
+C1B=$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')
+[ "$C1A" = "off" ] && [ "$C1B" = "on" ] \
+  && ok "CRIT1: une seule barre apres presse1 (A=$C1A B=$C1B = enfant seul)" \
+  || bad "CRIT1: PRESSE1 doit donner A=off B=on (enfant seul) — got A=$C1A B=$C1B"
+
+log "CHEMIN CRITIQUE 2: delegate control (fenetre chez l'enfant pendant delegation)"
+# le parent est sourd (prefix None + F10 unbound) : prefix+c doit creer chez B.
+C2WB0=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
+C2WA0=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
+docker exec "$B" tmux -S "$SOCK_B" new-window -t main:
+sleep 1
+C2WB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
+C2WA1=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
+[ "$C2WB1" -eq "$((C2WB0+1))" ] && [ "$C2WA1" -eq "$C2WA0" ] \
+  && ok "CRIT2: presse1 -> fenetre creee CHEZ L'ENFANT seulement (B $C2WB0->$C2WB1, A stable $C2WA0)" \
+  || bad "CRIT2: presse1 = control chez l'enfant — fenetre doit atterrir chez B seulement (B $C2WB0->$C2WB1 A $C2WA0->$C2WA1)"
+
 # PRESSE 2 CHEZ L'ENFANT (le keystroke traverse le ssh, parent sourd = unbind) :
 # l'enfant masque sa barre et repond ParentReclaim via le hub.
 docker exec "$B" sh -c "MUXMESH_HOST=$HOST_B MUXMESH_SOCKET=$SOCK_B MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
@@ -183,18 +221,25 @@ docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
   && ok "press2: $HOST_A F10 rebound (safety ring restored)" \
   || bad "press2: $HOST_A F10 still unbound — parent deaf forever"
 
-# une-seule-barre : pendant la delegation l'enfant a la sienne allumee, le parent eteinte.
-# apres reclaim c'est l'inverse. Verifie ici : bar A on, bar B off = une seule barre.
-BA=$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')
-BB=$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')
-[ "$BA" = "on" ] && [ "$BB" = "off" ] && ok "one-bar: A=$BA B=$BB (exactement une barre)" || bad "one-bar: A=$BA B=$BB — deux barres ou zero"
+log "CHEMIN CRITIQUE 1 (retour): une seule barre visible (A=on/B=off apres presse2)"
+# apres presse2 : le parent a la sienne allumee, l'enfant eteinte = une seule.
+C1rA=$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')
+C1rB=$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')
+[ "$C1rA" = "on" ] && [ "$C1rB" = "off" ] \
+  && ok "CRIT1: une seule barre apres presse2 (A=$C1rA B=$C1rB = parent seul)" \
+  || bad "CRIT1: PRESSE2 doit donner A=on B=off (parent seul) — got A=$C1rA B=$C1rB"
 
-# le parent a recupere le clavier : une nouvelle fenetre doit atterrir chez A.
-WA0=$(docker exec "$A" tmux -S "$SOCK_A" list-windows | wc -l | tr -d ' ')
+log "CHEMIN CRITIQUE 2 (retour): parent reprend le control (fenetre chez le parent)"
+# le parent a recupere prefix + F10 : prefix+c doit creer chez A, pas chez B.
+C2WA2=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
+C2WB2=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
 docker exec "$A" tmux -S "$SOCK_A" new-window
 sleep 1
-WA1=$(docker exec "$A" tmux -S "$SOCK_A" list-windows | wc -l | tr -d ' ')
-[ "$WA1" -eq "$((WA0+1))" ] && ok "parent: fenetre creee apres reclaim ($WA0->$WA1)" || bad "parent: pas de nouvelle fenetre chez $HOST_A ($WA0->$WA1)"
+C2WA3=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
+C2WB3=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
+[ "$C2WA3" -eq "$((C2WA2+1))" ] && [ "$C2WB3" -eq "$C2WB2" ] \
+  && ok "CRIT2: presse2 -> fenetre creee CHEZ LE PARENT seulement (A $C2WA2->$C2WA3, B stable $C2WB2)" \
+  || bad "CRIT2: presse2 = control chez le parent — fenetre doit atterrir chez A seulement (A $C2WA2->$C2WA3 B $C2WB2->$C2WB3)"
 
 log "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
