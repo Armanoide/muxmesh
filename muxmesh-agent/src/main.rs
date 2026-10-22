@@ -38,10 +38,17 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_MISSED_PONGS: u64 = 2;
 
 /// Live local tmux? sessions + active window per session.
-/// Returns (armed, sessions).
-fn scan_tmux() -> (bool, Vec<RemoteSession>) {
+/// Returns (armed, sessions). `socket` is the agent's configured tmux socket
+/// ("" = tmux default); when set it is passed as -S so the agent scans its
+/// own server, not /tmp/tmux-<uid>/default. Without this the agent on a custom
+/// socket never sees its tmux and posts armed=false forever.
+fn scan_tmux(socket: &str) -> (bool, Vec<RemoteSession>) {
     // tmux ls -> "sess: 3 windows (created ...)" per line, error if no server
-    let out = match Command::new("tmux")
+    let mut cmd = Command::new("tmux");
+    if !socket.is_empty() {
+        cmd.arg("-S").arg(socket);
+    }
+    let out = match cmd
         .args(["list-sessions", "-F", "#{session_name}\t#{session_windows}"])
         .output()
     {
@@ -57,7 +64,7 @@ fn scan_tmux() -> (bool, Vec<RemoteSession>) {
         if name.is_empty() {
             continue;
         }
-        let active = active_window(&name);
+        let active = active_window(socket, &name);
         sessions.push(RemoteSession {
             name,
             windows,
@@ -68,8 +75,12 @@ fn scan_tmux() -> (bool, Vec<RemoteSession>) {
 }
 
 /// name of the active window of a local tmux session.
-fn active_window(session: &str) -> String {
-    let out = Command::new("tmux")
+fn active_window(socket: &str, session: &str) -> String {
+    let mut cmd = Command::new("tmux");
+    if !socket.is_empty() {
+        cmd.arg("-S").arg(socket);
+    }
+    let out = cmd
         .args([
             "list-windows",
             "-t",
@@ -115,8 +126,8 @@ fn push(url: &str, host: &str, token: &str, state: &HostState) -> bool {
 }
 
 /// The payload is built with muxmesh-core (state.rs) -> same contract as the hub.
-fn build_state(host: &str) -> HostState {
-    let (armed, sessions) = scan_tmux();
+fn build_state(host: &str, socket: &str) -> HostState {
+    let (armed, sessions) = scan_tmux(socket);
     HostState {
         host: host.to_string(),
         armed,
@@ -167,7 +178,7 @@ async fn main() {
             let mut last = (false, usize::MAX);
             loop {
                 let token = muxmesh_core::read_token();
-                let state = build_state(&cfg.host);
+                let state = build_state(&cfg.host, &resolve_socket(&cfg));
                 let ok = push(&cfg.url(), &cfg.host, token.as_str(), &state);
                 tracing::debug!(
                     "armed={} sessions={} push={}",
@@ -479,7 +490,7 @@ mod tests {
 
     #[test]
     fn build_state_has_host_and_seen() {
-        let s = build_state("host-a");
+        let s = build_state("host-a", "");
         assert_eq!(s.host, "host-a");
         // seen = now_unix() -> recent; scan_tmux depends on real tmux (may be absent here).
         assert!(s.seen > 1_700_000_000);
@@ -487,7 +498,7 @@ mod tests {
 
     #[test]
     fn payload_roundtrips_through_core_contract() {
-        let s = build_state("host-b");
+        let s = build_state("host-b", "");
         let json = serde_json::to_vec(&s).unwrap();
         let back: muxmesh_core::HostState = serde_json::from_slice(&json).unwrap();
         assert_eq!(s, back);

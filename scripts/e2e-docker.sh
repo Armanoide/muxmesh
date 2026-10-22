@@ -70,12 +70,12 @@ done
 log "agents (each = its own tmux server)"
 docker run -d --name "$MINI" --network "$NET" \
   -e MUXMESH_HOST=mac_mini -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
-  -e MUXMESH_TMUX_SOCKET="$SOCK_MINI" -e RUST_LOG=debug \
+  -e MUXMESH_TMUX_SOCKET="$SOCK_MINI" -e MUXMESH_SOCKET="$SOCK_MINI" -e RUST_LOG=debug \
   "$IMAGE" sh -c "tmux -S $SOCK_MINI new-session -d -s main; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_MINI' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; muxmesh-agent" >/dev/null
 
 docker run -d --name "$MBP" --network "$NET" \
   -e MUXMESH_HOST=macbook -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
-  -e MUXMESH_TMUX_SOCKET="$SOCK_MBP" -e RUST_LOG=debug \
+  -e MUXMESH_TMUX_SOCKET="$SOCK_MBP" -e MUXMESH_SOCKET="$SOCK_MBP" -e RUST_LOG=debug \
   "$IMAGE" sh -c "tmux -S $SOCK_MBP new-session -d -s main; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_MBP' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; muxmesh-agent" >/dev/null
 
 log "wait for both agents to register + WS-connect"
