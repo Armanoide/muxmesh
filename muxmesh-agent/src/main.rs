@@ -416,10 +416,11 @@ fn dispatch_command(cfg: &muxmesh_core::AgentConfig, host: &str, text: &str) -> 
         return None;
     }
     tracing::info!(
-        "ws: command id={} src={} cmd={:?}",
+        "ws: command id={} src={} cmd={:?} ts={}",
         env.id,
         env.src,
-        env.cmd
+        env.cmd,
+        now_unix()
     );
 
     let ack = if env.v != 1 {
@@ -434,9 +435,17 @@ fn dispatch_command(cfg: &muxmesh_core::AgentConfig, host: &str, text: &str) -> 
         // socket — name them in the trace.
         let affected = tmux_sessions(&socket);
         tracing::info!("ws: executing on socket={socket} — affects: {affected}");
+        // TRACE (diagnostic MacBook): état AVANT/Après reclaim, horodaté —
+        // on saura si le parent a bien reçu et appliqué ParentReclaim.
+        let before = tmux_prefix_and_status(&socket);
         match env.cmd.execute(&socket) {
             Ok(()) => {
-                tracing::info!("ws: done id={} ok", env.id);
+                let after = tmux_prefix_and_status(&socket);
+                tracing::info!(
+                    "ws: done id={} ok — state {before} -> {after} ts={}",
+                    env.id,
+                    now_unix()
+                );
                 Ack::ok(env.v, &env.id)
             }
             Err(e) => {
@@ -466,6 +475,26 @@ fn resolve_socket(cfg: &muxmesh_core::AgentConfig) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cfg.tmux_socket.clone())
+}
+
+/// prefix+status of a socket in one line, for the before/after reclaim trace.
+fn tmux_prefix_and_status(socket: &str) -> String {
+    let get = |args: &[&str]| -> String {
+        std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(socket)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "?".into())
+    };
+    format!(
+        "prefix={} status={}",
+        get(&["show-options", "-gv", "prefix"]),
+        get(&["show-options", "-gv", "status"])
+    )
 }
 
 /// Human-readable list of sessions on a socket, for the exec trace.

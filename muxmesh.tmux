@@ -35,6 +35,18 @@ CLI="$CURRENT_DIR/bin/muxmesh-cli"
 # "#[cell]..." noise on the status line; keep tmux's view clean.
 tmux run-shell "mkdir -p $HOME/.muxmesh"
 
+# TRACE (diagnostic double-fire MacBook): `prefix2` is unused, so we borrow it
+# as a keystroke probe. prefix2 C-b means: first C-b lands in table prefix2,
+# we log the key that FOLLOWS with millisecond timestamps, then bounce to
+# root. Read keys.log after pressing C-b then F10 twice:
+#   - 2 KEY lines for 2 physical F10 = terminal is innocent, logic bug here
+#   - 4 KEY lines = the MacBook terminal sends F10 twice (ESC O P + ESC [21~)
+# shortcut: diagnostic only — remove once the double-fire is settled.
+tmux bind-key -T prefix2 -n F10 "\
+  run-shell 'printf \"KEY %s F10\\n\" \"\$(date +%H:%M:%S)\" >> \$HOME/.muxmesh/keys.log'; \
+  switch-client -T root"
+tmux set-option -g prefix2 C-b
+
 # F10 here is the LOCAL/parent binding. In delegated mode bar-toggle UNBINDS
 # it and cuts the prefix to None (tmux-remote's exact mechanism): the parent
 # goes fully deaf, press 2 traverses ssh into the child's tmux, and the child

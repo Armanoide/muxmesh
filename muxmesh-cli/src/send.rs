@@ -179,8 +179,15 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         .ok()
         .filter(|s| !s.is_empty());
     let base = muxmesh_core::poll::tmux_base(&socket);
+    // TRACE: millisecond timestamp + PID of every invocation, so the log shows
+    // if ONE physical F10 fires bar-toggle TWICE (double-fire MacBook).
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     tracing::info!(
-        "bar-toggle: start (hub={}, socket={:?})",
+        "bar-toggle: START ts={t0} pid={} (hub={}, socket={:?})",
+        std::process::id(),
         cfg.poll_hub,
         socket
     );
@@ -284,6 +291,14 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                 // prefix restored + F10 rebound + bar on — and control is back.
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
                 muxmesh_core::poll::run_tmux(&base, &["unbind-key", "-n", "F10"]);
+                // TRACE: confirm in the log that BOTH deafness steps were issued,
+                // with what tmux answered (unbind of an existing binding = exit 0).
+                let unbind_ok = muxmesh_core::poll::tmux_out(&base, &["list-keys", "-T", "root"])
+                    .map(|k| !k.contains("F10"))
+                    .unwrap_or(false);
+                tracing::info!(
+                    "bar-toggle: DEAFNESS applied — F10 unbound confirmed={unbind_ok} ts={t0}"
+                );
                 let cut =
                     muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "None"]);
                 // ECC P0: never claim DELEGATED without re-reading tmux — a
@@ -337,7 +352,7 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
         None => {
             let next = if hidden_now { "on" } else { "off" };
             tracing::info!(
-                "bar-toggle: CHILD/local branch — no armed ssh here, toggling THIS server's bar -> status {next}"
+                "bar-toggle: CHILD/local branch ts={t0} — no armed ssh here, toggling THIS server's bar -> status {next}"
             );
             // tmux redraws the bar by itself after set status — no refresh-client.
             muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", next]);
