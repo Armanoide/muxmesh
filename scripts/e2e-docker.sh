@@ -33,7 +33,11 @@ cleanup() {
 trap cleanup EXIT
 
 log "build image $IMAGE"
-docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
+if docker image inspect "$IMAGE" >/dev/null 2>&1 && [ "${SKIP_BUILD:-0}" = "1" ]; then
+  echo "  skipped (image exists, SKIP_BUILD=1)"
+else
+  docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
+fi
 
 log "network + hub"
 docker network create "$NET" >/dev/null 2>&1 || true
