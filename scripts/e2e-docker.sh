@@ -183,6 +183,7 @@ WB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
 #   Jamais deux barres, jamais zero barre, a aucun moment.
 #
 # CHEMIN CRITIQUE 2 — DELEGATE CONTROL :
+#   - BASE (non délégué) => prefix+c cree une fenetre CHEZ LE PARENT seulement.
 #   - F10 (presse 1) => l'ENFANT a le control : prefix+c cree une fenetre
 #     CHEZ L'ENFANT (et seulement chez l'enfant).
 #   - F10 (presse 2) => le PARENT recupere le control : prefix+c cree une
@@ -240,6 +241,20 @@ C2WB3=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
 [ "$C2WA3" -eq "$((C2WA2+1))" ] && [ "$C2WB3" -eq "$C2WB2" ] \
   && ok "CRIT2: presse2 -> fenetre creee CHEZ LE PARENT seulement (A $C2WA2->$C2WA3, B stable $C2WB2)" \
   || bad "CRIT2: presse2 = control chez le parent — fenetre doit atterrir chez A seulement (A $C2WA2->$C2WA3 B $C2WB2->$C2WB3)"
+
+log "CHEMIN CRITIQUE 2 (BASE): control local -> fenetre chez le PARENT seulement"
+# le parent tient a nouveau prefix+c (control local, non delegue) : une fenetre
+# creee ici doit atterrir CHEZ LE PARENT seulement (A +1, B stable). C'est le
+# cas de base de CRIT2, verifie ici sans perturber la delegation (apres presse2).
+C2bWA0=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
+C2bWB0=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
+docker exec "$A" tmux -S "$SOCK_A" new-window
+sleep 1
+C2bWA1=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
+C2bWB1=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
+[ "$C2bWA1" -eq "$((C2bWA0+1))" ] && [ "$C2bWB1" -eq "$C2bWB0" ] \
+  && ok "CRIT2-base: prefix+c -> fenetre CHEZ LE PARENT seulement (A $C2bWA0->$C2bWA1, B stable $C2bWB0)" \
+  || bad "CRIT2-base: control local = fenetre chez le parent seulement (A $C2bWA0->$C2bWA1 B $C2bWB0->$C2bWB1)"
 
 log "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
