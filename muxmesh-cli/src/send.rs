@@ -118,42 +118,69 @@ fn armed_host_of_current_window(cfg: &muxmesh_core::HubConfig) -> Option<String>
     let wid = muxmesh_core::poll::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
     let wid = wid.trim().to_string();
     let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
-    tracing::debug!(
-        "armed-host: hub {} -> {} host(s): {:?}",
-        cfg.poll_hub,
-        doc.hosts.len(),
-        doc.hosts
-            .iter()
-            .map(|(h, s)| format!(
-                "{h}:armed={}:seen={}s",
-                s.armed,
-                muxmesh_core::now_unix().saturating_sub(s.seen)
-            ))
-            .collect::<Vec<_>>()
-    );
-    let h = match muxmesh_core::poll::window_ssh_host(&base, &wid) {
-        Some(h) => h,
-        None => {
-            tracing::debug!("window {wid}: no live ssh client found in its panes");
+
+    // LIVE scan first: pane pids -> ssh target. This is the precise answer
+    // and it also yields the host name needed for BarShow/BarHide routing.
+    if let Some(h) = muxmesh_core::poll::window_ssh_host(&base, &wid) {
+        tracing::debug!("armed-host: live ssh target in window {wid} = '{h}'");
+        if !muxmesh_core::valid_host(&h) {
+            tracing::debug!("window {wid}: ssh target '{h}' rejected by valid_host");
             return None;
         }
-    };
-    tracing::debug!("armed-host: live ssh target in window {wid} = '{h}'");
-    if !muxmesh_core::valid_host(&h) {
-        tracing::debug!("window {wid}: ssh target '{h}' rejected by valid_host");
-        return None;
-    }
-    if doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
-        tracing::debug!("armed-host: '{h}' armed+fresh on hub -> ARMED");
-        Some(h)
-    } else {
+        if doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
+            tracing::debug!("armed-host: '{h}' armed+fresh on hub -> ARMED");
+            return Some(h);
+        }
         let known: Vec<&String> = doc.hosts.keys().collect();
         tracing::debug!(
             "ssh target '{h}' not armed on hub (known hosts: {known:?}; hub={})",
             cfg.poll_hub
         );
-        None
+        return None;
     }
+
+    // Badge fallback: the embedded poller armed this window by pane scan every
+    // interval and wrote @muxmesh-armed-win=1 + '@muxmesh-status  REMOTE <host> '.
+    // If OUR live scan missed the ssh (deep process tree: zsh -> node -> ssh
+    // exceeds the depth cap; observed prod MacBook: press 1 fell to local
+    // toggle, never delegated -> 'control never returns'), trust the badge and
+    // recover the host name from @muxmesh-status so BarShow still routes.
+    let badge = muxmesh_core::poll::tmux_out(
+        &base,
+        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-armed-win"],
+    )
+    .map(|o| o.trim() == "1")
+    .unwrap_or(false);
+    if !badge {
+        tracing::debug!("window {wid}: no live ssh and badge not armed -> None");
+        return None;
+    }
+    let status = muxmesh_core::poll::tmux_out(
+        &base,
+        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-status"],
+    )
+    .unwrap_or_default();
+    // '@muxmesh-status' format is exactly " REMOTE <host> " (poll.rs).
+    let host = status
+        .trim()
+        .strip_prefix("REMOTE ")
+        .map(|r| r.trim().to_string())
+        .filter(|h| muxmesh_core::valid_host(h))
+        .unwrap_or_default();
+    if host.is_empty() {
+        tracing::warn!(
+            "window {wid}: badge armed but @muxmesh-status '{status}' has no host -> None"
+        );
+        return None;
+    }
+    if !doc.host_armed(&host, muxmesh_core::now_unix(), cfg.ttl) {
+        tracing::debug!("badge host '{host}' not armed+fresh on hub -> None");
+        return None;
+    }
+    tracing::info!(
+        "window {wid}: live scan missed ssh, badge says armed -> trusting '{host}' (deep process tree)"
+    );
+    Some(host)
 }
 
 /// The exact run-shell command F10 must carry, for re-binding it after a
