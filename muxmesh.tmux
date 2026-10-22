@@ -35,33 +35,16 @@ CLI="$CURRENT_DIR/bin/muxmesh-cli"
 # "#[cell]..." noise on the status line; keep tmux's view clean.
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} run-shell "mkdir -p $HOME/.muxmesh"
 
-# TRACE (diagnostic double-fire MacBook): `prefix2` is unused, so we borrow it
-# as a keystroke probe. prefix2 C-b means: first C-b lands in table prefix2,
-# we log the key that FOLLOWS with millisecond timestamps, then bounce to
-# root. Read keys.log after pressing C-b then F10 twice:
-#   - 2 KEY lines for 2 physical F10 = terminal is innocent, logic bug here
-#   - 4 KEY lines = the MacBook terminal sends F10 twice (ESC O P + ESC [21~)
-# shortcut: diagnostic only — remove once the double-fire is settled.
-tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T prefix2 -n F10 "\
-  run-shell 'printf \"KEY %s F10\\n\" \"\$(date +%H:%M:%S)\" >> \$HOME/.muxmesh/keys.log'; \
-  switch-client -T root"
-tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-option -g prefix2 C-b
+# TRACE removed: the double-fire diagnostic (prefix2 probe) did its job and
+# is retired — F10 double-fire was terminal-side, settled.
 
-# F10 here is the LOCAL/parent binding. In delegated mode bar-toggle cuts the
-# prefix to None and moves the attached client to key table `off` (samoshkin's
-# canonical OFF mode): the parent is deaf to every keystroke EXCEPT F10, which
-# stays bound in table `off` below. Press 2 traverses ssh into the child's
-# tmux (child hides its bar and answers ParentReclaim over the hub), OR fires
-# this off-table binding directly on the parent — both paths restore prefix +
-# table root + bar. Nothing is ever unbound: the parent keeps its own escape
-# hatch, so control can never be stranded at the child.
+# F10 local/parent binding + the delegated-mode escape hatch (table `off`):
+# in OFF mode bar-toggle cuts the prefix to None and moves the client to
+# table `off`; F10 stays bound there, so the parent can always reclaim.
+# Nothing is ever unbound — control can never be stranded at the child.
 CMD="$CLI bar-toggle -v >>\$HOME/.muxmesh/bar-toggle.log 2>&1"
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T root -n F10 run-shell "$CMD"
-# table off: the delegated-mode escape hatch (see above). NOT defense in depth
-# against an unbound root F10 — nothing is unbound anymore.
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} bind-key -T off -n F10 run-shell "$CMD"
-# NOTE: tmux's own bind-key takes ONE argument for the command — do NOT write
-# `bind-key run-shell "..."` unquoted, word splitting makes run-shell see
-# several arguments ("too many arguments") -> tpm exits 1 (observed tmux 3.3a).
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-option -gu prefix2
 exit 0
 

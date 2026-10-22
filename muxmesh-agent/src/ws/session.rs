@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use muxmesh_core::{now_unix, Ack, CommandEnvelope};
+use muxmesh_core::{Ack, CommandEnvelope};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -148,13 +148,7 @@ pub fn dispatch_command(
         );
         return None;
     }
-    tracing::info!(
-        "ws: command id={} src={} cmd={:?} ts={}",
-        env.id,
-        env.src,
-        env.cmd,
-        now_unix()
-    );
+    tracing::info!("ws: command id={} src={} cmd={:?}", env.id, env.src, env.cmd);
 
     let ack = if env.v != 1 {
         Ack::err(env.v, &env.id, "unsupported v")
@@ -168,17 +162,11 @@ pub fn dispatch_command(
         // socket — name them in the trace.
         let affected = tmux_sessions(&socket);
         tracing::info!("ws: executing on socket={socket} — affects: {affected}");
-        // TRACE (diagnostic MacBook): état AVANT/Après reclaim, horodaté —
-        // on saura si le parent a bien reçu et appliqué ParentReclaim.
         let before = tmux_prefix_and_status(&socket);
         match env.cmd.execute(&socket) {
             Ok(()) => {
                 let after = tmux_prefix_and_status(&socket);
-                tracing::info!(
-                    "ws: done id={} ok — state {before} -> {after} ts={}",
-                    env.id,
-                    now_unix()
-                );
+                tracing::info!("ws: done id={} ok — state {before} -> {after}", env.id);
                 Ack::ok(env.v, &env.id)
             }
             Err(e) => {
