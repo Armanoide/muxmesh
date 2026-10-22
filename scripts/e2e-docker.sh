@@ -133,29 +133,28 @@ docker exec "$A" ps -eo pid,ppid,args | grep "[s]sh $HOST_B" || echo "  WARN: no
 log "PRE: both bars visible (status on), parent prefix intact"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on" "$HOST_B bar visible before test"
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on" "$HOST_A bar visible before test"
-# parent must start in LOCAL state: prefix is NOT None (control held by parent).
+# parent must start in LOCAL state: prefix is NOT M-a (control held by parent).
 P0=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
-[ "$P0" != "None" ] && ok "press0: $HOST_A prefix intact (LOCAL, '$P0')" || bad "press0: $HOST_A prefix already None"
+[ "$P0" != "M-a" ] && ok "press0: $HOST_A prefix intact (LOCAL, '$P0')" || bad "press0: $HOST_A prefix already M-a"
 
 log "PRESS 1 (delegate control: bar-toggle in $HOST_A, armed ssh toward $HOST_B)"
 docker exec "$A" sh -c "MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 1
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "off" "press1: $HOST_A bar hidden"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on"  "press1: $HOST_B bar shown (BarShow)"
-# control delegated: parent prefix must now be None and key-table muxmesh-remote.
+# control delegated: parent prefix must now be M-a (F10 stays a no-prefix
+# binding of the parent; C-b falls through to the child).
 P1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
-assert_eq "$P1" "None" "press1: $HOST_A control DELEGATED (prefix None)"
-KT1=$(docker exec "$A" tmux -S "$SOCK_A" display-message -p '#{key_table}' 2>/dev/null)
-echo "  (info) key-table after press1: ${KT1:-n/a}"
+assert_eq "$P1" "M-a" "press1: $HOST_A control DELEGATED (prefix M-a)"
 
 log "PRESS 2 (reclaim control: the step that failed on the real driver)"
 docker exec "$A" sh -c "MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 1
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on"  "press2: $HOST_A bar restored"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "off" "press2: $HOST_B bar hidden (BarHide)"
-# control reclaimed: parent prefix must NOT be None anymore (safety ring works).
+# control reclaimed: parent prefix must NOT be M-a anymore (safety ring works).
 P2=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
-[ "$P2" != "None" ] && ok "press2: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2: prefix still None — parent stuck without keyboard"
+[ "$P2" != "M-a" ] && ok "press2: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2: prefix still M-a — parent still delegated"
 
 log "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

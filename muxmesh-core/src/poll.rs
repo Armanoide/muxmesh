@@ -163,19 +163,6 @@ pub fn tmux_run(base: &[String], args: &[&str]) -> bool {
     }
 }
 
-/// The active client of this server as a switchc target (`name:idx`), if any.
-/// `switchc -T <table>` without `-t` fails with "no current client" on
-/// servers whose sessions were created headless (verified tmux 3.3a), so the
-/// delegation must target the client explicitly.
-pub fn client_active(base: &[String]) -> Option<String> {
-    tmux_out(
-        base,
-        &["display-message", "-p", "#{session_name}:#{window_index}"],
-    )
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty() && s != ":")
-}
-
 /// Run a tmux command, returning stdout on success (stderr captured for debug).
 pub fn tmux_out(base: &[String], args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(&base[0]);

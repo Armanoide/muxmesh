@@ -185,16 +185,13 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     tracing::debug!("bar-toggle: step 1 ok — window {wid}, bar-hidden={hidden_now}");
 
     // Delegated state of the PARENT: its own prefix, read from tmux (no flag).
-    // `prefix None` = control delegated to the child; any other value (C-b,
-    // C-a…) = parent holds control. Exact match so a custom prefix is never
-    // mistaken for delegated (ECC P2). Verified tmux 3.3a.
+    // `prefix M-a` = control delegated to the child (press 1 moved it there so
+    // F10 stays a no-prefix binding of the parent); anything else (C-b, C-a…)
+    // = parent holds control. Exact match so a custom prefix is never mistaken
+    // for delegated (ECC P2). Verified tmux 3.3a.
     let delegated = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-        .map(|o| o.trim() == "None")
+        .map(|o| o.trim() == "M-a")
         .unwrap_or(false);
-
-    // switchc needs an explicit client: -T alone fails with "no current
-    // client" on headless-created sessions (verified tmux 3.3a).
-    let client = muxmesh_core::poll::client_active(&base);
 
     let host = armed_host_of_current_window(cfg);
     tracing::info!(
@@ -205,11 +202,11 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
     // Parent/child roles are decided by the KEYSTROKE's server, not by us:
     // - F10 lands on the driver's server while an armed ssh has focus ->
     //   this server is the PARENT and OWNS BOTH BARS + the CONTROL: press 1
-    //   DELEGATES control to the child (prefix None + key-table muxmesh-remote,
-    //   hide local bar, BarShow remote), press 2 TAKES IT BACK (restore prefix +
-    //   key-table root, show local bar, BarHide remote). No send-keys echo: a
-    //   forwarded F10 would be handled by the child's own bar-toggle with ITS
-    //   state, which desyncs (observed: 2nd press re-hid the child).
+    //   DELEGATES control to the child (parent prefix -> M-a, hide local bar,
+    //   BarShow remote), press 2 TAKES IT BACK (restore prefix, show local bar,
+    //   BarHide remote). No send-keys echo: a forwarded F10 would be handled by
+    //   the child's own bar-toggle with ITS state, which desyncs (observed:
+    //   2nd press re-hid the child).
     // - F10 pressed inside the nested remote tmux traverses ssh and lands
     //   on the CHILD's server, where armed_host_of_current_window finds no
     //   outbound ssh -> local branch below (child-only toggle).
@@ -261,55 +258,46 @@ pub fn run_bar_toggle(cfg: &muxmesh_core::HubConfig) -> u8 {
                     println!("muxmesh: remote {h} unreachable — control NOT delegated (parent keeps the keyboard)");
                     return 1;
                 }
-                // child is live: hide local bar, then cut control (prefix None +
-                // key-table muxmesh-remote). F10 stays bound in that table, so the
-                // parent still intercepts press 2 (safety ring).
-                // shortcut: switchc only works with an ATTACHED client (headless =
-                // "no current client", verified 3.3a) — harmless: the key-table is
-                // cosmetic, prefix None is what actually delegates, and press 2 is
-                // detected by re-reading the prefix, not by table membership.
+                // child is live: hide local bar, then hand the keyboard over by
+                // MOVING the parent's prefix to M-a (never `None`). `prefix None`
+                // makes the parent deaf to EVERY key — F10 included — so press 2
+                // would land on the child and never come back (observed on the
+                // real MacBook). With prefix M-a, F10 stays a no-prefix binding of
+                // the parent (intercepted before the pane, verified 3.3a pty
+                // spike), C-b falls through to the child (its own tmux keeps it),
+                // and M-a stays the parent's emergency prefix if F10 ever fails.
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "off"]);
                 let cut =
-                    muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "None"]);
-                if let Some(c) = &client {
-                    muxmesh_core::poll::tmux_run(
-                        &base,
-                        &["switchc", "-t", c, "-T", "muxmesh-remote"],
-                    );
-                }
+                    muxmesh_core::poll::tmux_run(&base, &["set-option", "-g", "prefix", "M-a"]);
                 // ECC P0: never claim DELEGATED without re-reading tmux — a
-                // silently failed prefix cut would leave a half-delegated state.
+                // silently failed prefix move would leave control undelegated.
                 let now = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-                    .map(|o| o.trim() == "None")
+                    .map(|o| o.trim() == "M-a")
                     .unwrap_or(false);
                 if !cut || !now {
                     // rollback: the keyboard never left the parent's hands.
                     muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
-                    if let Some(c) = &client {
-                        muxmesh_core::poll::tmux_run(&base, &["switchc", "-t", c, "-T", "root"]);
-                    }
                     muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
                     tracing::error!(
-                        "bar-toggle: prefix cut FAILED — rolled back, parent keeps control"
+                        "bar-toggle: prefix move FAILED — rolled back, parent keeps control"
                     );
-                    println!("muxmesh: delegation FAILED (prefix cut refused) — parent keeps the keyboard");
+                    println!("muxmesh: delegation FAILED (prefix move refused) — parent keeps the keyboard");
                     return 1;
                 }
-                println!("muxmesh: control DELEGATED to {h} — parent bar hidden, prefix off (F10 returns it)");
+                println!("muxmesh: control DELEGATED to {h} — parent bar hidden, prefix now M-a (F10 returns it)");
                 0
             } else {
                 // press 2: TAKE CONTROL BACK — unconditionally first (safety ring).
                 // Restore prefix + key-table root so the parent holds the keyboard
+                // press 2: TAKE CONTROL BACK — unconditionally first (safety ring).
+                // Restore the parent's default prefix so C-b belongs to the parent
                 // again, EVEN IF BarHide later fails (that part is cosmetic).
                 let restore = muxmesh_core::poll::tmux_run(&base, &["set-option", "-gu", "prefix"]);
-                if let Some(c) = &client {
-                    muxmesh_core::poll::tmux_run(&base, &["switchc", "-t", c, "-T", "root"]);
-                }
                 muxmesh_core::poll::run_tmux(&base, &["set-option", "-g", "status", "on"]);
                 // ECC P0: verify the prefix is really back before claiming it —
-                // "RECLAIMED" must never lie while the keyboard is still cut.
+                // "RECLAIMED" must never lie while the keyboard is still delegated.
                 let now = muxmesh_core::poll::tmux_out(&base, &["show-options", "-gv", "prefix"])
-                    .map(|o| o.trim() != "None")
+                    .map(|o| o.trim() != "M-a")
                     .unwrap_or(false);
                 if !restore || !now {
                     tracing::error!(
