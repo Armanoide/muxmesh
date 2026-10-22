@@ -1,0 +1,10 @@
+# keep the docker build context tiny: target/ is 5+ GB of host-built Rust
+# artifacts (Linux-incompatible here anyway) and must never enter the context.
+target/
+.git/
+.muxmesh/
+*.log
+state.json
+token
+*.token
+config.toml
