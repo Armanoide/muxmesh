@@ -26,6 +26,7 @@ bad()  { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3 ($1)"; else bad "$3: got '$1' want '$2'"; fi; }
 
 cleanup() {
+  if [ "${KEEP:-0}" = "1" ]; then echo "  KEEP=1: containers left running for inspection"; return; fi
   log "cleanup"
   docker rm -f "$HUB" "$MINI" "$MBP" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
@@ -39,12 +40,24 @@ else
   docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
 fi
 
-log "network + hub"
+log "network + tokens (minted BEFORE the server: it loads tokens.json once at startup)"
 docker network create "$NET" >/dev/null 2>&1 || true
-docker run -d --name "$HUB" --network "$NET" \
+VOL=muxmesh-e2e-data
+docker volume create "$VOL" >/dev/null 2>&1 || true
+
+# mint into a shared volume with the SAME config the server will use
+docker run --rm --entrypoint muxmesh-hub -v "$VOL":/data \
+  -e MUXMESH_TOKENS=/data/tokens.json "$IMAGE" generate-token mac_mini | head -1 > /tmp/mm-tok-mini
+docker run --rm --entrypoint muxmesh-hub -v "$VOL":/data \
+  -e MUXMESH_TOKENS=/data/tokens.json "$IMAGE" generate-token macbook | head -1 > /tmp/mm-tok-mbp
+TOK_MINI=$(cat /tmp/mm-tok-mini); TOK_MBP=$(cat /tmp/mm-tok-mbp)
+echo "  minted tokens for mac_mini + macbook (volume, before server start)"
+
+log "hub (loads the pre-minted tokens.json at startup)"
+docker run -d --name "$HUB" --network "$NET" -v "$VOL":/data \
   -e MUXMESH_BIND=0.0.0.0:9997 \
-  -e MUXMESH_STATE=/tmp/state.json \
-  -e MUXMESH_TOKENS=/tmp/tokens.json \
+  -e MUXMESH_STATE=/data/state.json \
+  -e MUXMESH_TOKENS=/data/tokens.json \
   -e MUXMESH_POLL_HUB=127.0.0.1:1 \
   -e RUST_LOG=debug \
   "$IMAGE" muxmesh-hub >/dev/null
@@ -53,10 +66,6 @@ for i in $(seq 1 50); do
   docker exec "$HUB" sh -c 'exec 3<>/dev/tcp/127.0.0.1/9997' 2>/dev/null && break
   sleep 0.2
 done
-
-TOK_MINI=$(docker exec "$HUB" muxmesh-hub generate-token mac_mini | head -1)
-TOK_MBP=$(docker exec "$HUB" muxmesh-hub generate-token macbook | head -1)
-echo "  minted tokens for mac_mini + macbook"
 
 log "agents (each = its own tmux server)"
 docker run -d --name "$MINI" --network "$NET" \
@@ -71,18 +80,20 @@ docker run -d --name "$MBP" --network "$NET" \
 
 log "wait for both agents to register + WS-connect"
 for i in $(seq 1 60); do
-  S=$(docker exec "$HUB" cat /tmp/state.json 2>/dev/null || true)
+  S=$(docker exec "$HUB" cat /data/state.json 2>/dev/null || true)
   echo "$S" | grep -q mac_mini && echo "$S" | grep -q macbook && break
   sleep 0.5
 done
-echo "  state: $(docker exec "$HUB" cat /tmp/state.json)"
+echo "  state: $(docker exec "$HUB" cat /data/state.json)"
 
 log "arm the macbook window toward mac_mini (fake ssh) + run poller once"
+# detached so the fake ssh stays alive across docker exec calls (a plain
+# exec exits with the pane and tmux kills it).
 docker exec -d "$MBP" tmux -S "$SOCK_MBP" new-window -t main: "bash /opt/muxmesh/arm-ssh.sh mac_mini"
 sleep 1
 # the embedded poller runs every 2s; force one pass against the live hub so
 # @muxmesh-armed-win is set on the fake-ssh window before we press.
-docker exec "$MBP" sh -c "MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli poll --once" >/dev/null 2>&1 || true
+docker exec "$MBP" sh -c "MUXMESH_SOCKET=$SOCK_MBP MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli poll --once" 2>&1 | tail -2 || true
 sleep 1
 
 log "PRE: both bars visible (status on)"
