@@ -1,10 +1,11 @@
-//! One live WS session: reader/writer/pinger/watchdog tasks + command
-//! dispatch + the central-log tracing layer.
+//! One live WS session: the four tasks that share a connected socket, plus
+//! the command cycle and the central-log tracing layer.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use muxmesh_core::{Ack, CommandEnvelope};
 use tokio::sync::mpsc;
@@ -13,158 +14,157 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::tmux::{build_state, resolve_socket, tmux_prefix_and_status, tmux_sessions};
 use crate::ws::{Ws, MAX_MISSED_PONGS, PING_INTERVAL};
 
-/// Read pushed frames until the socket dies: reader (dispatch+ack), writer
-/// (sink owner: acks + forwarded log lines), seq-stamped pinger, and a
-/// dead-hub watchdog. First task to finish ends the session.
-pub async fn ws_session(
+/// Hold ONE connected socket open until it dies: four concurrent tasks share
+/// it — read pushed commands, write outbound frames, ping, watch liveness —
+/// and the first to finish ends the session so dial_hub_forever reconnects.
+pub async fn run_socket_until_dead(
     cfg: &Arc<muxmesh_core::AgentConfig>,
     ws: Ws,
-    mut log_rx: tokio::sync::broadcast::Receiver<String>,
+    log_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
-    let (mut sink, mut stream) = ws.split(); // liveness counters are SESSION-local: statics shared across reconnects
-                                             // would corrupt the missed-pong accounting between sessions.
+    // liveness counters are SESSION-local: statics shared across reconnects
+    // would corrupt the missed-pong accounting between sessions.
     let last_ping_seq = Arc::new(AtomicU64::new(0)); // last ping WE sent
     let alive_seq = Arc::new(AtomicU64::new(0)); // last ping the hub answered
-                                                 // outbound frames (acks + keepalive pings) go through one channel so a
-                                                 // single task owns the sink (a SplitSink cannot be shared).
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-
-    // ping loop: outbound keepalive, seq-stamped so pongs prove liveness.
-    let tx_p = tx.clone();
-    let last_ping_p = last_ping_seq.clone();
-    let pinger = async move {
-        let mut ping = tokio::time::interval(PING_INTERVAL);
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ping.tick().await;
-            let seq = last_ping_p.fetch_add(1, Ordering::Relaxed) + 1;
-            if tx_p.send(Message::Ping(seq.to_string().into())).is_err() {
-                return; // writer gone -> session over
-            }
-        }
-    };
-
-    // writer task: the ONLY owner of the sink. Central-log lines from the
-    // tracing layer arrive on `log_rx` and are forwarded as {"log":...} frames;
-    // the hub appends them to its hub.log (one file for the whole fleet).
-    // The heartbeat lives here too: every cfg.interval, a ReportState frame
-    // carries the local tmux state to the hub (replaces HTTP POST /state) —
-    // one channel, one clock. Quiet at INFO unless armed/sessions CHANGES.
-    // shortcut: lines emitted while the WS is DOWN are lost (stderr keeps
-    // them) — add replay-on-reconnect if the hub must hold full history.
-    let tx2 = tx.clone();
-    let cfg_w = cfg.clone();
-    let writer = async move {
-        let mut beat = tokio::time::interval(Duration::from_secs(cfg_w.interval.max(1)));
-        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last = (false, usize::MAX);
-        loop {
-            tokio::select! {
-                biased;
-                // acks queued by the reader go out first: a command answer is
-                // more urgent than a log line or the next state photo.
-                Some(msg) = rx.recv() => {
-                    if sink.send(msg).await.is_err() {
-                        return; // socket error -> session over
-                    }
-                }
-                Ok(line) = log_rx.recv() => {
-                    let frame = format!("{{\"log\":{}}}", serde_json::json!(line));
-                    if tx2.send(Message::Text(frame.into())).is_err() {
-                        return;
-                    }
-                }
-                _ = beat.tick() => {
-                    let state = build_state(&cfg_w.host, &resolve_socket(&cfg_w));
-                    let frame = serde_json::json!({
-                        "v": 1,
-                        "id": format!("s-{}", muxmesh_core::now_unix()),
-                        "src": cfg_w.host,
-                        "dst": "hub",
-                        "ts": muxmesh_core::now_unix(),
-                        "cmd": { "type": "ReportState", "state": state },
-                    });
-                    if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
-                        return; // socket error -> session over; reconnect resyncs
-                    }
-                    if (state.armed, state.sessions.len()) != last {
-                        tracing::info!(
-                            "armed={} sessions={} push=ok (ws)",
-                            state.armed,
-                            state.sessions.len()
-                        );
-                    }
-                    last = (state.armed, state.sessions.len());
-                }
-            }
-        }
-    };
-
-    let last_ping_r = last_ping_seq.clone();
-    let alive_r = alive_seq.clone();
-    let cfg_r = cfg.clone();
-    let reader = async move {
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Some(ack) = dispatch_command(&cfg_r, &cfg_r.host, text.as_str()) {
-                        if tx.send(Message::Text(ack.into())).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Ok(Message::Pong(data)) => {
-                    // tungstenite echoes the ping payload back verbatim: a pong
-                    // carrying our latest sent seq proves the hub is alive.
-                    let seq: u64 = String::from_utf8_lossy(&data).parse().unwrap_or(0);
-                    if seq != 0 && seq == last_ping_r.load(Ordering::Relaxed) {
-                        alive_r.store(seq, Ordering::Relaxed);
-                    }
-                }
-                Ok(Message::Close(_)) => return,
-                Ok(_) => {} // binary/ping: ping auto-answered by tungstenite
-                Err(e) => {
-                    tracing::warn!("ws: recv error: {e}");
-                    return;
-                }
-            }
-        }
-    };
-
-    // Dead-hub watchdog: MAX_MISSED_PONGS pings sent without a matching pong
-    // -> end the session so the reconnect loop takes over. A silent half-open
-    // socket surfaces here, not as a read timeout (there is none).
-    let last_ping_w = last_ping_seq.clone();
-    let alive_w = alive_seq.clone();
-    let watchdog = async move {
-        loop {
-            tokio::time::sleep(PING_INTERVAL).await;
-            let last = last_ping_w.load(Ordering::Relaxed);
-            if last.saturating_sub(alive_w.load(Ordering::Relaxed)) >= MAX_MISSED_PONGS {
-                tracing::warn!(
-                    "ws: {MAX_MISSED_PONGS} unanswered pings -> dropping connection (dead hub)"
-                );
-                return;
-            }
-        }
-    };
+    let (sink, stream) = ws.split();
+    // outbound frames (acks + keepalive pings) go through one channel so a
+    // single task owns the sink (a SplitSink cannot be shared).
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
 
     tokio::select! {
-        _ = reader => {}
-        _ = pinger => {}
-        _ = writer => {}
-        _ = watchdog => {}
+        _ = write_frames_until_dead(cfg, sink, rx, log_rx) => {}
+        _ = read_and_execute_commands(cfg, stream, tx.clone(), alive_seq.clone()) => {}
+        _ = send_keepalive_ping(tx.clone(), last_ping_seq.clone()) => {}
+        _ = watch_for_dead_hub(last_ping_seq, alive_seq) => {}
     }
 }
 
-/// Pure dispatch decision: envelope -> ack JSON (no socket, no exec side
-/// effects beyond the argv-scoped tmux call). dst mismatch or bad frame ->
-/// no ack (None): the hub logs the queue TTL drop instead.
-pub fn dispatch_command(
-    cfg: &muxmesh_core::AgentConfig,
-    host: &str,
-    text: &str,
-) -> Option<String> {
+/// The ONLY owner of the sink: drains outbound frames (acks queued by the
+/// reader first — a command answer is more urgent than a log line), forwards
+/// central-log lines as {"log":...} frames, and on every cfg.interval pushes
+/// a ReportState frame (the heartbeat — replaces HTTP POST /state). One
+/// channel, one clock. Quiet at INFO unless armed/sessions CHANGES.
+/// shortcut: frames emitted while the WS is DOWN are lost (stderr keeps them)
+/// — add replay-on-reconnect if the hub must hold full history.
+async fn write_frames_until_dead(
+    cfg: &Arc<muxmesh_core::AgentConfig>,
+    mut sink: SplitSink<Ws, Message>,
+    mut rx: mpsc::UnboundedReceiver<Message>,
+    mut log_rx: tokio::sync::broadcast::Receiver<String>,
+) {
+    let mut beat = tokio::time::interval(Duration::from_secs(cfg.interval.max(1)));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last = (false, usize::MAX);
+    loop {
+        tokio::select! {
+            biased;
+            Some(msg) = rx.recv() => {
+                if sink.send(msg).await.is_err() {
+                    return; // socket error -> session over
+                }
+            }
+            Ok(line) = log_rx.recv() => {
+                let frame = format!("{{\"log\":{}}}", serde_json::json!(line));
+                if sink.send(Message::Text(frame.into())).await.is_err() {
+                    return;
+                }
+            }
+            _ = beat.tick() => {
+                let state = build_state(&cfg.host, &resolve_socket(cfg));
+                let frame = serde_json::json!({
+                    "v": 1,
+                    "id": format!("s-{}", muxmesh_core::now_unix()),
+                    "src": cfg.host,
+                    "dst": "hub",
+                    "ts": muxmesh_core::now_unix(),
+                    "cmd": { "type": "ReportState", "state": state },
+                });
+                if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
+                    return; // socket error -> session over; reconnect resyncs
+                }
+                if (state.armed, state.sessions.len()) != last {
+                    tracing::info!(
+                        "armed={} sessions={} push=ok (ws)",
+                        state.armed,
+                        state.sessions.len()
+                    );
+                }
+                last = (state.armed, state.sessions.len());
+            }
+        }
+    }
+}
+
+/// Read pushed frames until the socket dies: execute commands addressed to us
+/// (ack queued on `tx`), record pongs as liveness proof, end on Close/error.
+async fn read_and_execute_commands(
+    cfg: &Arc<muxmesh_core::AgentConfig>,
+    mut stream: SplitStream<Ws>,
+    tx: mpsc::UnboundedSender<Message>,
+    alive_seq: Arc<AtomicU64>,
+) {
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Some(ack) = execute_and_ack(cfg, text.as_str()) {
+                    if tx.send(Message::Text(ack.into())).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Message::Pong(data)) => {
+                // tungstenite echoes the ping payload back verbatim: a pong
+                // carrying our latest sent seq proves the hub is alive.
+                let seq: u64 = String::from_utf8_lossy(&data).parse().unwrap_or(0);
+                if seq != 0 {
+                    alive_seq.fetch_max(seq, Ordering::Relaxed);
+                }
+            }
+            Ok(Message::Close(_)) => return,
+            Ok(_) => {} // binary/ping: ping auto-answered by tungstenite
+            Err(e) => {
+                tracing::warn!("ws: recv error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Outbound keepalive: one seq-stamped WS ping per PING_INTERVAL, so the
+/// pong that comes back proves to watch_for_dead_hub that the hub is alive.
+async fn send_keepalive_ping(tx: mpsc::UnboundedSender<Message>, last_ping_seq: Arc<AtomicU64>) {
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ping.tick().await;
+        let seq = last_ping_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if tx.send(Message::Ping(seq.to_string().into())).is_err() {
+            return; // writer gone -> session over
+        }
+    }
+}
+
+/// Dead-hub watchdog: MAX_MISSED_PONGS pings sent without a matching pong
+/// -> end the session so dial_hub_forever reconnects. A silent half-open
+/// socket surfaces here, not as a read timeout (there is none).
+async fn watch_for_dead_hub(last_ping_seq: Arc<AtomicU64>, alive_seq: Arc<AtomicU64>) {
+    loop {
+        tokio::time::sleep(PING_INTERVAL).await;
+        let last = last_ping_seq.load(Ordering::Relaxed);
+        if last.saturating_sub(alive_seq.load(Ordering::Relaxed)) >= MAX_MISSED_PONGS {
+            tracing::warn!(
+                "ws: {MAX_MISSED_PONGS} unanswered pings -> dropping connection (dead hub)"
+            );
+            return;
+        }
+    }
+}
+
+/// Pure command cycle: envelope -> ack JSON (no socket held here). Executes the
+/// argv-scoped tmux call for a command addressed to us; dst mismatch, a pushed
+/// ReportState (agent->hub only) or a bad frame -> no ack (None): the hub logs
+/// the queue TTL drop instead.
+pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<String> {
     let env: CommandEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
         Err(e) => {
@@ -172,11 +172,12 @@ pub fn dispatch_command(
             return None;
         }
     };
-    if env.dst != host {
+    if env.dst != cfg.host {
         tracing::warn!(
-            "ws: ignoring command id={} dst={} (not me: {host})",
+            "ws: ignoring command id={} dst={} (not me: {})",
             env.id,
-            env.dst
+            env.dst,
+            cfg.host
         );
         return None;
     }

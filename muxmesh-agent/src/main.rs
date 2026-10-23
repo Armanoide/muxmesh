@@ -72,7 +72,7 @@ fn main() {
 
     // heartbeat: state pushed on the WS every interval (see session.rs —
     // same armed/sessions log rules: quiet at INFO unless state CHANGES).
-    let ws = ws::ws_channel(Arc::new(cfg.clone()), log_rx);
+    let ws = ws::dial_hub_forever(Arc::new(cfg.clone()), log_rx);
 
     // tokio runtime for the WS channel only (the poller thread stays std).
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -115,14 +115,14 @@ mod tests {
         let c = cfg();
         // foreign dst -> ignored, no ack (hub logs the TTL drop)
         let foreign = r#"{"v":1,"id":"c-1","src":"driver","dst":"someone-else","cmd":{"type":"BarHide"},"ts":1}"#;
-        assert_eq!(ws::session::dispatch_command(&c, "me", foreign), None);
+        assert_eq!(ws::session::execute_and_ack(&c, foreign), None);
         // bad json -> ignored
-        assert_eq!(ws::session::dispatch_command(&c, "me", "not json"), None);
+        assert_eq!(ws::session::execute_and_ack(&c, "not json"), None);
         // bad version -> ack err (id echoed)
         let oldv =
             r#"{"v":2,"id":"c-2","src":"driver","dst":"me","cmd":{"type":"BarShow"},"ts":1}"#;
         let ack: muxmesh_core::Ack =
-            serde_json::from_str(&ws::session::dispatch_command(&c, "me", oldv).unwrap()).unwrap();
+            serde_json::from_str(&ws::session::execute_and_ack(&c, oldv).unwrap()).unwrap();
         assert_eq!(ack.id, "c-2");
         assert!(!ack.ok);
         // own BarHide: no live tmux here -> exec fails, but the ack must
@@ -130,7 +130,7 @@ mod tests {
         let mine =
             r#"{"v":1,"id":"c-3","src":"driver","dst":"me","cmd":{"type":"BarHide"},"ts":1}"#;
         let ack: muxmesh_core::Ack =
-            serde_json::from_str(&ws::session::dispatch_command(&c, "me", mine).unwrap()).unwrap();
+            serde_json::from_str(&ws::session::execute_and_ack(&c, mine).unwrap()).unwrap();
         assert_eq!(ack.id, "c-3");
     }
 
@@ -140,7 +140,7 @@ mod tests {
         // one back, the agent must not execute it nor ack it.
         let c = cfg();
         let rs = r#"{"v":1,"id":"s-1","src":"hub","dst":"me","ts":1,"cmd":{"type":"ReportState","state":{"host":"me","armed":false,"seen":1}}}"#;
-        assert_eq!(ws::session::dispatch_command(&c, "me", rs), None);
+        assert_eq!(ws::session::execute_and_ack(&c, rs), None);
     }
 
     #[test]

@@ -12,12 +12,12 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[path = "ws/session.rs"]
 pub mod session;
-pub use session::ws_session;
+pub use session::run_socket_until_dead;
 
-// dispatch_command + WsLogLayer are reached through ws::session::* (main.rs
+// execute_and_ack + WsLogLayer are reached through ws::session::* (main.rs
 // and tests spell the full path) — re-export kept for ws:: dispatch callers.
 #[allow(unused_imports)]
-pub use session::{dispatch_command, WsLogLayer};
+pub use session::{execute_and_ack, WsLogLayer};
 
 /// Keepalive cadence: one WS ping per 30 s.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -28,13 +28,13 @@ pub const MAX_MISSED_PONGS: u64 = 2;
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Persistent outbound WS channel: dial /agent/ws with the machine token
-/// headers, execute pushed commands, ack them. Reconnect with exponential
-/// backoff 1s -> 30s (reset on a successful session); logs state changes only
-/// (never the token).
+/// Persistent outbound WS channel: dial /agent/ws forever with the machine
+/// token headers. One successful session hands the socket to
+/// run_socket_until_dead; when it dies, reconnect with exponential backoff
+/// 1s -> 30s (reset on success); logs state changes only (never the token).
 /// shortcut: no jitter on the backoff — fine at homelab scale, add jitter if
 /// many agents ever hammer a restarting hub.
-pub async fn ws_channel(
+pub async fn dial_hub_forever(
     cfg: Arc<muxmesh_core::AgentConfig>,
     log_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
@@ -58,7 +58,7 @@ pub async fn ws_channel(
         match connect_with_auth(&url, &cfg.host, &token).await {
             Ok((ws, resp)) => {
                 tracing::info!("ws: connected to {url} (status {})", resp.status());
-                ws_session(&cfg, ws, log_rx.resubscribe()).await;
+                run_socket_until_dead(&cfg, ws, log_rx.resubscribe()).await;
                 tracing::warn!("ws: channel closed -> reconnecting");
                 backoff = Duration::from_secs(1); // success resets the ramp
             }
