@@ -72,7 +72,7 @@ fn main() {
     // headless pivot (no tmux server) it is inert by design.
     {
         let pcfg = cfg.clone();
-        std::thread::spawn(move || muxmesh_core::poll::run_embedded(&pcfg));
+        std::thread::spawn(move || muxmesh_core::poll::poll_hub_and_badge_windows(&pcfg));
     }
 
     // purge expired entries at startup so state.json doesn't grow forever.

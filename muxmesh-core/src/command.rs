@@ -191,7 +191,7 @@ impl Command {
             Command::ReportState { .. } => {
                 // never executed on tmux: the hub merges it into state.json and
                 // does not route it to agents. An agent that receives one (a
-                // malicious hub) ignores it — see dispatch_command.
+                // malicious hub) ignores it — see execute_and_ack.
                 vec![]
             }
         }

@@ -67,7 +67,7 @@ fn main() {
     {
         let mut poll_cfg = muxmesh_core::HubConfig::load();
         poll_cfg.poll_hub = muxmesh_core::agent_poll_hub(&cfg);
-        thread::spawn(move || muxmesh_core::poll::run_embedded(&poll_cfg));
+        thread::spawn(move || muxmesh_core::poll::poll_hub_and_badge_windows(&poll_cfg));
     }
 
     // heartbeat: state pushed on the WS every interval (see session.rs —

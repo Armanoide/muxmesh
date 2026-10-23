@@ -20,7 +20,7 @@ const MAX_MISSED_PONGS: u32 = 2;
 /// Register this agent's channel, then serve its socket until it dies: push
 /// queued commands, read acks/state/logs back, ping every 30 s. No read
 /// timeout — a quiet channel is alive; the pings prove it.
-pub async fn handle_agent(mut socket: WebSocket, host: String, state: Arc<AppState>) {
+pub async fn serve_agent_until_disconnected(mut socket: WebSocket, host: String, state: Arc<AppState>) {
     let gen = WS_GEN.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     register_channel(&state, &host, tx, gen);

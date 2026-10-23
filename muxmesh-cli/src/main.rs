@@ -32,11 +32,11 @@ fn main() {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("tree");
 
     match cmd {
-        "poll" if args.iter().any(|a| a == "--once") => muxmesh_core::poll::run_once(&cfg),
-        "poll" => muxmesh_core::poll::run(&cfg),
+        "poll" if args.iter().any(|a| a == "--once") => muxmesh_core::poll::refresh_badges_once(&cfg),
+        "poll" => muxmesh_core::poll::poll_badges_forever(&cfg),
         "tree" => tree(&cfg, args.iter().any(|a| a == "--local")),        "send" => std::process::exit(send::run_send(&cfg, &args[1..]) as i32),
         "armed-host" => std::process::exit(send::run_armed_host(&cfg) as i32),
-        "bar-toggle" => std::process::exit(bar::run(&cfg) as i32),
+        "bar-toggle" => std::process::exit(bar::toggle_bar_for_current_window(&cfg) as i32),
         "why" => std::process::exit(why::run_why(&cfg) as i32),
         other => {
             let _ = other;

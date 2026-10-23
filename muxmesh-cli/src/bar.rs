@@ -15,8 +15,9 @@ use muxmesh_core::{Command, HubConfig};
 use crate::tmux_state;
 use crate::transport;
 
-/// `muxmesh-cli bar-toggle` entry point. Returns a process exit code.
-pub fn run(cfg: &HubConfig) -> u8 {
+/// `muxmesh-cli bar-toggle` entry point: read the tmux state, then branch on
+/// (armed host, delegated) to delegate/reclaim/child-press. Exit code = status.
+pub fn toggle_bar_for_current_window(cfg: &HubConfig) -> u8 {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());

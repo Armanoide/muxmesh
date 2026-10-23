@@ -208,5 +208,5 @@ pub async fn agent_ws(
     crate::interfaces::auth::AuthenticatedHost(host): crate::interfaces::auth::AuthenticatedHost,
 ) -> Response {
     // identity comes from the gate's verification, never from a second header read
-    ws.on_upgrade(move |socket| ws::handle_agent(socket, host, state))
+    ws.on_upgrade(move |socket| ws::serve_agent_until_disconnected(socket, host, state))
 }

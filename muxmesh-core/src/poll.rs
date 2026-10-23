@@ -27,7 +27,7 @@ pub fn read_state(path: &Path) -> StateDoc {
 }
 
 /// One pass: evaluate every window on the server, set/unset the badge option.
-pub fn poll_once(base: &[String], doc: &StateDoc, ttl: u64) {
+pub fn refresh_window_badges(base: &[String], doc: &StateDoc, ttl: u64) {
     let now = crate::now_unix();
     // all windows across all sessions: "window_id" per line
     let out = match tmux::tmux_out(base, &["list-windows", "-a", "-F", "#{window_id}"]) {
@@ -87,8 +87,8 @@ pub fn poll_once(base: &[String], doc: &StateDoc, ttl: u64) {
     }
 }
 
-/// Main loop. env: MUXMESH_SOCKET (tmux socket), MUXMESH_INTERVAL, MUXMESH_TTL.
-pub fn run(cfg: &HubConfig) {
+/// Main loop (CLI `poll`): badge every cfg.interval until the process dies.
+pub fn poll_badges_forever(cfg: &HubConfig) {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -99,15 +99,15 @@ pub fn run(cfg: &HubConfig) {
     }
     loop {
         let doc = fetch_state(&cfg.poll_hub);
-        poll_once(&base, &doc, cfg.ttl);
+        refresh_window_badges(&base, &doc, cfg.ttl);
         thread::sleep(Duration::from_secs(cfg.interval));
     }
 }
 
 /// Embedded badge poller for hub/agent: same loop, quiet. On a machine with
-/// no local tmux server (the hub), poll_once is inert and fetch_state only
+/// no local tmux server (the hub), refresh_window_badges is inert and fetch_state only
 /// logs a deduped line every ~30s; that is the expected steady state there.
-pub fn run_embedded(cfg: &HubConfig) {
+pub fn poll_hub_and_badge_windows(cfg: &HubConfig) {
     tracing::info!(hub = %cfg.poll_hub, "embedded badge poller started");
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
@@ -115,19 +115,19 @@ pub fn run_embedded(cfg: &HubConfig) {
     let base = tmux::tmux_base(&socket);
     loop {
         let doc = fetch_state(&cfg.poll_hub);
-        poll_once(&base, &doc, cfg.ttl);
+        refresh_window_badges(&base, &doc, cfg.ttl);
         thread::sleep(Duration::from_secs(cfg.interval));
     }
 }
 
-/// One-shot pass for tests and `poll --once` (no loop).
-pub fn run_once(cfg: &HubConfig) {
+/// One badge pass for tests and `poll --once` (no loop).
+pub fn refresh_badges_once(cfg: &HubConfig) {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
     let base = tmux::tmux_base(&socket);
     let doc = fetch_state(&cfg.poll_hub);
-    poll_once(&base, &doc, cfg.ttl);
+    refresh_window_badges(&base, &doc, cfg.ttl);
 }
 
 /// Live state from the hub. A driver machine has no local state.json — the
