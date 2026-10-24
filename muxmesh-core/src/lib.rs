@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod identity;
+pub mod ipc;
 pub mod log;
 pub mod paths;
 pub mod poll;
@@ -19,5 +20,6 @@ pub use config::{
 };
 pub use error::CoreError;
 pub use identity::{new_token, verify_token, TokenRecord, TokenStore, PREFIX_LEN};
+pub use ipc::{ipc_socket_path, IpcRequest, IpcResponse, ParentsAnswer};
 pub use paths::bar_toggle_cmd;
 pub use state::{now_unix, HostState, RemoteSession, StateDoc};

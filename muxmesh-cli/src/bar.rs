@@ -2,14 +2,16 @@
 //!
 //! Roles are decided by the KEYSTROKE's server, not configured anywhere:
 //! an armed ssh in the current window -> PARENT branch, else CHILD branch.
+//! The CLI owns the LOCAL tmux dance (prefix/table/bar — no network); every
+//! hub interaction goes through the agent's WS via IPC (transport.rs). No
+//! agent -> no relay -> the remote side is simply not notified; the local bar
+//! still toggles (the keystroke must never be swallowed).
 //!
-//!   PARENT  press 1 -> DELEGATE: BarShow(child) via hub, then prefix None
-//!                     + switch-client -T off (samoshkin OFF mode). F10 stays
-//!                     bound in table `off` = the parent's escape hatch.
-//!   PARENT  press 2 -> RECLAIM locally (no network needed for the keyboard).
-//!   CHILD   F10     -> local bar toggle; if hiding, answer GiveControl (or
-//!                     ResumeControl if still delegated) to whoever armed an ssh
-//!                     into us (hub directory).
+//!   PARENT  press 1 -> DELEGATE: GiveControl(child) via agent->hub, then cut
+//!                     the local prefix (None) + park the client in table `off`.
+//!   PARENT  press 2 -> RECLAIM locally + BarHide(child) via agent->hub.
+//!   CHILD   F10     -> local bar toggle; if hiding, ResumeControl to whoever
+//!                     armed an ssh into us (parents via agent->hub).
 
 use muxmesh_core::{Command, HubConfig};
 
@@ -40,11 +42,11 @@ pub fn toggle_bar_for_current_window(cfg: &HubConfig) -> u8 {
 
     match (host, delegated) {
         // child, or server still delegated with no armed ssh: reclaim.
-        (Some(h), true) => reclaim(&base, Some(&h), cfg),
+        (Some(h), true) => reclaim(&base, Some(&h)),
         // parent + press 1: hand the keyboard to the child.
-        (Some(h), false) => delegate(&base, &h, cfg),
+        (Some(h), false) => delegate(&base, &h),
         // child, or parent whose armed window the scans both missed.
-        (None, d) => child_press(&base, hidden_now, d, cfg),
+        (None, d) => child_press(&base, hidden_now, d),
     }
 }
 
@@ -52,13 +54,9 @@ pub fn toggle_bar_for_current_window(cfg: &HubConfig) -> u8 {
 ///
 /// GUARD: the prefix is cut BEFORE anything else is touched — if the cut is
 /// refused, nothing happened and the parent keeps everything. Bar off + deaf
-/// table only after the cut is confirmed by re-reading tmux.
-fn delegate(base: &[String], h: &str, cfg: &HubConfig) -> u8 {
-    if !transport::post_verb(Command::BarShow, h, "BarShow", cfg) {
-        tracing::error!("bar-toggle: child unreachable, NOT delegating");
-        println!("muxmesh: remote {h} unreachable — control NOT delegated (parent keeps the keyboard)");
-        return 1;
-    }
+/// table only after the cut is confirmed by re-reading tmux. The child is
+/// notified via GiveControl relayed on the agent's WS (no direct network).
+fn delegate(base: &[String], h: &str) -> u8 {
     let cut = muxmesh_core::tmux::tmux_run(base, &["set-option", "-g", "prefix", "None"]);
     if !cut || !tmux_state::is_delegated(base) {
         muxmesh_core::tmux::tmux_run(base, &["set-option", "-gu", "prefix"]);
@@ -70,26 +68,31 @@ fn delegate(base: &[String], h: &str, cfg: &HubConfig) -> u8 {
     // headless servers answer "no current client" — harmless, prefix None is
     // what actually delegates the keyboard there.
     muxmesh_core::tmux::tmux_run(base, &["switch-client", "-T", "off"]);
-    println!("muxmesh: control DELEGATED to {h} — press F10 again to reclaim");
+    // notify the child (give it control) via the agent's WS; best-effort —
+    // the parent already delegated its own keyboard, a silent child is not a
+    // reason to undo the local cut.
+    if transport::relay_send(h, Command::GiveControl) {
+        println!("muxmesh: control DELEGATED to {h} — press F10 again to reclaim");
+    } else {
+        println!("muxmesh: control DELEGATED locally; child '{h}' NOT notified (agent down?)");
+    }
     0
 }
 
-/// The single reclaim path (was two near-copies). Restores prefix + table
-/// root + bar, audits tmux, then fixes the other side via the hub:
-/// `dst = Some(host)` -> BarHide the child (parent pressed F10 itself);
-/// `dst = None` -> answer GiveControl/ResumeControl to our hub parent (self-reclaim).
-fn reclaim(base: &[String], dst: Option<&str>, cfg: &HubConfig) -> u8 {
+/// The single reclaim path. Restores prefix + table root + bar locally, audits
+/// tmux, then fixes the other side via the agent's WS: `dst = Some(host)` ->
+/// BarHide the child (parent pressed F10 itself); `dst = None` -> ResumeControl
+/// to our parent (self-reclaim, child pressing again while delegated).
+fn reclaim(base: &[String], dst: Option<&str>) -> u8 {
     muxmesh_core::tmux::tmux_run(base, &["set-option", "-gu", "prefix"]);
     muxmesh_core::tmux::run_tmux(base, &["switch-client", "-T", "root"]);
     muxmesh_core::tmux::run_tmux(base, &["set-option", "-g", "status", "on"]);
     match dst {
         Some(h) => {
-            transport::post_verb(Command::BarHide, h, "BarHide", cfg);
+            transport::relay_send(h, Command::BarHide);
         }
         None => {
-            if !cfg.poll_hub.is_empty() {
-                transport::answer_parent_reclaim(cfg);
-            }
+            answer_parent_reclaim();
         }
     }
     let (prefix_back, f10_back) = tmux_state::reclaim_audit(base);
@@ -101,15 +104,29 @@ fn reclaim(base: &[String], dst: Option<&str>, cfg: &HubConfig) -> u8 {
 /// CHILD branch (no armed ssh here): plain local bar toggle, or self-reclaim
 /// if this server is still delegated (prefix None from an earlier press 1).
 /// If hiding, tell our parent (whoever has a live ssh into us) to reclaim.
-fn child_press(base: &[String], hidden_now: bool, delegated: bool, cfg: &HubConfig) -> u8 {
+fn child_press(base: &[String], hidden_now: bool, delegated: bool) -> u8 {
     if delegated {
-        return reclaim(base, None, cfg);
+        return reclaim(base, None);
     }
     let next = if hidden_now { "on" } else { "off" };
     muxmesh_core::tmux::run_tmux(base, &["set-option", "-g", "status", next]);
-    if next == "off" && !cfg.poll_hub.is_empty() {
-        transport::answer_parent_reclaim(cfg);
+    if next == "off" {
+        answer_parent_reclaim();
     }
     println!("muxmesh: local bar {next}");
     0
+}
+
+/// Answer a press-2 back to the parent: ask the agent (-> hub over WS) who has
+/// a live ssh INTO us, then relay ResumeControl to that parent. Best-effort —
+/// never block the local bar toggle on the network or a missing agent.
+fn answer_parent_reclaim() {
+    let parent = match transport::ask_parents().into_iter().next() {
+        Some(p) => p,
+        None => {
+            tracing::info!("child: no parent known (agent/hub silent) — local-only toggle");
+            return;
+        }
+    };
+    transport::relay_send(&parent, Command::ResumeControl);
 }

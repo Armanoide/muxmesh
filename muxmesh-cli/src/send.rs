@@ -1,10 +1,10 @@
 //! Closed-list command parsing + `muxmesh-cli send <host> <verb>` entry.
 //!
-//! The wire lives in transport.rs, the F10 state machine in bar.rs, tmux
-//! reads in tmux_state.rs. This file owns only: CLI words -> Command, and the
-//! plain `send` subcommand (driver -> hub -> agent).
+//! The IPC lives in transport.rs, the F10 state machine in bar.rs, tmux reads
+//! in tmux_state.rs. This file owns only: CLI words -> Command, and the plain
+//! `send` subcommand (driver -> AGENT over IPC -> hub -> dst agent).
 
-use muxmesh_core::{Command, CommandEnvelope};
+use muxmesh_core::Command;
 
 use crate::transport;
 
@@ -33,10 +33,10 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
     }
 }
 
-/// `muxmesh-cli send <host> <verb> [args...]` — POSTed to the HUB, which
-/// enqueues it on <host>'s persistent WS channel (202 queued). Returns a
-/// small exit code: 0 ok, 1 failure, 2 usage.
-pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
+/// `muxmesh-cli send <host> <verb> [args...]` — relayed to the HUB through
+/// the local agent's WS (the CLI never touches the network). Returns a small
+/// exit code: 0 ok, 1 failure (incl. no agent), 2 usage.
+pub fn run_send(_cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     if args.len() < 2 {
         eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach|BarHide|BarShow|GiveControl|ResumeControl> [args]");
         return 2;
@@ -59,30 +59,11 @@ pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
         return 2;
     }
 
-    // driver -> hub -> agent: POST to poll.hub, dst in the envelope.
-    let (hub_host, hub_port) = transport::hub_endpoint(cfg);
-    let env = CommandEnvelope {
-        v: 1,
-        id: format!("c-{}", transport::now_ts()),
-        src: transport::driver_host(),
-        dst: host.clone(),
-        cmd,
-        ts: transport::now_ts(),
-    };
-    match transport::send_cmd(&hub_host, hub_port, &transport::cmd_token(), &env) {
-        Ok(resp) => {
-            println!("{resp}");
-            if resp.starts_with("HTTP/1.1 202") {
-                println!("muxmesh: queued via hub (pushed on {host}'s channel)");
-                0
-            } else {
-                1
-            }
-        }
-        Err(e) => {
-            eprintln!("muxmesh-cli send: hub {hub_host}:{hub_port}: {e}");
-            1
-        }
+    // driver -> AGENT (unix socket) -> hub -> dst agent. No network here.
+    if transport::relay_send(host, cmd) {
+        0
+    } else {
+        1
     }
 }
 
@@ -152,7 +133,7 @@ mod tests {
 
     #[test]
     fn envelope_serializes_with_closed_tag() {
-        let env = CommandEnvelope {
+        let env = muxmesh_core::CommandEnvelope {
             v: 1,
             id: "c-1".into(),
             src: "client-a".into(),
@@ -167,13 +148,5 @@ mod tests {
         assert!(text.contains("\"type\":\"NewWindow\""));
         // the hub needs dst to route the frame
         assert!(text.contains("\"dst\":\"host-a\""));
-    }
-
-    #[test]
-    fn split_host_port_handles_v4_v6_bare() {
-        assert_eq!(transport::split_host_port("10.0.10.3:9997"), ("10.0.10.3", 9997));
-        assert_eq!(transport::split_host_port("10.0.10.3"), ("10.0.10.3", 9997));
-        assert_eq!(transport::split_host_port("[::1]:9998"), ("::1", 9998));
-        assert_eq!(transport::split_host_port("[::1]"), ("::1", 9997));
     }
 }
