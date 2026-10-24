@@ -15,7 +15,7 @@ const NET = "muxmesh-e2e-net";
 // cucumber v12: no this.timeout() in hooks — timeout is a hook option (ms).
 BeforeAll({ timeout: 20 * 60 * 1000 }, () => {
   // full cargo build inside the image can take minutes
-  execFileSync("bash", ["-c", "TESTS=0 bash e2e/run.sh"], {
+  execFileSync("bash", ["-c", `TESTS=0 KEEP=1 bash ${path.join(REPO, "e2e", "run.sh")}`], {
     cwd: REPO, stdio: "inherit", env: { ...process.env, KEEP: "1" },
   });
 });
