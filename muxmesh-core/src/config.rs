@@ -270,6 +270,11 @@ impl AgentConfig {
         format!("http://{}:{}/state", self.hub, self.port)
     }
 
+    /// "host:port" of the hub's state endpoint — what poll::fetch_state reads.
+    pub fn hub_addr(&self) -> String {
+        format!("{}:{}", self.hub, self.port)
+    }
+
     /// WebSocket URL of the hub's persistent command channel. The agent dials
     /// OUT to the hub here; the hub never dials the agent. The hub host may
     /// be "host" or "host:port" (poll.hub style) — strip any embedded port so

@@ -187,8 +187,20 @@ pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<St
         tracing::warn!("ws: ignoring inbound ReportState id={} (agent->hub only)", env.id);
         return None;
     }
+    // Role guard, read from the command's declarative meta (tmux_argv_meta):
+    // a child = a machine with a live parent inbound. GiveControl is the
+    // parent's verb, so a child that receives it (misaddressed or forged)
+    // ignores it. The rule lives on the Command, not in a per-verb `if` here.
+    let meta = env.cmd.tmux_argv_meta();
+    if meta.ignore_by_child && am_i_child(cfg) {
+        tracing::warn!(
+            "ws: ignoring {:?} id={} (I am a child — not my verb)",
+            env.cmd,
+            env.id
+        );
+        return None;
+    }
     tracing::info!("ws: command id={} src={} cmd={:?}", env.id, env.src, env.cmd);
-
     let ack = if env.v != 1 {
         Ack::err(env.v, &env.id, "unsupported v")
     } else if !env.cmd.args_valid() {
@@ -215,6 +227,15 @@ pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<St
         }
     };
     Some(serde_json::to_string(&ack).unwrap_or_else(|_| "{}".into()))
+}
+
+/// Am I a child right now? A child = this machine has a live parent, i.e.
+/// another registered host currently has an inbound ssh INTO me (parents_of).
+/// Reads the hub directory over HTTP; on unreachable/corrupt it returns false
+/// (treat as parent) so a flaky hub never silently drops a legitimate command.
+fn am_i_child(cfg: &muxmesh_core::AgentConfig) -> bool {
+    let doc = muxmesh_core::poll::fetch_state(&cfg.hub_addr());
+    !muxmesh_core::tmux::parents_of(&doc, &cfg.host).is_empty()
 }
 
 /// tracing layer: every log event becomes {"log":"<formatted line>"} on the

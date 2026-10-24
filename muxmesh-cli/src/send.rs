@@ -27,6 +27,8 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
         }),
         "BarHide" => Some(Command::BarHide),
         "BarShow" => Some(Command::BarShow),
+        "GiveControl" => Some(Command::GiveControl),
+        "ResumeControl" => Some(Command::ResumeControl),
         _ => None,
     }
 }
@@ -36,7 +38,7 @@ pub fn parse_command(words: &[String]) -> Option<Command> {
 /// small exit code: 0 ok, 1 failure, 2 usage.
 pub fn run_send(cfg: &muxmesh_core::HubConfig, args: &[String]) -> u8 {
     if args.len() < 2 {
-        eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach|BarHide|BarShow> [args]");
+        eprintln!("usage: muxmesh-cli send <host> <NewWindow|NewSession|FocusWindow|AttachOrDetach|BarHide|BarShow|GiveControl|ResumeControl> [args]");
         return 2;
     }
     let host = &args[0];
@@ -130,6 +132,14 @@ mod tests {
         assert!(matches!(
             parse_command(&[v("BarShow")]),
             Some(Command::BarShow)
+        ));
+        assert!(matches!(
+            parse_command(&[v("GiveControl")]),
+            Some(Command::GiveControl)
+        ));
+        assert!(matches!(
+            parse_command(&[v("ResumeControl")]),
+            Some(Command::ResumeControl)
         ));
     }
 

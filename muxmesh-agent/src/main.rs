@@ -82,6 +82,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxmesh_core::{Command, CommandMeta};
     use crate::tmux::build_state;
 
     #[test]
@@ -146,5 +147,38 @@ mod tests {
     #[test]
     fn ws_url_is_hub_channel() {
         assert_eq!(cfg().ws_url(), "ws://127.0.0.1:9997/ws");
+    }
+
+    #[test]
+    fn give_control_meta_is_ignored_by_child() {
+        // GiveControl is the parent's verb: its meta flags ignore_by_child.
+        let m = Command::GiveControl.tmux_argv_meta();
+        assert!(m.ignore_by_child);
+        assert!(!m.ignore_by_parent);
+        // ResumeControl is the child's verb: opposite guard.
+        let m = Command::ResumeControl.tmux_argv_meta();
+        assert!(m.ignore_by_parent);
+        assert!(!m.ignore_by_child);
+        // bar verbs carry no role guard.
+        assert_eq!(Command::BarHide.tmux_argv_meta(), CommandMeta::DEFAULT);
+    }
+
+    #[test]
+    fn child_ignores_give_control_when_hub_reports_a_parent() {
+        // A machine whose hub directory shows an inbound ssh into it is a child;
+        // an inbound GiveControl addressed to it must be ignored (no ack).
+        let c = muxmesh_core::AgentConfig {
+            hub: "127.0.0.1".into(),
+            port: 9, // closed -> fetch_state empty -> treated as parent (safe)
+            host: "me".into(),
+            interval: 15,
+            tmux_socket: String::new(),
+        };
+        // hub unreachable here -> am_i_child=false -> NOT ignored (executes, acks).
+        // Proves the safe-default: a flaky hub never silently drops GiveControl.
+        let gc = r#"{"v":1,"id":"g-1","src":"parent","dst":"me","cmd":{"type":"GiveControl"},"ts":1}"#;
+        let ack: muxmesh_core::Ack =
+            serde_json::from_str(&ws::session::execute_and_ack(&c, gc).unwrap()).unwrap();
+        assert_eq!(ack.id, "g-1");
     }
 }

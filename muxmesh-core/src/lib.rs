@@ -12,7 +12,7 @@ pub mod poll;
 pub mod state;
 pub mod tmux;
 
-pub use command::{valid_host, valid_name, Ack, Command, CommandEnvelope};
+pub use command::{valid_host, valid_name, Ack, Command, CommandEnvelope, CommandMeta};
 pub use config::{
     agent_poll_hub, config_dir, expand_tilde, load_map, read_token, token_matches, AgentConfig,
     HubConfig, Token,

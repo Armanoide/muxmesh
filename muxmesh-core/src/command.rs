@@ -51,6 +51,28 @@ pub enum Command {
     ReportState { state: serde_json::Value },
 }
 
+/// Routing policy a receiver applies before executing a command. Declarative:
+/// the rule lives on the Command (tmux_argv_meta), not scattered in `if`s at
+/// each call site. Add a field here + set it per verb, and every receiver that
+/// reads meta obeys. `ignore_by_child`/`ignore_by_parent` are role guards: a
+/// child = a machine that has a live parent (parents_of non-empty); a parent =
+/// one with a live outbound ssh to the sender (ssh_parent_hosts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandMeta {
+    /// a child (has a parent) must not execute this — it is the parent's verb.
+    pub ignore_by_child: bool,
+    /// a parent (no parent of its own) must not execute this — the child's verb.
+    pub ignore_by_parent: bool,
+}
+
+impl CommandMeta {
+    /// No guard: any authenticated receiver may execute.
+    pub const DEFAULT: CommandMeta = CommandMeta {
+        ignore_by_child: false,
+        ignore_by_parent: false,
+    };
+}
+
 /// Envelope of a command sent by a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandEnvelope {
@@ -143,6 +165,29 @@ impl Command {
             Command::GiveControl | Command::ResumeControl => vec![],
             // agent->hub state report: no tmux names, nothing to validate.
             Command::ReportState { .. } => vec![],
+        }
+    }
+
+    /// Declarative routing meta for a command — the *policy* the receiver
+    /// applies before executing. Kept separate from tmux_argv (the *action*):
+    /// argv says what tmux runs, meta says who may run it and when. Add a
+    /// rule here (not an `if` in execute_and_ack) and the receiver obeys.
+    pub fn tmux_argv_meta(&self) -> CommandMeta {
+        match self {
+            // delegate: only a parent cuts its prefix. A child (a machine that
+            // has a parent) receiving GiveControl is misaddressed or forged ->
+            // the receiver ignores it. Bar/control verbs carry no tmux names.
+            Command::GiveControl => CommandMeta {
+                ignore_by_child: true,
+                ..CommandMeta::DEFAULT
+            },
+            // reclaim: only a child hands control back to its parent. A parent
+            // receiving ResumeControl (no parent of its own) is misaddressed.
+            Command::ResumeControl => CommandMeta {
+                ignore_by_parent: true,
+                ..CommandMeta::DEFAULT
+            },
+            _ => CommandMeta::DEFAULT,
         }
     }
 
