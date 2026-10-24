@@ -26,6 +26,9 @@ function pressF10(container, host, sock) {
     ["exec", container, "sh", "-c", `${env} muxmesh-cli bar-toggle -v`],
     { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
   );
+  // diagnostic permanent : le press doit tracer son role et sa decision,
+  // sinon un toggle inverse (ex: delegated au mauvais moment) est invisible.
+  console.log(`[press ${container}] ${out.split("\n").filter(l => /bar-toggle:|RECLAIM|DELEGAT|local bar|queued/.test(l)).join(" | ")}`);
   return out;
 }
 
@@ -44,7 +47,7 @@ const bar = (c, sock) => sh(c, `tmux -S ${sock} show-options -g status | awk '{p
 const prefix = (c, sock) => sh(c, `tmux -S ${sock} show-options -gv prefix`);
 const winCount = (c, sock) => Number(sh(c, `tmux -S ${sock} list-windows -a | wc -l | tr -d ' '`));
 
-Then("machine_a holds its prefix (not None)", () => {
+Then("machine_a holds its prefix \\(not None\\)", () => {
   if (prefix(A, SOCK_A) === "None") throw new Error("machine_a prefix already None");
 });
 
@@ -67,10 +70,12 @@ When("I press F10 on machine_a", () => {
 });
 When("I press F10 on machine_b", () => {
   const out = pressF10(B, HOST_B, SOCK_B);
-  // la reclaim remonte par le hub (B->hub->A) : attendre que A soit revenu on
+  // la presse2 est un toggle LOCAL (mm-b barre off) + relay ResumeControl
+  // vers le parent : attendre l'effet LOCAL ici. La barre du parent est
+  // verifiee par le step suivant ("restored by the hub"), pas ce When.
   const deadline = Date.now() + 5000;
   for (;;) {
-    if (bar(A, SOCK_A) === "on") break;
+    if (bar(B, SOCK_B) === "off") break;
     if (Date.now() > deadline) break;
     execFileSync("sleep", ["0.5"]);
   }
@@ -86,7 +91,7 @@ Then("machine_b's bar is shown", () => {
   if (bar(B, SOCK_B) !== "on") throw new Error(`machine_b bar = ${bar(B, SOCK_B)}, want on`);
 });
 
-Then("machine_a's control is delegated (prefix None)", () => {
+Then("machine_a's control is delegated \\(prefix None\\)", () => {
   if (prefix(A, SOCK_A) !== "None") throw new Error(`prefix = ${prefix(A, SOCK_A)}, want None`);
 });
 
@@ -111,7 +116,11 @@ Then(/^exactly one bar is visible: machine_a (on|off), machine_b (on|off)$/, (a,
 When(/^a window is created on (machine_a|machine_b)$/, (host) => {
   const [c, sock] = host === "machine_a" ? [A, SOCK_A] : [B, SOCK_B];
   global.__before = { a: winCount(A, SOCK_A), b: winCount(B, SOCK_B) };
-  sh(c, host === "machine_a" ? `tmux -S ${sock} new-window` : `tmux -S ${sock} new-window -t main:`);
+  // -t main: JAMAIS `new-window` nu : sans cible, tmux cree la fenetre chez
+  // le client attache le plus recent — sur mm-a c'est le faux client ssh
+  // vers mm-b, donc la fenetre atterrissait chez l'ENFANT (fenetre orpheline
+  // qui désarmait le badge parent et cassait toute la suite du run).
+  sh(c, `tmux -S ${sock} new-window -t main:`);
 });
 
 Then(/^machine_(a|b) has one more window and machine_(a|b) is unchanged$/, (grow, stable) => {
@@ -124,14 +133,34 @@ Then(/^machine_(a|b) has one more window and machine_(a|b) is unchanged$/, (grow
 });
 
 Then("machine_b's bar is hidden", () => {
-  if (bar(B, SOCK_B) !== "off") throw new Error(`machine_b bar = ${bar(B, SOCK_B)}, want off`);
+  // le toggle local est quasi-instantane mais le docker exec a son latence ;
+  // attendre court avant de trancher (la presse2 peut aussi avoir declenche
+  // un reclaim complet si mm-b etait encore delegate).
+  const deadline = Date.now() + 5000;
+  let got;
+  for (;;) {
+    got = bar(B, SOCK_B);
+    if (got === "off") return;
+    if (Date.now() > deadline) break;
+    execFileSync("sleep", ["0.5"]);
+  }
+  throw new Error(`machine_b bar = ${got}, want off`);
 });
 
-Then("machine_a's bar is restored by the hub (ResumeControl)", () => {
-  if (bar(A, SOCK_A) !== "on") throw new Error(`machine_a bar = ${bar(A, SOCK_A)}, want on`);
+Then("machine_a's bar is restored by the hub \\(ResumeControl\\)", () => {
+  // le relay B->hub->A est asynchrone : attendre la restauration du parent.
+  const deadline = Date.now() + 5000;
+  let got;
+  for (;;) {
+    got = bar(A, SOCK_A);
+    if (got === "on") return;
+    if (Date.now() > deadline) break;
+    execFileSync("sleep", ["0.5"]);
+  }
+  throw new Error(`machine_a bar = ${got}, want on`);
 });
 
-Then("machine_a's control is reclaimed (prefix back, F10 alive in root)", () => {
+Then("machine_a's control is reclaimed \\(prefix back, F10 alive in root\\)", () => {
   if (prefix(A, SOCK_A) === "None") throw new Error("prefix still None — parent stuck");
   if (!sh(A, `tmux -S ${SOCK_A} list-keys -T root`).includes("F10"))
     throw new Error("F10 missing from root — parent deaf forever");
@@ -143,12 +172,12 @@ Given("the muxmesh stack is running", () => {
   for (const c of [HUB, A, B])
     if (!running.includes(c)) throw new Error(`stack container ${c} not running`);
 });
-Given("machine_a is forced into the delegated state (prefix None, bar off)", () => {
+Given("machine_a is forced into the delegated state \\(prefix None, bar off\\)", () => {
   sh(A, `tmux -S ${SOCK_A} set-option -g prefix None`);
   sh(A, `tmux -S ${SOCK_A} set-option -g status off`);
 });
 
-Then("machine_a's prefix is restored (self-reclaim)", () => {
+Then("machine_a's prefix is restored \\(self-reclaim\\)", () => {
   if (prefix(A, SOCK_A) === "None") throw new Error("prefix reste None — F10 MORT");
 });
 
