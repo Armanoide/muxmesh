@@ -36,7 +36,6 @@ mod tmux;
 mod ws;
 
 use std::sync::Arc;
-use std::thread;
 
 use crate::ws::session::WsLogLayer;
 fn main() {
@@ -65,16 +64,10 @@ fn main() {
         cfg.interval
     );
 
-    // Embedded badge poller: the agent's own machine gets @muxmesh-status
-    // badges automatically. It targets the agent's own push target
-    // ([agent] hub), not the hub-side bind default — a remote agent
-    // configured with only [agent] hub still works. Blocking ureq+tmux ->
-    // dedicated std::thread, off the tokio runtime.
-    {
-        let mut poll_cfg = muxmesh_core::HubConfig::load();
-        poll_cfg.poll_hub = muxmesh_core::agent_poll_hub(&cfg);
-        thread::spawn(move || muxmesh_core::poll::poll_hub_and_badge_windows(&poll_cfg));
-    }
+    // No embedded HTTP badge poller here (WS-Refacto §9): the agent makes
+    // ZERO network calls except its own WS. Badges on this machine come from
+    // muxmesh-cli poll/bar-toggle reading tmux locally + the hub directory
+    // over IPC. A std::thread doing GET /state would break that contract.
 
     // heartbeat: state pushed on the WS every interval (see session.rs —
     // same armed/sessions log rules: quiet at INFO unless state CHANGES).
