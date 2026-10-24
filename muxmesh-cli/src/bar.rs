@@ -89,7 +89,9 @@ fn reclaim(base: &[String], dst: Option<&str>) -> u8 {
     muxmesh_core::tmux::run_tmux(base, &["set-option", "-g", "status", "on"]);
     match dst {
         Some(h) => {
-            transport::relay_send(h, Command::BarHide);
+            if !transport::relay_send(h, Command::BarHide) {
+                println!("muxmesh: RECLAIMED locally; child '{h}' NOT told to hide its bar (agent down?)");
+            }
         }
         None => {
             answer_parent_reclaim();
@@ -125,6 +127,7 @@ fn answer_parent_reclaim() {
         Some(d) => d,
         None => {
             tracing::info!("child: no directory (agent/hub silent) — local-only toggle");
+            println!("muxmesh: parent NOT notified (agent/hub silent) — local-only toggle");
             return;
         }
     };

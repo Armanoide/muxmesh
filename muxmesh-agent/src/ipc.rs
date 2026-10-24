@@ -38,15 +38,19 @@ impl HubRendezvous {
     /// Ask the hub over the WS and wait for its answer. `ask` sends the
     /// request frame (the caller owns the WS). Err = hub silent past the
     /// timeout or channel down — the CLI then degrades, never hangs.
+    /// The waiter is enrolled BEFORE sending: a hub that answers between the
+    /// send and the wait would otherwise notify nobody (notify_waiters only
+    /// wakes already-enrolled waiters) and we would burn the full timeout.
     pub async fn ask_hub(
         &self,
         me: &str,
         ask: impl std::future::Future<Output = Result<(), String>>,
     ) -> Result<DirectoryAnswer, String> {
         *self.answer.lock().await = None;
+        let waiter = self.arrived.notified(); // enrolled now, awaited below
         ask.await?;
         tokio::select! {
-            _ = self.arrived.notified() => {}
+            _ = waiter => {}
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 return Err("hub silent (5s)".into());
             }
@@ -69,14 +73,30 @@ pub async fn serve_cli_forever(chan: Arc<crate::ws::Channel>) -> std::io::Result
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // a previous crash leaves the socket file behind -> bind would EADDRINUSE.
+    // A previous crash leaves the socket file behind -> bind would EADDRINUSE.
+    // But a live second agent answers on it: NEVER delete its socket (two
+    // listeners would run tmux verbs on one machine). Probe first: connect
+    // succeeds = someone is home -> refuse to start; refused/stale = ours now.
     if path.exists() {
-        std::fs::remove_file(&path)?;
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("another agent is live on {} — refusing to start", path.display()),
+                ))
+            }
+            Err(_) => {
+                tracing::warn!("ipc: stale socket {} -> removing", path.display());
+                std::fs::remove_file(&path)?;
+            }
+        }
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // 0600 immediately after bind: the window is one syscall, and every
+        // peer here (the CLI) runs as the same user anyway.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     tracing::info!("ipc: listening on {}", path.display());
@@ -122,9 +142,16 @@ async fn serve_one_connection(
 async fn dispatch(req: IpcRequest, chan: &crate::ws::Channel) -> IpcResponse {
     match req {
         IpcRequest::Send { host, verb } => {
+            // unique id per send: same-second commands must not collide in the
+            // hub's ack mirror (id-keyed).
+            static SEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let env = CommandEnvelope {
                 v: 1,
-                id: format!("c-{}", muxmesh_core::now_unix()),
+                id: format!(
+                    "c-{}-{}",
+                    muxmesh_core::now_unix(),
+                    SEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
                 src: chan.host.clone(),
                 dst: host.clone(),
                 cmd: verb,
