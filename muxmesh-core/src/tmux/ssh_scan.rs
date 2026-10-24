@@ -125,6 +125,13 @@ pub fn window_ssh_host(base: &[String], wid: &str) -> Option<String> {
 /// currently dialing OUT to (we are their parent). Inside an inbound ssh there
 /// is no ssh client process here, so a pure target returns empty — its own
 /// parents come from `parents_of` (the hub directory), not from here.
+///
+/// Known limit: a parent who launched its ssh INSIDE tmux (`new-window 'ssh
+/// host'`) is not caught here — `ps -eo args` shows the pane's argv
+/// (`sh -c ssh ...`, no leading `ssh`) and the client may hang off a shell
+/// tree, not at argv head. tmux-armed parents are caught by the badge scan
+/// (`window_ssh_host`), which is why armed_host_of_current_window stays
+/// authoritative for the press-1 branch.
 pub fn ssh_parent_hosts() -> Vec<String> {
     let out = match Command::new("ps").args(["-eo", "args"]).output() {
         Ok(o) if o.status.success() => o.stdout,
