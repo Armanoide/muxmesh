@@ -242,6 +242,12 @@ impl Command {
             Command::ResumeControl => {
                 vec!["set-option".into(), "-gu".into(), "prefix".into()]
             }
+            // the child's press-2 answer: the parent's bar must come back with
+            // its control. BarShow alone would restore the prefix but leave a
+            // hidden bar (the hub's router never re-sends BarShow).
+            Command::BarShow => {
+                vec!["set".into(), "-g".into(), "status".into(), "on".into()]
+            }
             Command::ReportState { .. } => {
                 // never executed on tmux: the hub merges it into state.json and
                 // does not route it to agents. An agent that receives one (a
@@ -298,8 +304,11 @@ impl Command {
                 self.tmux_argv(),
                 vec!["switch-client".into(), "-T".into(), "off".into()],
             ],
+            // the child's press-2 answer: restore prefix AND bar — reclaiming
+            // control with a hidden bar would leave the parent deaf and blind.
             Command::ResumeControl => vec![
                 self.tmux_argv(),
+                vec!["set-option".into(), "-g".into(), "status".into(), "on".into()],
                 vec!["switch-client".into(), "-T".into(), "root".into()],
             ],
             _ => vec![self.tmux_argv()],
