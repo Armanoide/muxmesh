@@ -317,6 +317,19 @@ impl Command {
         self.run_steps(socket, &steps)
     }
 
+    /// Ordered tmux steps for execute() — exposed to tests so the multi-step
+    /// verbs (ResumeControl's bar restore) stay pinned without a live socket.
+    pub fn execute_steps_for_test(&self) -> Vec<Vec<String>> {
+        match self {
+            Command::ResumeControl => vec![
+                self.tmux_argv(),
+                vec!["set-option".into(), "-g".into(), "status".into(), "on".into()],
+                vec!["switch-client".into(), "-T".into(), "root".into()],
+            ],
+            _ => vec![self.tmux_argv()],
+        }
+    }
+
     /// Run ordered tmux steps (one command per invocation), auditing each.
     /// Fails if any step fails; the audit names the offending verb+args.
     fn run_steps(&self, socket: &str, steps: &[Vec<String>]) -> Result<(), String> {
@@ -442,6 +455,18 @@ mod tests {
         // execute() adds switch-client. Delegate cuts prefix, reclaim restores it.
         assert_eq!(Command::GiveControl.tmux_argv(), ["set-option", "-g", "prefix", "None"]);
         assert_eq!(Command::ResumeControl.tmux_argv(), ["set-option", "-gu", "prefix"]);
+    }
+
+    #[test]
+    fn resume_control_steps_restore_prefix_bar_and_table() {
+        // press-2 at the child: the parent's reclaim must restore ALL THREE —
+        // prefix, bar (status on), key table. A hidden bar after reclaim was
+        // the live e2e failure (control back, keyboard blind).
+        let steps = Command::ResumeControl.execute_steps_for_test();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], ["set-option", "-gu", "prefix"]);
+        assert_eq!(steps[1], ["set-option", "-g", "status", "on"]);
+        assert_eq!(steps[2], ["switch-client", "-T", "root"]);
     }
 
     #[test]
