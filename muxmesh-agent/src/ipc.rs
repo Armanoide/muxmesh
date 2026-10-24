@@ -13,53 +13,70 @@ use muxmesh_core::{
     ipc_socket_path, AskDirectory, CommandEnvelope, DirectoryAnswer, IpcRequest, IpcResponse,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
-/// The hub answers on the agent's long-lived WS, where many frames share one
-/// channel — so a request needs a rendez-vous: the session task deposits each
-/// DirectoryAnswer here, the IPC handler waits on the notify. One pending
-/// question at a time is enough (the homelab CLI is one keystroke at a time).
-/// The rendez-vous where hub answers (directory) are deposited by the session
-/// and awaited by the CLI's IPC handler. Clonable so both halves hold one
-/// logical rendez-vous (the state is two Arcs: answer + notify).
-#[derive(Clone, Default)]
-pub struct HubRendezvous {
-    answer: Arc<Mutex<Option<DirectoryAnswer>>>,
-    arrived: Arc<Notify>,
+/// The hub's answers on the agent's long-lived WS need somewhere to wait:
+/// the session task posts each DirectoryAnswer into this mailbox, the CLI's
+/// handler asks a question and waits for its letter. Capacity 8; a full
+/// mailbox drops the answer (the CLI degrades, never hangs). Clonable so the
+/// session and the IPC listener hold handles to ONE mailbox.
+#[derive(Clone)]
+pub struct HubReplyBox {
+    inbox: Arc<tokio::sync::mpsc::Sender<DirectoryAnswer>>,
+    unread: Arc<Mutex<tokio::sync::mpsc::Receiver<DirectoryAnswer>>>,
 }
 
-impl HubRendezvous {
-    /// The WS reader deposits an answer and wakes the waiter.
+impl Default for HubReplyBox {
+    fn default() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        HubReplyBox { inbox: Arc::new(tx), unread: Arc::new(Mutex::new(rx)) }
+    }
+}
+
+impl HubReplyBox {
+    /// Post a hub answer into the mailbox. Full (8 unread) drops it — the
+    /// waiter times out, the CLI degrades. Never blocks the WS reader.
     pub async fn deposit(&self, ans: DirectoryAnswer) {
-        *self.answer.lock().await = Some(ans);
-        self.arrived.notify_waiters();
+        let _ = self.inbox.try_send(ans);
     }
 
-    /// Ask the hub over the WS and wait for its answer. `ask` sends the
-    /// request frame (the caller owns the WS). Err = hub silent past the
-    /// timeout or channel down — the CLI then degrades, never hangs.
-    /// The waiter is enrolled BEFORE sending: a hub that answers between the
-    /// send and the wait would otherwise notify nobody (notify_waiters only
-    /// wakes already-enrolled waiters) and we would burn the full timeout.
+    /// Ask the hub over the WS and wait for its letter. `ask` sends the
+    /// request frame (the caller owns the WS). Mailbox semantics: an answer
+    /// that arrived BEFORE we start waiting is kept, not lost (a Notify woke
+    /// nobody in that window — the race the e2e caught). The mailbox is read
+    /// newest-first: the freshest answer for `me` wins, older unread ones are
+    /// discarded. Err = hub silent past 5s or channel down.
     pub async fn ask_hub(
         &self,
         me: &str,
         ask: impl std::future::Future<Output = Result<(), String>>,
     ) -> Result<DirectoryAnswer, String> {
-        *self.answer.lock().await = None;
-        let waiter = self.arrived.notified(); // enrolled now, awaited below
+        let mut unread = self.unread.lock().await;
         ask.await?;
-        tokio::select! {
-            _ = waiter => {}
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                return Err("hub silent (5s)".into());
+        // answers already in the box (hub faster than our scheduling): take
+        // the newest one addressed to us, drop the rest.
+        let mut fresh: Option<DirectoryAnswer> = None;
+        while let Ok(a) = unread.try_recv() {
+            if a.me == me {
+                fresh = Some(a);
             }
         }
-        let got = self.answer.lock().await.take();
-        match got {
-            Some(a) if a.me == me => Ok(a),
-            Some(a) => Err(format!("directory answer addressed to '{}'", a.me)),
-            None => Err("no directory answer".into()),
+        if let Some(a) = fresh {
+            return Ok(a);
+        }
+        // nothing yet: wait for the next letter addressed to me.
+        loop {
+            let got = tokio::select! {
+                g = unread.recv() => g,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    return Err("hub silent (5s)".into());
+                }
+            };
+            match got {
+                Some(a) if a.me == me => return Ok(a),
+                Some(_) => continue, // addressed elsewhere: skip, keep waiting
+                None => return Err("no directory answer".into()),
+            }
         }
     }
 }
@@ -101,11 +118,12 @@ pub async fn serve_cli_forever(chan: Arc<crate::ws::Channel>) -> std::io::Result
     }
     tracing::info!("ipc: listening on {}", path.display());
 
-    let mut tasks = tokio::task::JoinSet::new();
+    
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let (stream, _) = listener.accept().await?;
         let chan = chan.clone();
-        tasks.spawn(async move {
+        connections.spawn(async move {
             if let Err(e) = serve_one_connection(stream, &chan).await {
                 tracing::warn!("ipc: connection: {e}");
             }
@@ -138,7 +156,7 @@ async fn serve_one_connection(
 
 /// Route one request to its answer. `send` is answered as soon as the frame
 /// is on the WS (the hub acks later, in its own time); `ask_directory` waits
-/// for the hub's answer on the rendez-vous.
+/// waiting for the hub's reply in the mailbox.
 async fn dispatch(req: IpcRequest, chan: &crate::ws::Channel) -> IpcResponse {
     match req {
         IpcRequest::Send { host, verb } => {
@@ -168,7 +186,7 @@ async fn dispatch(req: IpcRequest, chan: &crate::ws::Channel) -> IpcResponse {
         IpcRequest::AskDirectory => {
             let me = chan.host.clone();
             let ask = chan.push_frame(serde_json::to_string(&AskDirectory {}).unwrap());
-            match chan.rv.ask_hub(&me, ask).await {
+            match chan.mailbox.ask_hub(&me, ask).await {
                 Ok(ans) => {
                     let mut data = serde_json::Map::new();
                     data.insert(
@@ -194,9 +212,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn rendezvous_delivers_answer_to_waiter() {
-        let rv = Arc::new(HubRendezvous::default());
-        let rv2 = rv.clone();
+    async fn mailbox_delivers_the_hubs_answer() {
+        let mailbox = Arc::new(HubReplyBox::default());
+        let rv2 = mailbox.clone();
         // the hub answers 50ms after the question, as the WS reader would.
         let answer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -206,31 +224,64 @@ mod tests {
             })
             .await;
         });
-        let ans = rv.ask_hub("me", std::future::ready(Ok(()))).await.unwrap();
+        let ans = mailbox.ask_hub("me", std::future::ready(Ok(()))).await.unwrap();
         assert_eq!(ans.me, "me");
         answer.await.unwrap();
     }
 
     #[tokio::test]
-    async fn rendezvous_rejects_answer_for_another_host() {
-        let rv = Arc::new(HubRendezvous::default());
-        let rv2 = rv.clone();
+    async fn mailbox_refuses_an_answer_addressed_elsewhere() {
+        // only OUR letters count: an answer addressed to another host never
+        // satisfies our question — we keep waiting and hit the 5s guard. The
+        // depositing task must DIE with the test: a loop that outlives it
+        // keeps the runtime alive and cargo never finishes (seen: hang).
+        let mailbox = Arc::new(HubReplyBox::default());
+        let rv2 = mailbox.clone();
+        let spam = tokio::spawn(async move {
+            for _ in 0..400 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                rv2.deposit(DirectoryAnswer {
+                    me: "someone-else".into(),
+                    directory: muxmesh_core::StateDoc::default(),
+                })
+                .await;
+            }
+        });
+        let e = mailbox.ask_hub("me", std::future::ready(Ok(()))).await.unwrap_err();
+        assert!(e.contains("silent"), "{e}");
+        spam.abort(); // the loop has no reason to outlive the question it fed
+    }
+
+    #[tokio::test]
+    async fn mailbox_keeps_answer_that_arrived_before_waiting() {
+        // THE race the e2e caught: the hub answers before ask_hub reaches its
+        // select! (WS faster than the scheduler). mpsc holds the answer —
+        // a Notify would have lost it and burned the 5s timeout.
+        let mailbox = HubReplyBox::default();
+        mailbox.deposit(DirectoryAnswer { me: "me".into(), directory: muxmesh_core::StateDoc::default() }).await;
+        let ans = mailbox.ask_hub("me", std::future::ready(Ok(()))).await.unwrap();
+        assert_eq!(ans.me, "me");
+    }
+
+    #[tokio::test]
+    async fn mailbox_drains_letters_from_a_past_question() {
+        // an answer to a PAST question must not satisfy the next one: it is
+        // drained, and the fresh answer (addressed correctly) wins.
+        let mailbox = HubReplyBox::default();
+        mailbox.deposit(DirectoryAnswer { me: "old".into(), directory: muxmesh_core::StateDoc::default() }).await;
+        let rv2 = mailbox.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            rv2.deposit(DirectoryAnswer {
-                me: "someone-else".into(),
-                directory: muxmesh_core::StateDoc::default(),
-            })
-            .await;
+            rv2.deposit(DirectoryAnswer { me: "me".into(), directory: muxmesh_core::StateDoc::default() }).await;
         });
-        let e = rv.ask_hub("me", std::future::ready(Ok(()))).await.unwrap_err();
-        assert!(e.contains("someone-else"), "{e}");
+        let ans = mailbox.ask_hub("me", std::future::ready(Ok(()))).await.unwrap();
+        assert_eq!(ans.me, "me");
     }
 
     #[tokio::test]
     async fn ask_hub_fails_when_ask_itself_fails() {
-        let rv = HubRendezvous::default();
-        let e = rv.ask_hub("me", std::future::ready(Err("ws down".into()))).await.unwrap_err();
+        let mailbox = HubReplyBox::default();
+        let e = mailbox.ask_hub("me", std::future::ready(Err("ws down".into()))).await.unwrap_err();
         assert_eq!(e, "ws down");
     }
 
@@ -268,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_ask_directory_serves_hub_answer() {
-        // the hub's answer arrives on the rendez-vous; dispatch must hand the
+        // the hub posts its reply into the mailbox; dispatch must hand the
         // directory to the CLI in data.directory. The ask frame itself needs
         // a live socket (attached here) — the hub reads it and answers back.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -276,10 +327,10 @@ mod tests {
         chan.attach_socket(Some(tx)).await;
         let c2 = chan.clone();
         tokio::spawn(async move {
-            // the hub reads the ask frame, then answers ~20ms later.
+            // the hub reads the ask frame, then posts its reply ~20ms later.
             let _ask = rx.recv().await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            c2.rv
+            c2.mailbox
                 .deposit(DirectoryAnswer { me: "me".into(), directory: muxmesh_core::StateDoc::default() })
                 .await;
         });

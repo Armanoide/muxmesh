@@ -5,7 +5,7 @@
 //! The hub NEVER dials the agent — this task is the only contact.
 //!
 //! The channel object (Channel) is the stable half: it outlives every socket
-//! and carries what the socket cannot — the rendez-vous for hub answers and
+//! and carries what the socket cannot — the mailbox for hub replies and
 //! the identity of this machine. The CLI's IPC handler holds a Channel, never
 //! a socket: an F10 pressed while the WS is reconnecting gets "ws down", not
 //! a panic. Commands are NEVER queued while the WS is down: a stale verb
@@ -32,20 +32,19 @@ pub const MAX_MISSED_PONGS: u64 = 2;
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-use crate::ipc::HubRendezvous;
+use crate::ipc::HubReplyBox;
 
 /// The machine's persistent hub channel: identity, the live socket's sender,
-/// and the rendez-vous where hub answers (directory) are deposited by the
-/// session. Cloned (Arc) into the IPC listener; survives every reconnect.
+/// and the mailbox where the session posts the hub's directory replies for
+/// the CLI listener. Cloned (Arc) into ipc.rs; survives every reconnect.
 pub struct Channel {
     /// our hub identity (canonical host key) — the src of every relayed send.
     pub host: String,
     /// the live socket's sender, set by run_socket_until_dead while connected.
     /// None = WS down: push_frame fails immediately (no queue, no replay).
     tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
-    /// hub answers (AskDirectory -> DirectoryAnswer) land here. One rendez-vous,
-    /// shared by reference with the IPC listener (Clone = handles to one state).
-    pub rv: HubRendezvous,
+    /// the hub's directory replies land here, read by the CLI listener.
+    pub mailbox: HubReplyBox,
 }
 
 impl Channel {
@@ -53,7 +52,7 @@ impl Channel {
         Channel {
             host,
             tx: Mutex::new(None),
-            rv: HubRendezvous::default(),
+            mailbox: HubReplyBox::default(),
         }
     }
 

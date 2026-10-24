@@ -114,7 +114,7 @@ async fn write_frames_until_dead(
 
 /// Read pushed frames until the socket dies: execute commands addressed to us
 /// (ack queued on `tx`), deposit directory answers on the shared channel's
-/// rendez-vous, record pongs as liveness proof, end on Close/error.
+/// mailbox, record pongs as liveness proof, end on Close/error.
 async fn read_and_execute_commands(
     cfg: &Arc<muxmesh_core::AgentConfig>,
     chan: &Arc<Channel>,
@@ -128,7 +128,7 @@ async fn read_and_execute_commands(
                 // directory answer first: it carries no envelope and must reach
                 // the IPC waiter, not the command executor.
                 if let Some(ans) = parse_directory_answer(text.as_str()) {
-                    chan.rv.deposit(ans).await;
+                    chan.mailbox.deposit(ans).await;
                     continue;
                 }
                 // role facts from the LOCAL scan (same data ReportState pushes):

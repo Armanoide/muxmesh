@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn directory_answer_parses_from_hub_frame() {
         // the hub's {"dir":{...}} frame must parse into DirectoryAnswer (the
-        // rendez-vous payload) — the hub-side contract, checked here.
+        // mailbox payload) — the hub-side contract, checked here.
         let frame = r#"{"dir":{"me":"me","directory":{"hosts":{}}}}"#;
         let v: serde_json::Value = serde_json::from_str(frame).unwrap();
         let ans: muxmesh_core::DirectoryAnswer = serde_json::from_value(v["dir"].clone()).unwrap();
