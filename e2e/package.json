@@ -1,0 +1,13 @@
+{
+  "name": "muxmesh-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cucumber e2e for the muxmesh one-bar protocol (real docker stack)",
+  "scripts": {
+    "test": "cucumber-js",
+    "test:skip-build": "SKIP_BUILD=1 cucumber-js"
+  },
+  "dependencies": {
+    "@cucumber/cucumber": "^12.9.0"
+  }
+}

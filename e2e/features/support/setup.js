@@ -1,0 +1,27 @@
+// Stack lifecycle for the cucumber e2e: the bash harness's setup/teardown,
+// reused verbatim. run.sh stays the single source of truth for infrastructure
+// (image, network, tokens, containers, real ssh arm): we run it with TESTS=0
+// so it sets up and LEAVES THE STACK RUNNING (no cleanup), then cucumber
+// drives the presses and asserts. Cleanup here, on exit, always.
+
+const { execFileSync } = require("node:child_process");
+const path = require("node:path");
+const { BeforeAll, AfterAll } = require("@cucumber/cucumber");
+
+const REPO = path.resolve(__dirname, "..", "..");
+const HUB = "mm-c", A = "mm-a", B = "mm-b";
+const NET = "muxmesh-e2e-net";
+
+BeforeAll(function () {
+  this.timeout(20 * 60 * 1000); // full cargo build inside the image can take minutes
+  execFileSync("bash", ["-c", "TESTS=0 bash e2e/run.sh"], {
+    cwd: REPO, stdio: "inherit", env: { ...process.env, KEEP: "1" },
+  });
+});
+
+AfterAll(() => {
+  if (process.env.KEEP === "1") { console.log("KEEP=1: stack left running"); return; }
+  execFileSync("bash", ["-c", `docker rm -f ${HUB} ${A} ${B} >/dev/null 2>&1; docker network rm ${NET} >/dev/null 2>&1 || true`], {
+    stdio: "inherit",
+  });
+});

@@ -43,7 +43,16 @@ cleanup() {
   docker rm -f "$HUB" "$A" "$B" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+# TESTS=0 (cucumber mode): setup only — run the setup blocks, skip every
+# assertion, leave the stack RUNNING (no cleanup trap) for cucumber to drive.
+if [ "${TESTS:-1}" = "0" ]; then
+  ok()   { :; }
+  bad()  { echo "  UNEXPECTED FAIL during setup: $*" >&2; FAIL=$((FAIL+1)); }
+  assert_eq() { :; }
+  SKIP_AFTER_ARM=1
+else
+  trap cleanup EXIT
+fi
 
 log "build image $IMAGE"
 if docker image inspect "$IMAGE" >/dev/null 2>&1 && [ "${SKIP_BUILD:-0}" = "1" ]; then
@@ -153,6 +162,13 @@ echo "  armed window: ${ARMED:-NONE}"
 docker exec "$A" tmux -S "$SOCK_A" select-window -t "$ARMED"
 sleep 1
 docker exec "$A" ps -eo pid,ppid,args | grep "[s]sh $HOST_B" || echo "  WARN: no live ssh $HOST_B"
+
+# cucumber mode: the stack is armed and alive — hand over, assertions are
+# cucumber's job now (features/one-bar.feature).
+if [ "${SKIP_AFTER_ARM:-0}" = "1" ]; then
+  echo "  setup complete, stack left running for cucumber"
+  exit "$FAIL"
+fi
 
 log "PRE: both bars visible (status on), parent prefix intact"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on" "$HOST_B bar visible before test"

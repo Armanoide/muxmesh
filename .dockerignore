@@ -3,6 +3,7 @@
 target/
 .git/
 .muxmesh/
+node_modules/
 *.log
 state.json
 token

@@ -1,5 +1,6 @@
 # muxmesh — multi-machine tmux orchestrator (HTTP pivot).
-/target/
+/node_modules/
+e2e/node_modules/
 
 # Secret — NEVER committed (shared hub<->agents token)
 token
