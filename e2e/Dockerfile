@@ -19,9 +19,9 @@ WORKDIR /opt/muxmesh
 COPY --from=build /src/target/release/muxmesh-hub /usr/local/bin/
 COPY --from=build /src/target/release/muxmesh-agent /usr/local/bin/
 COPY --from=build /src/target/release/muxmesh-cli /usr/local/bin/
-# tpm-style plugin entry + sshd bootstrap so mac_mini accepts a REAL ssh from
-# macbook (no simulated ssh process — the poller sees a genuine `ssh mac_mini`).
+# tpm-style plugin entry + sshd bootstrap so the child accepts a REAL ssh
+# from the driver (no simulated ssh process — the poller sees a genuine one).
 COPY muxmesh.tmux /opt/muxmesh/muxmesh.tmux
-COPY scripts/e2e-sshd.sh /opt/muxmesh/sshd-setup.sh
+COPY e2e/sshd-setup.sh /opt/muxmesh/sshd-setup.sh
 RUN chmod +x /opt/muxmesh/*.sh /usr/local/bin/muxmesh-*
 ENTRYPOINT []

@@ -3,5 +3,5 @@ COPY bin-linux/muxmesh-hub /usr/local/bin/
 COPY bin-linux/muxmesh-agent /usr/local/bin/
 COPY bin-linux/muxmesh-cli /usr/local/bin/
 COPY muxmesh.tmux /opt/muxmesh/muxmesh.tmux
-COPY scripts/e2e-sshd.sh /opt/muxmesh/sshd-setup.sh
+COPY e2e/sshd-setup.sh /opt/muxmesh/sshd-setup.sh
 RUN chmod +x /usr/local/bin/muxmesh-* /opt/muxmesh/*.sh

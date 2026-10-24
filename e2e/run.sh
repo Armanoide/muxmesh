@@ -5,7 +5,7 @@
 #   machine_a = driver / master  (prod: macbook) — opens `ssh machine_b`,
 #             presses F10, owns BOTH bars.
 #   machine_b = target / child    (prod: mac_mini) — runs sshd, receives the
-#             remote BarShow/BarHide commands.
+#             remote control/bar commands (GiveControl, BarHide via the hub).
 #   machine_c = hub               (prod: Mac Mini) — router + directory, lives on
 #             its OWN machine; never dials an agent (agents dial it via WS).
 #
@@ -14,9 +14,9 @@
 # (sshd on machine_b, authorized key) so the poller arms the window naturally.
 # Then drives the F10 keystroke with `muxmesh-cli bar-toggle` and asserts the
 # full parent/child bar dance:
-#   press 1 -> machine_a status=off, machine_b status=on  (BarShow pushed+acked)
-#   press 2 -> machine_a status=on,  machine_b status=off (BarHide pushed+acked)
-# Run from repo root:   bash scripts/e2e-docker.sh
+#   press 1 -> machine_a status=off, machine_b status=on  (GiveControl pushed+acked)
+#   press 2 -> machine_a status=on,  machine_b status=off (ResumeControl/BarHide pushed+acked)
+# Run from repo root:   bash e2e/run.sh
 # Cleanup is automatic on exit. SKIP_BUILD=1 reuses the existing image.
 set -euo pipefail
 
@@ -49,7 +49,7 @@ log "build image $IMAGE"
 if docker image inspect "$IMAGE" >/dev/null 2>&1 && [ "${SKIP_BUILD:-0}" = "1" ]; then
   echo "  skipped (image exists, SKIP_BUILD=1)"
 else
-  docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
+  docker build -f e2e/Dockerfile -t "$IMAGE" . >/dev/null
 fi
 
 log "network + tokens (minted BEFORE the server: it loads tokens.json once at startup)"
@@ -167,7 +167,7 @@ log "PRESS 1 (delegate control: bar-toggle in $HOST_A, armed ssh toward $HOST_B)
 docker exec "$A" sh -c "MUXMESH_HOST=$HOST_A MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 1
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "off" "press1: $HOST_A bar hidden"
-assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on"  "press1: $HOST_B bar shown (BarShow)"
+assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on"  "press1: $HOST_B bar shown (delegate: child bar on)"
 # control delegated: parent prefix None AND attached client moved to key
 # table `off` (samoshkin OFF mode). root F10 stays bound but is INACTIVE
 # while the client sits in `off` — press 2 traverses ssh into the child, and
@@ -214,7 +214,7 @@ C1B=$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2
   || bad "CRIT1: PRESSE1 doit donner A=off B=on (enfant seul) — got A=$C1A B=$C1B"
 
 log "CHEMIN CRITIQUE 2: delegate control (fenetre chez l'enfant pendant delegation)"
-# le parent est sourd (prefix None + F10 unbound) : prefix+c doit creer chez B.
+# le parent est sourd (prefix None) : prefix+c doit creer chez B.
 C2WB0=$(docker exec "$B" tmux -S "$SOCK_B" list-windows -a | wc -l | tr -d ' ')
 C2WA0=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
 docker exec "$B" tmux -S "$SOCK_B" new-window -t main:
