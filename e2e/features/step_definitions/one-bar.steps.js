@@ -6,7 +6,7 @@
 const { execFileSync } = require("node:child_process");
 const { Given, When, Then } = require("@cucumber/cucumber");
 
-const A = "mm-a", B = "mm-b";
+const A = "mm-a", B = "mm-b", HUB = "mm-c";
 const SOCK_A = "/tmp/tmux-a.sock", SOCK_B = "/tmp/tmux-b.sock";
 const HOST_A = "machine_a", HOST_B = "machine_b";
 
@@ -18,13 +18,23 @@ function sh(container, cmd) {
 
 // the F10 keystroke, exactly as the tmux binding fires it.
 function pressF10(container, host, sock) {
+  // MUXMESH_IPC_SOCKET: the agent binds ~/.muxmesh/agent.sock; docker exec
+  // does not always carry HOME, so point the CLI at the socket explicitly.
+  const env = `MUXMESH_HOST=${host} MUXMESH_SOCKET=${sock} MUXMESH_IPC_SOCKET=/root/.muxmesh/agent.sock MUXMESH_POLL_HUB=mm-c:9997 HOME=/root`;
   const out = execFileSync(
     "docker",
-    ["exec", container, "sh", "-c",
-      `MUXMESH_HOST=${host} MUXMESH_SOCKET=${sock} MUXMESH_POLL_HUB=mm-c:9997 muxmesh-cli bar-toggle -v`],
+    ["exec", container, "sh", "-c", `${env} muxmesh-cli bar-toggle -v`],
     { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
   );
   return out;
+}
+
+// the hub directory via the agent's IPC socket — did the CLI see the world?
+function pressTrace(container) {
+  return execFileSync(
+    "docker", ["exec", container, "tail", "-5", "/root/.muxmesh/bar-toggle.log"],
+    { encoding: "utf8" },
+  );
 }
 
 const bar = (c, sock) => sh(c, `tmux -S ${sock} show-options -g status | awk '{print $2}'`);
@@ -40,8 +50,16 @@ Then("both bars are visible before the test", () => {
   if (bar(B, SOCK_B) !== "on") throw new Error("machine_b bar not on");
 });
 
-When("I press F10 on machine_a", () => { pressF10(A, HOST_A, SOCK_A); });
-When("I press F10 on machine_b", () => { pressF10(B, HOST_B, SOCK_B); });
+When("I press F10 on machine_a", () => {
+  const out = pressF10(A, HOST_A, SOCK_A);
+  if (out.includes("no agent") || out.includes("agent/hub silent"))
+    throw new Error(`F10 on machine_a: agent path deaf — ${out.trim()}\nlog:\n${pressTrace(A)}`);
+});
+When("I press F10 on machine_b", () => {
+  const out = pressF10(B, HOST_B, SOCK_B);
+  if (out.includes("no agent") || out.includes("agent/hub silent"))
+    throw new Error(`F10 on machine_b: agent path deaf — ${out.trim()}\nlog:\n${pressTrace(B)}`);
+});
 
 Then("machine_a's bar is hidden", () => {
   if (bar(A, SOCK_A) !== "off") throw new Error(`machine_a bar = ${bar(A, SOCK_A)}, want off`);
@@ -92,6 +110,13 @@ Then("machine_a's control is reclaimed (prefix back, F10 alive in root)", () => 
   if (prefix(A, SOCK_A) === "None") throw new Error("prefix still None — parent stuck");
   if (!sh(A, `tmux -S ${SOCK_A} list-keys -T root`).includes("F10"))
     throw new Error("F10 missing from root — parent deaf forever");
+});
+
+Given("the muxmesh stack is running", () => {
+  // setup.js BeforeAll brought it up; cheap liveness check, no re-setup.
+  const running = execFileSync("docker", ["ps", "--format", "{{.Names}}"], { encoding: "utf8" });
+  for (const c of [HUB, A, B])
+    if (!running.includes(c)) throw new Error(`stack container ${c} not running`);
 });
 
 Given("machine_a is forced into the delegated state (prefix None, bar off)", () => {

@@ -14,10 +14,12 @@ const HUB = "mm-c", A = "mm-a", B = "mm-b";
 const NET = "muxmesh-e2e-net";
 
 // cucumber v12: no this.timeout() in hooks — timeout is a hook option (ms).
+// The stack runs ONCE for the whole suite: scenarios are one continuous
+// story (press 1 -> delegate -> press 2 -> reclaim) on live containers.
 BeforeAll({ timeout: 20 * 60 * 1000 }, () => {
   // full cargo build inside the image can take minutes
-  execFileSync("bash", ["-c", `TESTS=0 KEEP=1 bash ${path.join(REPO, "e2e", "run.sh")}`], {
-    cwd: REPO, stdio: "inherit", env: { ...process.env, KEEP: "1" },
+  execFileSync("bash", [path.join(REPO, "e2e", "run.sh")], {
+    cwd: REPO, stdio: "inherit", env: { ...process.env, TESTS: "0", KEEP: "1" },
   });
 });
 
