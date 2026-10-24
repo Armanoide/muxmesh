@@ -31,10 +31,13 @@ function pressF10(container, host, sock) {
 
 // the hub directory via the agent's IPC socket — did the CLI see the world?
 function pressTrace(container) {
-  return execFileSync(
-    "docker", ["exec", container, "tail", "-5", "/root/.muxmesh/bar-toggle.log"],
-    { encoding: "utf8" },
-  );
+  // best-effort diagnostic only: a missing log must never mask the real error.
+  try {
+    return execFileSync(
+      "docker", ["exec", container, "tail", "-5", "/root/.muxmesh/bar-toggle.log"],
+      { encoding: "utf8" },
+    );
+  } catch { return "(no bar-toggle.log)"; }
 }
 
 const bar = (c, sock) => sh(c, `tmux -S ${sock} show-options -g status | awk '{print $2}'`);
@@ -118,7 +121,6 @@ Given("the muxmesh stack is running", () => {
   for (const c of [HUB, A, B])
     if (!running.includes(c)) throw new Error(`stack container ${c} not running`);
 });
-
 Given("machine_a is forced into the delegated state (prefix None, bar off)", () => {
   sh(A, `tmux -S ${SOCK_A} set-option -g prefix None`);
   sh(A, `tmux -S ${SOCK_A} set-option -g status off`);
