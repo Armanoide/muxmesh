@@ -7,8 +7,9 @@
 //!                     + switch-client -T off (samoshkin OFF mode). F10 stays
 //!                     bound in table `off` = the parent's escape hatch.
 //!   PARENT  press 2 -> RECLAIM locally (no network needed for the keyboard).
-//!   CHILD   F10     -> local bar toggle; if hiding, answer ParentReclaim to
-//!                     whoever armed an ssh into us (hub directory).
+//!   CHILD   F10     -> local bar toggle; if hiding, answer GiveControl (or
+//!                     ResumeControl if still delegated) to whoever armed an ssh
+//!                     into us (hub directory).
 
 use muxmesh_core::{Command, HubConfig};
 
@@ -76,7 +77,7 @@ fn delegate(base: &[String], h: &str, cfg: &HubConfig) -> u8 {
 /// The single reclaim path (was two near-copies). Restores prefix + table
 /// root + bar, audits tmux, then fixes the other side via the hub:
 /// `dst = Some(host)` -> BarHide the child (parent pressed F10 itself);
-/// `dst = None` -> answer ParentReclaim to our hub parent (self-reclaim).
+/// `dst = None` -> answer GiveControl/ResumeControl to our hub parent (self-reclaim).
 fn reclaim(base: &[String], dst: Option<&str>, cfg: &HubConfig) -> u8 {
     muxmesh_core::tmux::tmux_run(base, &["set-option", "-gu", "prefix"]);
     muxmesh_core::tmux::run_tmux(base, &["switch-client", "-T", "root"]);

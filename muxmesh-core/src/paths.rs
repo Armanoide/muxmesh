@@ -1,5 +1,5 @@
 //! Where the muxmesh binaries live, and the exact F10 run-shell command.
-//! One spelling for every crate (cli rollback, hub ParentReclaim bind).
+//! One spelling for every crate (cli rollback, hub F10 bind).
 
 /// Absolute path of muxmesh-cli: install dir, MUXMESH_BIN_DIR override, or
 /// bare name (PATH lookup).

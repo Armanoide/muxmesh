@@ -28,10 +28,18 @@ pub enum Command {
     BarHide,
     /// restore the status bar on the target: `set -g status on`.
     BarShow,
-    /// take back delegated control (press-2 answer from the child, routed by
-    /// the hub): restore the default prefix, rebind F10, show the bar. Sent
-    /// BY the child TO its parent after the child's F10 traversed ssh.
-    ParentReclaim,
+    /// hand control TO the child (delegate): cut the parent's prefix and park
+    /// its client in the deaf `off` key-table, so the child's keystrokes reach
+    /// the remote tmux. Two tmux calls (tmux takes one command per invocation):
+    /// `set-option -g prefix None` + `switch-client -T off`. Sent BY the parent
+    /// on press-1; mirrors bar.rs delegate().
+    GiveControl,
+    /// take control BACK (reclaim): restore the default prefix and return the
+    /// client to the `root` key-table, so this machine's own keyboard works
+    /// again. Two tmux calls: `set-option -gu prefix` + `switch-client -T
+    /// root`. Sent BY the child to its parent on press-2; mirrors bar.rs
+    /// reclaim(). Distinct from GiveControl — same verbs, opposite effect.
+    ResumeControl,
     /// agent -> hub ONLY: a state report pushed on the agent's own WS every
     /// interval (replaces the old HTTP POST /state). The hub merges it into
     /// state.json and never routes it to another agent, so a child can never
@@ -130,7 +138,9 @@ impl Command {
             Command::NewSession { name } => vec![name],
             Command::FocusWindow { session, window } => vec![session, window],
             Command::AttachOrDetach { session } => vec![session],
-            Command::BarHide | Command::BarShow | Command::ParentReclaim => vec![],
+            Command::BarHide | Command::BarShow => vec![],
+            // control hand-back: global prefix reset, no name to validate.
+            Command::GiveControl | Command::ResumeControl => vec![],
             // agent->hub state report: no tmux names, nothing to validate.
             Command::ReportState { .. } => vec![],
         }
@@ -141,13 +151,6 @@ impl Command {
         self.names().iter().all(|n| valid_name(n))
     }
 
-    /// Extra argv for `bind-key -n F10 run-shell <cmd>` when re-binding F10
-    /// after a delegation. Only meaningful for ParentReclaim; the agent builds
-    /// it from its own binary path (it knows where muxmesh-cli lives).
-    pub fn is_parent_reclaim(&self) -> bool {
-        matches!(self, Command::ParentReclaim)
-    }
-
     /// A state report pushed by an agent on its own WS. The hub merges it into
     /// state.json (same merge path as the legacy POST /state) and never routes it onward.
     pub fn is_report_state(&self) -> bool {
@@ -155,7 +158,9 @@ impl Command {
     }
 
     /// Full tmux argv for the closed list (never shell-interpolated).
-    /// Returns `tmux <argv...>` arguments, scoped to `session`.
+    /// Returns `tmux <argv...>` arguments, scoped to `session`. Commands that
+    /// need several tmux invocations (AttachOrDetach, GiveControl,
+    /// ResumeControl) return their FIRST step here; execute() runs the rest.
     pub fn tmux_argv(&self) -> Vec<String> {
         match self {
             Command::NewWindow { session } => {
@@ -182,11 +187,15 @@ impl Command {
             Command::BarShow => {
                 vec!["set".into(), "-g".into(), "status".into(), "on".into()]
             }
-            Command::ParentReclaim => {
-                // marker argv: the real work (bind F10, restore prefix, bar on)
-                // runs in execute() as separate tmux calls — tmux takes ONE
-                // command per invocation, a joined argv = "too many arguments".
-                vec![]
+            // delegate: cut the prefix (deaf keyboard); execute() then parks
+            // the client in table `off`. First step = the prefix, like BarHide.
+            Command::GiveControl => {
+                vec!["set-option".into(), "-g".into(), "prefix".into(), "None".into()]
+            }
+            // reclaim: restore the default prefix; execute() then returns the
+            // client to table `root`. First step = the prefix, like BarShow.
+            Command::ResumeControl => {
+                vec!["set-option".into(), "-gu".into(), "prefix".into()]
             }
             Command::ReportState { .. } => {
                 // never executed on tmux: the hub merges it into state.json and
@@ -206,14 +215,16 @@ impl Command {
             Command::FocusWindow { session, window } => format!("{session}:{window}"),
             // global option, no -t target
             Command::BarHide | Command::BarShow => String::new(),
-            Command::ParentReclaim => String::new(),
+            Command::GiveControl | Command::ResumeControl => String::new(),
             Command::ReportState { .. } => String::new(),
         }
     }
 
     /// Execute this command against a local tmux socket, strictly via argv.
-    /// AttachOrDetach is stateful: attached client -> detach, else attach -d.
     /// Every call is audited to stderr (ts, verb, target, ok) — SPEC §7.
+    /// Stateful verbs run their steps in order (tmux: one command each):
+    /// AttachOrDetach (list-clients -> attach|detach), GiveControl (prefix
+    /// None -> table off), ResumeControl (unset prefix -> table root).
     pub fn execute(&self, socket: &str) -> Result<(), String> {
         use std::process::Command as Proc;
 
@@ -222,95 +233,69 @@ impl Command {
             return Ok(());
         }
 
-        let argv: Vec<String> = if matches!(self, Command::AttachOrDetach { .. }) {
-            let target = self.target();
-            let attached = Proc::new("tmux")
-                .args(["-S", socket, "list-clients", "-t", &target])
-                .output()
-                .map(|o| o.status.success() && !o.stdout.is_empty())
-                .unwrap_or(false);
-            if attached {
-                vec!["detach-client".into(), "-t".into(), target]
-            } else {
-                vec!["attach-session".into(), "-d".into(), "-t".into(), target]
-            }
-        } else if self.is_parent_reclaim() {
-            // tmux takes ONE command per invocation — run the three steps as
-            // separate calls. Order = safety: rebind F10 FIRST (so the parent
-            // can always toggle again), then restore the prefix (the keyboard
-            // comes back), then the bar. F10 was never unbound during a
-            // delegation (it stays bound in table `off`), so restoring the
-            // prefix + table root is enough; the root bind is re-issued anyway
-            // (cheap, idempotent) so a parent that lost its binding self-heals.
-            let cmd = crate::bar_toggle_cmd();
-            let steps: [(&str, Vec<&str>); 3] = [
-                ("bind-key", vec!["-T", "root", "-n", "F10", "run-shell", &cmd]),
-                ("set-option", vec!["-gu", "prefix"]),
-                ("set-option", vec!["-g", "status", "on"]),
-            ];
-            let mut all_ok = true;
-            for (verb, args) in steps {
-                let out = Proc::new("tmux")
-                    .arg("-S")
-                    .arg(socket)
-                    .args(std::iter::once(verb).chain(args.iter().copied()))
+        // ordered steps: the FIRST is tmux_argv() (the audited verb), the
+        // rest are follow-up commands tmux needs in a separate invocation.
+        let steps: Vec<Vec<String>> = match self {
+            Command::AttachOrDetach { .. } => {
+                let target = self.target();
+                let attached = Proc::new("tmux")
+                    .args(["-S", socket, "list-clients", "-t", &target])
                     .output()
-                    .map_err(|e| format!("spawn tmux {verb}: {e}"))?;
-                eprintln!(
-                    "muxmesh-agent: exec ts={} verb={verb} ok={}",
-                    now_unix(),
-                    out.status.success()
-                );
-                if !out.status.success() {
-                    all_ok = false;
-                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    if !err.is_empty() {
-                        eprintln!("muxmesh-agent: reclaim step {verb} stderr: {err}");
-                    }
+                    .map(|o| o.status.success() && !o.stdout.is_empty())
+                    .unwrap_or(false);
+                if attached {
+                    vec![vec!["detach-client".into(), "-t".into(), target]]
+                } else {
+                    vec![vec!["attach-session".into(), "-d".into(), "-t".into(), target]]
                 }
             }
-            // switch-client -T root is best-effort: headless servers (no attached
-            // client) answer "no current client" — the keyboard path does not run
-            // there at all, so failing must not mark the reclaim as failed.
-            let woke = Proc::new("tmux")
-                .arg("-S")
-                .arg(socket)
-                .args(["switch-client", "-T", "root"])
-                .output();
-            tracing::debug!("reclaim: switch-client -T root ok={}", woke.map(|o| o.status.success()).unwrap_or(false));
-            return if all_ok {
-                Ok(())
-            } else {
-                Err("reclaim step failed (see audit)".into())
-            };
-        } else {
-            self.tmux_argv()
+            Command::GiveControl => vec![
+                self.tmux_argv(),
+                vec!["switch-client".into(), "-T".into(), "off".into()],
+            ],
+            Command::ResumeControl => vec![
+                self.tmux_argv(),
+                vec!["switch-client".into(), "-T".into(), "root".into()],
+            ],
+            _ => vec![self.tmux_argv()],
         };
 
-        let verb = argv[0].clone();
-        let out = Proc::new("tmux")
-            .arg("-S")
-            .arg(socket)
-            .args(&argv)
-            .output()
-            .map_err(|e| format!("spawn tmux: {e}"))?;
+        self.run_steps(socket, &steps)
+    }
 
-        let ok = out.status.success();
+    /// Run ordered tmux steps (one command per invocation), auditing each.
+    /// Fails if any step fails; the audit names the offending verb+args.
+    fn run_steps(&self, socket: &str, steps: &[Vec<String>]) -> Result<(), String> {
+        use std::process::Command as Proc;
         let target = self.target();
-        // audit line: no secrets, only whitelisted names (already validated).
-        eprintln!(
-            "muxmesh-agent: exec ts={} verb={verb} target={target} ok={ok}",
-            now_unix()
-        );
-        if !ok {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(if err.is_empty() {
-                "tmux failed".into()
-            } else {
-                err
-            });
+        let mut all_ok = true;
+        for argv in steps {
+            let verb = argv[0].clone();
+            let out = Proc::new("tmux")
+                .arg("-S")
+                .arg(socket)
+                .args(argv)
+                .output()
+                .map_err(|e| format!("spawn tmux {verb}: {e}"))?;
+            let ok = out.status.success();
+            // audit line: no secrets, only whitelisted names (already validated).
+            eprintln!(
+                "muxmesh-agent: exec ts={} verb={verb} target={target} ok={ok}",
+                now_unix()
+            );
+            if !ok {
+                all_ok = false;
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if !err.is_empty() {
+                    eprintln!("muxmesh-agent: step {verb} stderr: {err}");
+                }
+            }
         }
-        Ok(())
+        if all_ok {
+            Ok(())
+        } else {
+            Err("tmux step failed (see audit)".into())
+        }
     }
 }
 
@@ -389,6 +374,8 @@ mod tests {
         for (json, cmd) in [
             (r#"{"type":"BarHide"}"#, Command::BarHide),
             (r#"{"type":"BarShow"}"#, Command::BarShow),
+            (r#"{"type":"GiveControl"}"#, Command::GiveControl),
+            (r#"{"type":"ResumeControl"}"#, Command::ResumeControl),
         ] {
             let full = format!(r#"{{"v":1,"id":"c","src":"x","cmd":{json},"ts":1}}"#);
             let env: CommandEnvelope = serde_json::from_str(&full).unwrap();
@@ -397,6 +384,10 @@ mod tests {
         }
         assert_eq!(Command::BarHide.tmux_argv(), ["set", "-g", "status", "off"]);
         assert_eq!(Command::BarShow.tmux_argv(), ["set", "-g", "status", "on"]);
+        // control verbs are multi-step: tmux_argv is the FIRST step (prefix),
+        // execute() adds switch-client. Delegate cuts prefix, reclaim restores it.
+        assert_eq!(Command::GiveControl.tmux_argv(), ["set-option", "-g", "prefix", "None"]);
+        assert_eq!(Command::ResumeControl.tmux_argv(), ["set-option", "-gu", "prefix"]);
     }
 
     #[test]

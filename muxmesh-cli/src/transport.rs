@@ -145,8 +145,10 @@ pub fn post_verb(verb: Command, dst: &str, label: &str, cfg: &muxmesh_core::HubC
 }
 
 /// Answer a press-2 back to the parent: find who armed an ssh INTO us (the
-/// hub directory knows) and POST ParentReclaim via the hub. Best-effort —
-/// never block the local bar toggle on the network.
+/// hub directory knows) and POST GiveControl/ResumeControl via the hub. The
+/// verb depends on our own state: still delegated (prefix None) -> we are
+/// resuming control for the parent's re-press; otherwise we are handing our
+/// bar-given control back. Best-effort — never block the local toggle on net.
 pub fn answer_parent_reclaim(cfg: &muxmesh_core::HubConfig) {
     let me = driver_host();
     let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
@@ -159,7 +161,16 @@ pub fn answer_parent_reclaim(cfg: &muxmesh_core::HubConfig) {
             return;
         }
     };
-    if post_verb(Command::ParentReclaim, &parent, "ParentReclaim", cfg) {
-        tracing::info!("child: answered press-2 -> ParentReclaim queued for parent '{parent}' via hub");
+    let socket = std::env::var("MUXMESH_SOCKET").ok().filter(|s| !s.is_empty());
+    let base = muxmesh_core::tmux::tmux_base(&socket);
+    let delegated = crate::tmux_state::is_delegated(&base);
+    let verb = if delegated {
+        Command::ResumeControl
+    } else {
+        Command::GiveControl
+    };
+    let label = if delegated { "ResumeControl" } else { "GiveControl" };
+    if post_verb(verb, &parent, label, cfg) {
+        tracing::info!("child: answered press-2 -> {label} queued for parent '{parent}' via hub");
     }
 }
