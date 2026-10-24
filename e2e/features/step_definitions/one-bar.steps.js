@@ -55,11 +55,25 @@ Then("both bars are visible before the test", () => {
 
 When("I press F10 on machine_a", () => {
   const out = pressF10(A, HOST_A, SOCK_A);
+  // la delegate est asynchrone (agent->hub->agent B) : attendre qu'elle atterrisse
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    if (bar(B, SOCK_B) === "on") break;
+    if (Date.now() > deadline) break;
+    execFileSync("sleep", ["0.5"]);
+  }
   if (out.includes("no agent") || out.includes("agent/hub silent"))
     throw new Error(`F10 on machine_a: agent path deaf — ${out.trim()}\nlog:\n${pressTrace(A)}`);
 });
 When("I press F10 on machine_b", () => {
   const out = pressF10(B, HOST_B, SOCK_B);
+  // la reclaim remonte par le hub (B->hub->A) : attendre que A soit revenu on
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    if (bar(A, SOCK_A) === "on") break;
+    if (Date.now() > deadline) break;
+    execFileSync("sleep", ["0.5"]);
+  }
   if (out.includes("no agent") || out.includes("agent/hub silent"))
     throw new Error(`F10 on machine_b: agent path deaf — ${out.trim()}\nlog:\n${pressTrace(B)}`);
 });
@@ -82,8 +96,16 @@ Then(/^machine_a's client sits in the deaf key table "([^"]*)"$/, (table) => {
 });
 
 Then(/^exactly one bar is visible: machine_a (on|off), machine_b (on|off)$/, (a, b) => {
-  const ga = bar(A, SOCK_A), gb = bar(B, SOCK_B);
-  if (ga !== a || gb !== b) throw new Error(`bars A=${ga} B=${gb}, want A=${a} B=${b}`);
+  // the presses are asynchronous (agent->hub->agent): wait for tmux to agree.
+  const deadline = Date.now() + 5000;
+  let ga, gb;
+  for (;;) {
+    ga = bar(A, SOCK_A); gb = bar(B, SOCK_B);
+    if (ga === a && gb === b) return;
+    if (Date.now() > deadline) break;
+    execFileSync("sleep", ["0.5"]);
+  }
+  throw new Error(`bars A=${ga} B=${gb}, want A=${a} B=${b}`);
 });
 
 When(/^a window is created on (machine_a|machine_b)$/, (host) => {

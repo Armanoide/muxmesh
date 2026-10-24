@@ -151,6 +151,9 @@ docker exec "$A" tmux -S "$SOCK_A" new-window -t main: \
 # would match immediately on the initial bash window and exit too early.
 ARMED=""
 for i in $(seq 1 30); do
+  # the agent is WS-only (WS-Refacto: no embedded badge poller) — nothing else
+  # stamps @muxmesh-armed-win, so the harness runs one badge pass per tick.
+  docker exec "$A" sh -c "MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli poll --once" >/dev/null 2>&1
   ARMED=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a -F '#{window_id} #{@muxmesh-armed-win}' | awk '$2=="1"{print $1; exit}')
   [ -n "$ARMED" ] && break
   sleep 0.5
