@@ -165,20 +165,60 @@ mod tests {
 
     #[test]
     fn child_ignores_give_control_when_hub_reports_a_parent() {
-        // A machine whose hub directory shows an inbound ssh into it is a child;
-        // an inbound GiveControl addressed to it must be ignored (no ack).
+        // Nominal case: hub reachable, directory shows a live parent with an
+        // inbound ssh into "me" -> I am a child -> inbound GiveControl (the
+        // parent's verb) is ignored, no ack. A real TcpListener stands up the
+        // hub so fetch_state succeeds and parents_of is non-empty.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"hosts":{"parent":{"host":"parent","armed":true,"seen":9999999999,"parents":["me"]}}}"#;
+        std::thread::spawn(move || {
+            // serve one GET /state, then drop the connection.
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
         let c = muxmesh_core::AgentConfig {
-            hub: "127.0.0.1".into(),
-            port: 9, // closed -> fetch_state empty -> treated as parent (safe)
+            hub: addr.ip().to_string(),
+            port: addr.port(),
             host: "me".into(),
             interval: 15,
             tmux_socket: String::new(),
         };
-        // hub unreachable here -> am_i_child=false -> NOT ignored (executes, acks).
-        // Proves the safe-default: a flaky hub never silently drops GiveControl.
         let gc = r#"{"v":1,"id":"g-1","src":"parent","dst":"me","cmd":{"type":"GiveControl"},"ts":1}"#;
-        let ack: muxmesh_core::Ack =
-            serde_json::from_str(&ws::session::execute_and_ack(&c, gc).unwrap()).unwrap();
-        assert_eq!(ack.id, "g-1");
+        assert_eq!(
+            ws::session::execute_and_ack(&c, gc),
+            None,
+            "child with a live parent must ignore GiveControl"
+        );
+    }
+
+    #[test]
+    fn hub_unreachable_assumes_child_and_ignores_give_control() {
+        // CRIT2 safe-default: hub down (port closed) -> cannot prove parentage
+        // -> assume child -> GiveControl ignored, NOT executed. Executing it on
+        // a hub outage would cut our own prefix and leave us deaf (CRIT2).
+        let c = muxmesh_core::AgentConfig {
+            hub: "127.0.0.1".into(),
+            port: 9, // closed -> fetch_state empty -> assume child
+            host: "me".into(),
+            interval: 15,
+            tmux_socket: String::new(),
+        };
+        let gc = r#"{"v":1,"id":"g-2","src":"parent","dst":"me","cmd":{"type":"GiveControl"},"ts":1}"#;
+        assert_eq!(
+            ws::session::execute_and_ack(&c, gc),
+            None,
+            "hub unreachable -> assume child -> ignore GiveControl (CRIT2 safe-default)"
+        );
     }
 }

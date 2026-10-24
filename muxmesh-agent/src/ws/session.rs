@@ -229,12 +229,19 @@ pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<St
     Some(serde_json::to_string(&ack).unwrap_or_else(|_| "{}".into()))
 }
 
-/// Am I a child right now? A child = this machine has a live parent, i.e.
-/// another registered host currently has an inbound ssh INTO me (parents_of).
-/// Reads the hub directory over HTTP; on unreachable/corrupt it returns false
-/// (treat as parent) so a flaky hub never silently drops a legitimate command.
+/// Am I a child right now? A child = another registered host currently has a
+/// live ssh INTO me (parents_of on the hub directory). The hub is the single
+/// source of truth: we ask it, we never cache the map locally. Hub unreachable
+/// or empty directory -> cannot prove parentage -> assume child -> ignore any
+/// inbound GiveControl. No hub means no commands: a GiveControl that cannot be
+/// checked against the directory is not executed (executing it blind would cut
+/// our own prefix and leave us deaf while the parent thinks it holds control).
 fn am_i_child(cfg: &muxmesh_core::AgentConfig) -> bool {
-    let doc = muxmesh_core::poll::fetch_state(&cfg.hub_addr());
+    let doc = muxmesh_core::poll::fetch_state(&muxmesh_core::agent_poll_hub(cfg));
+    if doc.hosts.is_empty() {
+        tracing::debug!("am_i_child: hub directory empty/unreachable -> assume child");
+        return true;
+    }
     !muxmesh_core::tmux::parents_of(&doc, &cfg.host).is_empty()
 }
 
