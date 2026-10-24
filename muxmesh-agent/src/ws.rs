@@ -3,21 +3,25 @@
 //! The agent dials /agent/ws at startup with its machine token headers and
 //! keeps the channel open for life (backoff 1s -> 30s, reset on success).
 //! The hub NEVER dials the agent — this task is the only contact.
+//!
+//! The channel object (Channel) is the stable half: it outlives every socket
+//! and carries what the socket cannot — the rendez-vous for hub answers and
+//! the identity of this machine. The CLI's IPC handler holds a Channel, never
+//! a socket: an F10 pressed while the WS is reconnecting gets "ws down", not
+//! a panic. Commands are NEVER queued while the WS is down: a stale verb
+//! replayed minutes later would cut a prefix nobody asked for.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[path = "ws/session.rs"]
 pub mod session;
-pub use session::run_socket_until_dead;
 
-// execute_and_ack + WsLogLayer are reached through ws::session::* (main.rs
-// and tests spell the full path) — re-export kept for ws:: dispatch callers.
-#[allow(unused_imports)]
-pub use session::{execute_and_ack, WsLogLayer};
+pub use session::run_socket_until_dead;
 
 /// Keepalive cadence: one WS ping per 30 s.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -28,6 +32,48 @@ pub const MAX_MISSED_PONGS: u64 = 2;
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+use crate::ipc::HubRendezvous;
+
+/// The machine's persistent hub channel: identity, the live socket's sender,
+/// and the rendez-vous where hub answers (directory) are deposited by the
+/// session. Cloned (Arc) into the IPC listener; survives every reconnect.
+pub struct Channel {
+    /// our hub identity (canonical host key) — the src of every relayed send.
+    pub host: String,
+    /// the live socket's sender, set by run_socket_until_dead while connected.
+    /// None = WS down: push_frame fails immediately (no queue, no replay).
+    tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// hub answers (AskDirectory -> DirectoryAnswer) land here. One rendez-vous,
+    /// shared by reference with the IPC listener (Clone = handles to one state).
+    pub rv: HubRendezvous,
+}
+
+impl Channel {
+    pub fn new(host: String) -> Self {
+        Channel {
+            host,
+            tx: Mutex::new(None),
+            rv: HubRendezvous::default(),
+        }
+    }
+
+    /// Hand the live socket's sender to the channel (session start), or take
+    /// it back when the session ends (None -> push_frame fails again).
+    pub async fn attach_socket(&self, tx: Option<tokio::sync::mpsc::UnboundedSender<String>>) {
+        *self.tx.lock().await = tx;
+    }
+
+    /// Send one text frame to the hub on the live socket. Err when the WS is
+    /// down — commands are never queued: a stale verb replayed minutes later
+    /// would cut a prefix nobody asked for (the CLI hears "ws down").
+    pub async fn push_frame(&self, frame: String) -> Result<(), String> {
+        if let Some(t) = &*self.tx.lock().await {
+            return t.send(frame).map_err(|_| "ws channel closed".into());
+        }
+        Err("ws down".into())
+    }
+}
+
 /// Persistent outbound WS channel: dial /agent/ws forever with the machine
 /// token headers. One successful session hands the socket to
 /// run_socket_until_dead; when it dies, reconnect with exponential backoff
@@ -36,6 +82,7 @@ pub type Ws =
 /// many agents ever hammer a restarting hub.
 pub async fn dial_hub_forever(
     cfg: Arc<muxmesh_core::AgentConfig>,
+    chan: Arc<Channel>,
     log_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
     let url = {
@@ -58,7 +105,7 @@ pub async fn dial_hub_forever(
         match connect_with_auth(&url, &cfg.host, &token).await {
             Ok((ws, resp)) => {
                 tracing::info!("ws: connected to {url} (status {})", resp.status());
-                run_socket_until_dead(&cfg, ws, log_rx.resubscribe()).await;
+                run_socket_until_dead(&cfg, &chan, ws, log_rx.resubscribe()).await;
                 tracing::warn!("ws: channel closed -> reconnecting");
                 backoff = Duration::from_secs(1); // success resets the ramp
             }
@@ -107,9 +154,10 @@ async fn connect_with_auth(
         (Ok(h), Ok(t)) => (h, t),
         _ => {
             tracing::error!("ws: host/token contain invalid header characters (check token file)");
-            return Err(tokio_tungstenite::tungstenite::Error::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid header value"),
-            ));
+            return Err(tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid header value",
+            )));
         }
     };
     let h = req.headers_mut();

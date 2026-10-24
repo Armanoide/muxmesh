@@ -7,18 +7,19 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use muxmesh_core::{Ack, CommandEnvelope};
+use muxmesh_core::{Ack, CommandEnvelope, DirectoryAnswer};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::tmux::{build_state, resolve_socket, tmux_prefix_and_status, tmux_sessions};
-use crate::ws::{Ws, MAX_MISSED_PONGS, PING_INTERVAL};
+use crate::ws::{Channel, Ws, MAX_MISSED_PONGS, PING_INTERVAL};
 
 /// Hold ONE connected socket open until it dies: four concurrent tasks share
 /// it — read pushed commands, write outbound frames, ping, watch liveness —
 /// and the first to finish ends the session so dial_hub_forever reconnects.
 pub async fn run_socket_until_dead(
     cfg: &Arc<muxmesh_core::AgentConfig>,
+    chan: &Arc<Channel>,
     ws: Ws,
     log_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
@@ -27,16 +28,32 @@ pub async fn run_socket_until_dead(
     let last_ping_seq = Arc::new(AtomicU64::new(0)); // last ping WE sent
     let alive_seq = Arc::new(AtomicU64::new(0)); // last ping the hub answered
     let (sink, stream) = ws.split();
-    // outbound frames (acks + keepalive pings) go through one channel so a
-    // single task owns the sink (a SplitSink cannot be shared).
+    // outbound frames (acks + keepalive pings + CLI relays) go through one
+    // channel so a single task owns the sink (a SplitSink cannot be shared).
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    // hand the live sender to the shared channel and flush what queued while
+    // the WS was down (CLI relays); detach when this session ends. The sink
+    // task converts text frames to Messages; the channel speaks plain strings.
+    let (text_tx, mut text_rx) = mpsc::unbounded_channel::<String>();
+    chan.attach_socket(Some(text_tx)).await;
+    let pump_tx = tx.clone();
+    let pump = tokio::spawn(async move {
+        while let Some(text) = text_rx.recv().await {
+            if pump_tx.send(Message::Text(text.into())).is_err() {
+                break; // writer gone -> session over (the select! ends too)
+            }
+        }
+    });
 
     tokio::select! {
         _ = write_frames_until_dead(cfg, sink, rx, log_rx) => {}
-        _ = read_and_execute_commands(cfg, stream, tx.clone(), alive_seq.clone()) => {}
+        _ = read_and_execute_commands(cfg, chan, stream, tx.clone(), alive_seq.clone()) => {}
         _ = send_keepalive_ping(tx.clone(), last_ping_seq.clone()) => {}
         _ = watch_for_dead_hub(last_ping_seq, alive_seq) => {}
     }
+
+    chan.attach_socket(None).await; // this socket is gone: queue again
+    pump.abort(); // the text->Message pump has no sink anymore
 }
 
 /// The ONLY owner of the sink: drains outbound frames (acks queued by the
@@ -96,9 +113,11 @@ async fn write_frames_until_dead(
 }
 
 /// Read pushed frames until the socket dies: execute commands addressed to us
-/// (ack queued on `tx`), record pongs as liveness proof, end on Close/error.
+/// (ack queued on `tx`), deposit directory answers on the shared channel's
+/// rendez-vous, record pongs as liveness proof, end on Close/error.
 async fn read_and_execute_commands(
     cfg: &Arc<muxmesh_core::AgentConfig>,
+    chan: &Arc<Channel>,
     mut stream: SplitStream<Ws>,
     tx: mpsc::UnboundedSender<Message>,
     alive_seq: Arc<AtomicU64>,
@@ -106,7 +125,16 @@ async fn read_and_execute_commands(
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Some(ack) = execute_and_ack(cfg, text.as_str()) {
+                // directory answer first: it carries no envelope and must reach
+                // the IPC waiter, not the command executor.
+                if let Some(ans) = parse_directory_answer(text.as_str()) {
+                    chan.rv.deposit(ans).await;
+                    continue;
+                }
+                // role facts from the LOCAL scan (same data ReportState pushes):
+                // who has a live ssh INTO us. Zero network, every command.
+                let parents = muxmesh_core::tmux::ssh_parent_hosts();
+                if let Some(ack) = execute_and_ack(cfg, text.as_str(), &parents) {
                     if tx.send(Message::Text(ack.into())).is_err() {
                         return;
                     }
@@ -128,6 +156,16 @@ async fn read_and_execute_commands(
             }
         }
     }
+}
+
+/// Parse a hub directory-answer frame `{"dir":{"me":..,"directory":{..}}}`.
+/// None for commands/acks/log frames. Cheap substring pre-check first.
+fn parse_directory_answer(text: &str) -> Option<DirectoryAnswer> {
+    if !text.contains("\"dir\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    serde_json::from_value(v.get("dir")?.clone()).ok()
 }
 
 /// Outbound keepalive: one seq-stamped WS ping per PING_INTERVAL, so the
@@ -164,7 +202,18 @@ async fn watch_for_dead_hub(last_ping_seq: Arc<AtomicU64>, alive_seq: Arc<Atomic
 /// argv-scoped tmux call for a command addressed to us; dst mismatch, a pushed
 /// ReportState (agent->hub only) or a bad frame -> no ack (None): the hub logs
 /// the queue TTL drop instead.
-pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<String> {
+///
+/// Role guard: `inbound_parents` = host keys with a live ssh INTO us, from
+/// OUR OWN local scan (the same data ReportState carries to the hub — zero
+/// network here). A child ignores the parent's verb (GiveControl, meta
+/// `ignore_by_child`); no inbound ssh visible -> we look like a parent -> the
+/// verb is ours to execute. The hub routed by its directory; this re-checks
+/// with local truth (WS-Refacto §9: the agent makes no HTTP calls).
+pub fn execute_and_ack(
+    cfg: &muxmesh_core::AgentConfig,
+    text: &str,
+    inbound_parents: &[String],
+) -> Option<String> {
     let env: CommandEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
         Err(e) => {
@@ -187,12 +236,11 @@ pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<St
         tracing::warn!("ws: ignoring inbound ReportState id={} (agent->hub only)", env.id);
         return None;
     }
-    // Role guard, read from the command's declarative meta (tmux_argv_meta):
-    // a child = a machine with a live parent inbound. GiveControl is the
-    // parent's verb, so a child that receives it (misaddressed or forged)
-    // ignores it. The rule lives on the Command, not in a per-verb `if` here.
+    // Role guard, declarative (tmux_argv_meta): a child ignores the parent's
+    // verb. Childhood = inbound_parents non-empty, passed by the caller from
+    // our local ssh-parent scan (no network — see fn doc).
     let meta = env.cmd.tmux_argv_meta();
-    if meta.ignore_by_child && am_i_child(cfg) {
+    if meta.ignore_by_child && !inbound_parents.is_empty() {
         tracing::warn!(
             "ws: ignoring {:?} id={} (I am a child — not my verb)",
             env.cmd,
@@ -227,22 +275,6 @@ pub fn execute_and_ack(cfg: &muxmesh_core::AgentConfig, text: &str) -> Option<St
         }
     };
     Some(serde_json::to_string(&ack).unwrap_or_else(|_| "{}".into()))
-}
-
-/// Am I a child right now? A child = another registered host currently has a
-/// live ssh INTO me (parents_of on the hub directory). The hub is the single
-/// source of truth: we ask it, we never cache the map locally. Hub unreachable
-/// or empty directory -> cannot prove parentage -> assume child -> ignore any
-/// inbound GiveControl. No hub means no commands: a GiveControl that cannot be
-/// checked against the directory is not executed (executing it blind would cut
-/// our own prefix and leave us deaf while the parent thinks it holds control).
-fn am_i_child(cfg: &muxmesh_core::AgentConfig) -> bool {
-    let doc = muxmesh_core::poll::fetch_state(&muxmesh_core::agent_poll_hub(cfg));
-    if doc.hosts.is_empty() {
-        tracing::debug!("am_i_child: hub directory empty/unreachable -> assume child");
-        return true;
-    }
-    !muxmesh_core::tmux::parents_of(&doc, &cfg.host).is_empty()
 }
 
 /// tracing layer: every log event becomes {"log":"<formatted line>"} on the
