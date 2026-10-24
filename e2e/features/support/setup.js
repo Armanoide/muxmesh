@@ -12,8 +12,9 @@ const REPO = path.resolve(__dirname, "..", "..");
 const HUB = "mm-c", A = "mm-a", B = "mm-b";
 const NET = "muxmesh-e2e-net";
 
-BeforeAll(function () {
-  this.timeout(20 * 60 * 1000); // full cargo build inside the image can take minutes
+// cucumber v12: no this.timeout() in hooks — timeout is a hook option (ms).
+BeforeAll({ timeout: 20 * 60 * 1000 }, () => {
+  // full cargo build inside the image can take minutes
   execFileSync("bash", ["-c", "TESTS=0 bash e2e/run.sh"], {
     cwd: REPO, stdio: "inherit", env: { ...process.env, KEEP: "1" },
   });
