@@ -122,3 +122,15 @@ mod tests {
         std::env::remove_var("MUXMESH_IPC_SOCKET");
     }
 }
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+    #[test]
+    fn ask_directory_frame_carries_the_hubs_routing_key() {
+        // the hub routes inbound frames by substring "ask_directory" — an
+        // untagged {} was dropped there (e2e: press-2 never found its parent).
+        let f = serde_json::to_string(&AskDirectory {}).unwrap();
+        assert!(f.contains("ask_directory"), "frame must carry the key: {f}");
+    }
+}
