@@ -8,7 +8,8 @@ const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 const { BeforeAll, AfterAll } = require("@cucumber/cucumber");
 
-const REPO = path.resolve(__dirname, "..", "..");
+// setup.js lives in e2e/features/support/ -> repo root is three levels up.
+const REPO = path.resolve(__dirname, "..", "..", "..");
 const HUB = "mm-c", A = "mm-a", B = "mm-b";
 const NET = "muxmesh-e2e-net";
 
