@@ -112,7 +112,7 @@ docker run -d --name "$B" --network "$NET" --network-alias "$HOST_B" -v "$VOL":/
 docker run -d --name "$A" --network "$NET" --network-alias "$HOST_A" \
   -e MUXMESH_HOST="$HOST_A" -e MUXMESH_HUB="$HUB" -e MUXMESH_PORT=9997 \
   -e MUXMESH_TMUX_SOCKET="$SOCK_A" -e MUXMESH_SOCKET="$SOCK_A" -e RUST_LOG=debug \
-  "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; export MUXMESH_SOCKET=$SOCK_A; bash /opt/muxmesh/muxmesh.tmux > /tmp/muxtmux-A.log 2>&1; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; printf '[agent]\nhost = \"$HOST_A\"\nhub = \"$HUB\"\nport = 9997\n[poll]\nhub = \"$HUB:9997\"\n' > ~/.config/muxmesh/config.toml; exec muxmesh-agent" >/dev/null
+  "$IMAGE" sh -c "tmux -S $SOCK_A new-session -d -s main; export MUXMESH_SOCKET=$SOCK_A; bash /opt/muxmesh/muxmesh.tmux > /tmp/muxtmux-A.log 2>&1; mkdir -p ~/.config/muxmesh; printf '%s' '$TOK_A' > ~/.config/muxmesh/token; chmod 600 ~/.config/muxmesh/token; printf '[agent]\nhost = \"$HOST_A\"\nhub = \"$HUB\"\nport = 9997\ntmux_socket = \"$SOCK_A\"\n[poll]\nhub = \"$HUB:9997\"\n' > ~/.config/muxmesh/config.toml; exec muxmesh-agent" >/dev/null
 
 log "wait for both agents to register + WS-connect"
 for i in $(seq 1 60); do
