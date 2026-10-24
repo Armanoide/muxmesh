@@ -455,3 +455,38 @@ async fn hub_merges_ws_report_state() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// WS directory question: an agent sends {"ask_directory":{}} on its own
+/// /agent/ws and the hub answers {"dir":{"me":..,"directory":{..}}} on the
+/// SAME socket — no GET /state anywhere in the fleet (WS-Refacto §9).
+#[tokio::test]
+async fn hub_answers_ask_directory_on_ws() {
+    let mut hub = Hub::new();
+    let tok_me = hub.mint("agent-a");
+    let tok_parent = hub.mint("parent-a");
+    hub.spawn();
+
+    // a parent reports an outbound ssh INTO agent-a, so the directory answer
+    // must name it (parents_of data lives in the merged state.json).
+    let mut parent = hub.ws_connect("parent-a", &tok_parent).await;
+    let report = r#"{"v":1,"id":"s-1","src":"parent-a","dst":"hub","ts":1,"cmd":{"type":"ReportState","state":{"host":"parent-a","armed":true,"seen":1,"sessions":[],"parents":["agent-a"]}}}"#;
+    parent.send(Message::Text(report.into())).await.expect("parent report");
+
+    let mut agent = hub.ws_connect("agent-a", &tok_me).await;
+    agent
+        .send(Message::Text(r#"{"ask_directory":{}}"#.into()))
+        .await
+        .expect("send ask_directory");
+
+    let text: String = Hub::recv_text(&mut agent).await;
+    let v: serde_json::Value = serde_json::from_str(&text).expect("dir answer json");
+    let dir = &v["dir"];
+    assert_eq!(dir["me"], "agent-a", "answer: {text}");
+    // the directory must carry the parent (the agent computes parents_of from it).
+    assert!(
+        dir["directory"]["hosts"]
+            .get("parent-a")
+            .is_some_and(|h| h["parents"].as_array().is_some_and(|p| p.iter().any(|x| x == "agent-a"))),
+        "directory must include parent-a with parents [agent-a]: {text}"
+    );
+}
