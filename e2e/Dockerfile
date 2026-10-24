@@ -1,6 +1,6 @@
 # E2E test image: builds the real muxmesh binaries (hub/agent/cli) on Linux
-# and runs tmux inside. One image, three roles (hub / agent-mac_mini /
-# agent-macbook) selected by command at run time. NOT for macOS deploy — the
+# and runs tmux inside. One image, three roles (hub / agent machine_b /
+# agent machine_a) selected by command at run time. NOT for macOS deploy — the
 # Linux binary is a test artifact only; each real machine builds natively.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
