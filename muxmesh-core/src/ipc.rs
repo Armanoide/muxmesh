@@ -54,7 +54,11 @@ impl IpcResponse {
 /// (every host's reported state), so it — not the agent — answers who is
 /// armed and who has a live ssh INTO me. This frame replaces every GET
 /// /state: the answer comes back on the channel the agent already owns.
+/// tag `ask_directory`: the hub routes inbound frames by substring match on
+/// this key — an untagged empty struct serialized to `{}` and was silently
+/// dropped ("non-ack frame ignored"), so the CLI waited 5s on nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ask_directory", rename_all = "snake_case")]
 pub struct AskDirectory {}
 
 /// hub -> agent on the WS: the answer to AskDirectory, pushed on the same
