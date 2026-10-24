@@ -19,7 +19,7 @@ const NET = "muxmesh-e2e-net";
 BeforeAll({ timeout: 20 * 60 * 1000 }, () => {
   // full cargo build inside the image can take minutes
   execFileSync("bash", [path.join(REPO, "e2e", "run.sh")], {
-    cwd: REPO, stdio: "inherit", env: { ...process.env, TESTS: "0", KEEP: "1" },
+    cwd: REPO, stdio: "inherit", env: { ...process.env, TESTS: "0", KEEP: "1", SKIP_BUILD: process.env.SKIP_BUILD },
   });
 });
 
