@@ -28,17 +28,18 @@ pub enum Command {
     BarHide,
     /// restore the status bar on the target: `set -g status on`.
     BarShow,
-    /// hand control TO the child (delegate): cut the parent's prefix and park
-    /// its client in the deaf `off` key-table, so the child's keystrokes reach
-    /// the remote tmux. Two tmux calls (tmux takes one command per invocation):
-    /// `set-option -g prefix None` + `switch-client -T off`. Sent BY the parent
+    /// hand control TO the child (delegate, tmux-remote recipe): deafen this
+    /// server's keyboard with the GLOBAL key-table, not a per-client move —
+    /// `set-option -g prefix None` + `set-option -g key-table off` +
+    /// `refresh-client -S`. key-table is server state: every client, now and
+    /// later, is deaf except the F10 bound in table `off`. Sent BY the parent
     /// on press-1; mirrors bar.rs delegate().
     GiveControl,
-    /// take control BACK (reclaim): restore the default prefix and return the
-    /// client to the `root` key-table, so this machine's own keyboard works
-    /// again. Two tmux calls: `set-option -gu prefix` + `switch-client -T
-    /// root`. Sent BY the child to its parent on press-2; mirrors bar.rs
-    /// reclaim(). Distinct from GiveControl — same verbs, opposite effect.
+    /// take control BACK (reclaim, tmux-remote recipe): unset the GLOBAL
+    /// prefix and key-table so this machine's own keyboard works again —
+    /// `set-option -gu prefix` + `set-option -gu key-table` +
+    /// `refresh-client -S`. Sent BY the child to its parent on press-2;
+    /// mirrors bar.rs reclaim(). Distinct from GiveControl — opposite effect.
     ResumeControl,
     /// agent -> hub ONLY: a state report pushed on the agent's own WS every
     /// interval (replaces the old HTTP POST /state). The hub merges it into
@@ -302,14 +303,20 @@ impl Command {
             }
             Command::GiveControl => vec![
                 self.tmux_argv(),
-                vec!["switch-client".into(), "-T".into(), "off".into()],
+                vec!["set-option".into(), "-g".into(), "key-table".into(), "off".into()],
+                vec!["refresh-client".into(), "-S".into()],
             ],
-            // the child's press-2 answer: restore prefix AND bar — reclaiming
-            // control with a hidden bar would leave the parent deaf and blind.
+            // reclaim: restore prefix AND the global key-table; execute() and
+            // execute_steps_for_test must stay byte-identical (the pinned test
+            // guards the recipe tmux-remote established).
             Command::ResumeControl => vec![
                 self.tmux_argv(),
+                vec!["set-option".into(), "-gu".into(), "key-table".into()],
+                // the bar returns WITH control: a reclaimed parent that stays
+                // dark is blind (the live e2e regression). Visibility belongs
+                // here; the badge TEXT belongs to the poller (single writer).
                 vec!["set-option".into(), "-g".into(), "status".into(), "on".into()],
-                vec!["switch-client".into(), "-T".into(), "root".into()],
+                vec!["refresh-client".into(), "-S".into()],
             ],
             _ => vec![self.tmux_argv()],
         };
@@ -321,10 +328,16 @@ impl Command {
     /// verbs (ResumeControl's bar restore) stay pinned without a live socket.
     pub fn execute_steps_for_test(&self) -> Vec<Vec<String>> {
         match self {
+            Command::GiveControl => vec![
+                self.tmux_argv(),
+                vec!["set-option".into(), "-g".into(), "key-table".into(), "off".into()],
+                vec!["refresh-client".into(), "-S".into()],
+            ],
             Command::ResumeControl => vec![
                 self.tmux_argv(),
+                vec!["set-option".into(), "-gu".into(), "key-table".into()],
                 vec!["set-option".into(), "-g".into(), "status".into(), "on".into()],
-                vec!["switch-client".into(), "-T".into(), "root".into()],
+                vec!["refresh-client".into(), "-S".into()],
             ],
             _ => vec![self.tmux_argv()],
         }
@@ -458,15 +471,27 @@ mod tests {
     }
 
     #[test]
-    fn resume_control_steps_restore_prefix_bar_and_table() {
-        // press-2 at the child: the parent's reclaim must restore ALL THREE —
-        // prefix, bar (status on), key table. A hidden bar after reclaim was
-        // the live e2e failure (control back, keyboard blind).
+    fn resume_control_steps_restore_prefix_table_and_bar_globally() {
+        // press-2 at the child: tmux-remote recipe — unset prefix AND the
+        // GLOBAL key-table, bar back on, repaint. switch-client is per-client
+        // and was the rule violation (new/headless clients heard the prefix).
         let steps = Command::ResumeControl.execute_steps_for_test();
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0], ["set-option", "-gu", "prefix"]);
-        assert_eq!(steps[1], ["set-option", "-g", "status", "on"]);
-        assert_eq!(steps[2], ["switch-client", "-T", "root"]);
+        assert_eq!(steps[1], ["set-option", "-gu", "key-table"]);
+        assert_eq!(steps[2], ["set-option", "-g", "status", "on"]);
+        assert_eq!(steps[3], ["refresh-client", "-S"]);
+    }
+
+    #[test]
+    fn give_control_steps_deafen_prefix_and_key_table_globally() {
+        // press-1 at the parent: prefix None + key-table off (server-global)
+        // + repaint. F10 stays bound in table `off` -> reclaim never dies.
+        let steps = Command::GiveControl.execute_steps_for_test();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], ["set-option", "-g", "prefix", "None"]);
+        assert_eq!(steps[1], ["set-option", "-g", "key-table", "off"]);
+        assert_eq!(steps[2], ["refresh-client", "-S"]);
     }
 
     #[test]

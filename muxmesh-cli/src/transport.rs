@@ -70,6 +70,13 @@ pub fn ask_directory() -> Option<muxmesh_core::StateDoc> {
     }
 }
 
+/// Is the hub directory reachable right now (agent + WS alive)? bar-toggle
+/// uses this to refuse a blind role decision: no directory -> we cannot know
+/// if we are parent or child -> never cut the prefix (safe-default CRIT2).
+pub fn directory_reachable() -> bool {
+    ask_agent(&IpcRequest::AskDirectory).map(|r| r.ok).unwrap_or(false)
+}
+
 /// Our hub identity: MUST equal the agent's canonical host name (the key in
 /// tokens.json) — the same resolution the agent dials with. NOT `hostname -s`
 /// (macOS mDNS advertises a different name the hub never registered).

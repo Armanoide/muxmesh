@@ -86,7 +86,9 @@ pub fn armed_host_of_current_window(cfg: &HubConfig) -> Option<String> {
     None
 }
 
-/// Post-reclaim audit: re-read tmux, never claim success on faith.
+/// Post-reclaim audit: re-read tmux, never claim success on faith. The
+/// delegated state is prefix None + GLOBAL key-table off (tmux-remote), so
+/// the audit checks both — a prefix back in table `off` would still be deaf.
 pub fn reclaim_audit(base: &[String]) -> (bool, bool) {
     let prefix_back = muxmesh_core::tmux::tmux_out(base, &["show-options", "-gv", "prefix"])
         .map(|o| o.trim() != "None")
@@ -94,5 +96,8 @@ pub fn reclaim_audit(base: &[String]) -> (bool, bool) {
     let f10_back = muxmesh_core::tmux::tmux_out(base, &["list-keys", "-T", "root"])
         .map(|k| k.contains("F10"))
         .unwrap_or(false);
-    (prefix_back, f10_back)
+    let kt = muxmesh_core::tmux::tmux_out(base, &["show-options", "-gv", "key-table"])
+        .map(|o| o.trim() != "off")
+        .unwrap_or(true);
+    (prefix_back && kt, f10_back)
 }

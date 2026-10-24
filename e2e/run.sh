@@ -123,15 +123,13 @@ done
 echo "  state: $(docker exec "$HUB" cat /data/state.json)"
 
 log "arm machine_a window toward $HOST_B (REAL ssh)"
-# client factice ATTACHE des ici : switch-client -T off est un etat PAR
-# CLIENT — sans client attache tmux repond 'no current client' et la bascule
-# OFF mode ne peut pas etre verifiee. En prod le client est toujours attache
-# (le terminal de l'utilisateur). detach-client -a a la fin du script.
-# script(1) alloue un pty (docker exec -d n'en a pas -> tmux attach meurt
-# 'lost terminal'). Le fifo avec writer permanent (sleep, setsid) garde les
-# deux bouts ouverts quand le shell exec() se termine ; TERM explicite car
-# l'environnement du conteneur est nu. Le client reste attache jusqu'a la fin
-# du run (conteneur detruit au cleanup).
+# client factice ATTACHE : la delegation est un etat GLOBAL (key-table off,
+# tmux-remote) mais le harness verifie aussi #{client_key_table} — un client
+# doit donc etre attache pour la lecture. script(1) alloue un pty (docker exec
+# -d n'en a pas -> tmux attach meurt 'lost terminal'). Le fifo avec writer
+# permanent (sleep, setsid) garde les deux bouts ouverts quand le shell exec()
+# se termine ; TERM explicite car l'environnement du conteneur est nu. Le
+# client reste attache jusqu'a la fin du run (conteneur detruit au cleanup).
 docker exec "$A" sh -c 'rm -f /tmp/attach.fifo; mkfifo /tmp/attach.fifo'
 docker exec "$A" sh -c '(setsid sleep 3600 >/tmp/attach.fifo &); setsid sh -c "TERM=xterm-256color script -q -c \"tmux -S '"$SOCK_A"' attach -t main\" /dev/null </tmp/attach.fifo >/dev/null 2>&1 & exit"'
 sleep 2
@@ -185,17 +183,16 @@ log "PRESS 1 (delegate control: bar-toggle in $HOST_A, armed ssh toward $HOST_B)
 # container id (9e079a56cb5c), not machine_a -> the hub rejects POST /cmd 401.
 docker exec "$A" sh -c "MUXMESH_HOST=$HOST_A MUXMESH_SOCKET=$SOCK_A MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 1
-assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "off" "press1: $HOST_A bar hidden"
+assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "off" "press1: $HOST_A bar hidden (one-bar rule)"
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "on"  "press1: $HOST_B bar shown (delegate: child bar on)"
-# control delegated: parent prefix None AND attached client moved to key
-# table `off` (samoshkin OFF mode). root F10 stays bound but is INACTIVE
-# while the client sits in `off` — press 2 traverses ssh into the child, and
-# if it ever lands on the parent instead, the off-table F10 reclaims locally.
+# tmux-remote recipe: prefix None + GLOBAL key-table off. The table is read
+# on the attached client (it inherits the global) AND on the server option.
 P1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 assert_eq "$P1" "None" "press1: $HOST_A control DELEGATED (prefix None)"
-# key table est un etat PAR CLIENT (client attache depuis le debut du run).
+KT1=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv key-table)
+assert_eq "$KT1" "off" "press1: $HOST_A global key-table off (server-deaf except F10)"
 TBL=$(docker exec "$A" tmux -S "$SOCK_A" display-message -p '#{client_key_table}' 2>/dev/null || echo "")
-assert_eq "$TBL" "off" "press1: $HOST_A client in key table 'off' (deaf except F10)"
+assert_eq "$TBL" "off" "press1: $HOST_A client in key table 'off'"
 
 log "WORKFLOW USER: presse1 -> fenetre chez B -> presse2 chez B -> fenetre chez A"
 # fenetre chez l'enfant PENDANT la delegation (le focus clavier est dans le ssh).
@@ -253,6 +250,12 @@ assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{p
 assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on"  "press2: $HOST_A bar restored (ResumeControl via hub)"
 P2=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 [ "$P2" != "None" ] && ok "press2: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2: prefix still None — parent stuck"
+KT2=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv key-table)
+assert_eq "$KT2" "root" "press2: $HOST_A global key-table unset (back to root)"
+SL=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv status-left)
+echo "$SL" | grep -q "$HOST_A" \
+  && ok "press2: $HOST_A bar badge names the machine ('$SL')" \
+  || bad "press2: status-left ne nomme pas $HOST_A ('$SL')"
 docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \
   && ok "press2: $HOST_A F10 present in root (safety ring restored)" \
   || bad "press2: $HOST_A F10 missing from root — parent deaf forever"
@@ -301,6 +304,7 @@ log "CHEMIN CRITIQUE 3: presse2 SUR LE PARENT -> self-reclaim (F10 ne meurt pas)
 # Etat de depart force : parent delegue (prefix None), independant du timing
 # reseau, pour tester le self-reclaim seul.
 docker exec "$A" tmux -S "$SOCK_A" set-option -g prefix None
+docker exec "$A" tmux -S "$SOCK_A" set-option -g key-table off
 docker exec "$A" tmux -S "$SOCK_A" set-option -g status off
 echo "  etat delege force: prefix=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)"
 # presse2 sur le PARENT (bar-toggle sans armed ssh, prefix=None -> self-reclaim)

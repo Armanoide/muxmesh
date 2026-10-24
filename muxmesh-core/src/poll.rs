@@ -34,6 +34,10 @@ pub fn refresh_window_badges(base: &[String], doc: &StateDoc, ttl: u64) {
         Some(o) => o,
         None => return, // no tmux server -> nothing to badge (never spawn a phantom one)
     };
+    // the bar's identity badge: WHOSE keyboard this server drives. The poller
+    // is the single writer of status-left (tmux-remote model): LOCAL <host>
+    // when no window is armed, REMOTE <target> while a live ssh dials out.
+    let me = local_badge_host();
     for wid in out.lines() {
         if wid.is_empty() {
             continue;
@@ -80,6 +84,42 @@ pub fn refresh_window_badges(base: &[String], doc: &StateDoc, ttl: u64) {
             );
         }
     }
+    paint_status_left(base, &me);
+}
+
+/// The hostname the bar badge shows for THIS machine: MUXMESH_HOST (the hub
+/// identity, set by the operator) else `hostname -s`. valid_host-guarded: a
+/// weird hostname must never reach tmux's format interpolation unchecked.
+fn local_badge_host() -> String {
+    let h = std::env::var("MUXMESH_HOST")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        });
+    if crate::valid_host(&h) {
+        h
+    } else {
+        String::new()
+    }
+}
+
+/// status-left is OURS: paint LOCAL/REMOTE identity so the bar always says
+/// where the keyboard is. The poller runs ONLY where a tmux server exists,
+/// and the bar-toggle state machine never touches status-left — so whenever
+/// this runs, we hold our own keyboard: ` LOCAL machine_a `. While delegated
+/// (prefix None) the bar is dark anyway and nothing repaints. A hostname that
+/// failed valid_host -> no repaint at all (never inject, never blank).
+fn paint_status_left(base: &[String], me: &str) {
+    if me.is_empty() {
+        return;
+    }
+    let badge = format!(" LOCAL {me} ");
+    tmux::run_tmux(base, &["set-option", "-g", "status-left", &badge]);
 }
 
 /// Main loop (CLI `poll`): badge every cfg.interval until the process dies.

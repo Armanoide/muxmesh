@@ -21,6 +21,13 @@ tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-environment -g PATH "$CURRENT_D
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-window-option -gq @muxmesh-armed-win 0
 tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-window-option -gq @muxmesh-status ""
 
+# The bar shows WHERE the keyboard is: the poller paints status-left
+# " LOCAL <host> " every pass (and a window armed toward a remote shows its
+# own @muxmesh-status badge). The default window format must interpolate it.
+# #{?A@B,C,D} is NOT a thing in tmux formats: an @-option must be written
+# #{@muxmesh-status} to be read (verified tmux 3.3a).
+tmux ${MUXMESH_SOCKET:+-S "$MUXMESH_SOCKET"} set-window-option -g window-status-format "#[fg=colour208]#I#[fg=default]:#W#{?#{@muxmesh-status},#{@muxmesh-status},}"
+
 # F10: one-bar toggle against the armed remote host (Rust decides everything).
 # Absolute path first (PATH is frozen at server start -> 127 otherwise); the
 # bare name works once set-environment above has taken effect.
