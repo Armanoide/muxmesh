@@ -96,8 +96,12 @@ Then("machine_a's control is delegated \\(prefix None\\)", () => {
 });
 
 Then(/^machine_a's client sits in the deaf key table "([^"]*)"$/, (table) => {
+  // l'etat delegue est GLOBAL : la table du serveur doit etre `off` ; le
+  // client attache herite de la table globale (#{client_key_table} = off).
+  const kt = sh(A, `tmux -S ${SOCK_A} show-options -gv key-table`);
+  if (kt !== table) throw new Error(`global key-table = '${kt}', want '${table}'`);
   const got = sh(A, `tmux -S ${SOCK_A} display-message -p '#{client_key_table}'`);
-  if (got !== table) throw new Error(`key table = '${got}', want '${table}'`);
+  if (got !== table) throw new Error(`client key table = '${got}', want '${table}'`);
 });
 
 Then(/^exactly one bar is visible: machine_a (on|off), machine_b (on|off)$/, (a, b) => {
@@ -162,6 +166,8 @@ Then("machine_a's bar is restored by the hub \\(ResumeControl\\)", () => {
 
 Then("machine_a's control is reclaimed \\(prefix back, F10 alive in root\\)", () => {
   if (prefix(A, SOCK_A) === "None") throw new Error("prefix still None — parent stuck");
+  const kt = sh(A, `tmux -S ${SOCK_A} show-options -gv key-table`);
+  if (kt !== "root") throw new Error(`global key-table = '${kt}', want root`);
   if (!sh(A, `tmux -S ${SOCK_A} list-keys -T root`).includes("F10"))
     throw new Error("F10 missing from root — parent deaf forever");
 });
@@ -174,6 +180,7 @@ Given("the muxmesh stack is running", () => {
 });
 Given("machine_a is forced into the delegated state \\(prefix None, bar off\\)", () => {
   sh(A, `tmux -S ${SOCK_A} set-option -g prefix None`);
+  sh(A, `tmux -S ${SOCK_A} set-option -g key-table off`);
   sh(A, `tmux -S ${SOCK_A} set-option -g status off`);
 });
 

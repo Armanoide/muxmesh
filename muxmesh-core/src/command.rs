@@ -304,6 +304,10 @@ impl Command {
             Command::GiveControl => vec![
                 self.tmux_argv(),
                 vec!["set-option".into(), "-g".into(), "key-table".into(), "off".into()],
+                // CRIT1 one-bar: the child's bar lights up exactly when the
+                // parent goes dark (delegate sends status off). Visibility is
+                // owned here; the badge TEXT belongs to the poller.
+                vec!["set-option".into(), "-g".into(), "status".into(), "on".into()],
                 vec!["refresh-client".into(), "-S".into()],
             ],
             // reclaim: restore prefix AND the global key-table; execute() and
@@ -331,6 +335,10 @@ impl Command {
             Command::GiveControl => vec![
                 self.tmux_argv(),
                 vec!["set-option".into(), "-g".into(), "key-table".into(), "off".into()],
+                // CRIT1 one-bar: the child's bar lights up exactly when the
+                // parent goes dark (delegate sends status off). Visibility is
+                // owned here; the badge TEXT belongs to the poller.
+                vec!["set-option".into(), "-g".into(), "status".into(), "on".into()],
                 vec!["refresh-client".into(), "-S".into()],
             ],
             Command::ResumeControl => vec![
@@ -465,7 +473,8 @@ mod tests {
         assert_eq!(Command::BarHide.tmux_argv(), ["set", "-g", "status", "off"]);
         assert_eq!(Command::BarShow.tmux_argv(), ["set", "-g", "status", "on"]);
         // control verbs are multi-step: tmux_argv is the FIRST step (prefix),
-        // execute() adds switch-client. Delegate cuts prefix, reclaim restores it.
+        // execute() adds key-table off + refresh. Delegate cuts prefix,
+        // reclaim restores it (global state, tmux-remote recipe).
         assert_eq!(Command::GiveControl.tmux_argv(), ["set-option", "-g", "prefix", "None"]);
         assert_eq!(Command::ResumeControl.tmux_argv(), ["set-option", "-gu", "prefix"]);
     }
@@ -486,12 +495,14 @@ mod tests {
     #[test]
     fn give_control_steps_deafen_prefix_and_key_table_globally() {
         // press-1 at the parent: prefix None + key-table off (server-global)
-        // + repaint. F10 stays bound in table `off` -> reclaim never dies.
+        // + status on (the child's bar lights up as the parent goes dark —
+        // CRIT1 one-bar) + repaint. F10 stays bound in table `off`.
         let steps = Command::GiveControl.execute_steps_for_test();
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0], ["set-option", "-g", "prefix", "None"]);
         assert_eq!(steps[1], ["set-option", "-g", "key-table", "off"]);
-        assert_eq!(steps[2], ["refresh-client", "-S"]);
+        assert_eq!(steps[2], ["set-option", "-g", "status", "on"]);
+        assert_eq!(steps[3], ["refresh-client", "-S"]);
     }
 
     #[test]

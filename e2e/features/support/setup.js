@@ -23,11 +23,12 @@ function resetToLocal() {
   sh(A, `tmux -S ${SOCK_A} set-option -g status on`);
   sh(B, `tmux -S ${SOCK_B} set-option -gu prefix`);
   sh(B, `tmux -S ${SOCK_B} set-option -g status on`);
-  // le client mm-a doit revenir a la table root : leave-le dans `off`
-  // rendrait le parent sourd aux prefix du scenario suivant. mm-b tourne
-  // headless (pas de client attache) -> "no current client" est normal.
-  try { sh(A, `tmux -S ${SOCK_A} switch-client -T root`); } catch { /* no client */ }
-  try { sh(B, `tmux -S ${SOCK_B} switch-client -T root`); } catch { /* headless */ }
+  // l'etat delegue est GLOBAL (key-table off) : le unset ramene tout le
+  // serveur a root ; refresh repeint la barre. mm-b headless : normal.
+  sh(A, `tmux -S ${SOCK_A} set-option -gu key-table`);
+  sh(B, `tmux -S ${SOCK_B} set-option -gu key-table`);
+  try { sh(A, `tmux -S ${SOCK_A} refresh-client -S`); } catch { /* no client */ }
+  try { sh(B, `tmux -S ${SOCK_B} refresh-client -S`); } catch { /* headless */ }
   // le scenario "fenetre chez l'enfant" cree une fenetre sur mm-b : la
   // fermer ici pour que les compteurs repartent a zero (le scenario attend +1).
   try { sh(B, `tmux -S ${SOCK_B} kill-window -t main:1 2>/dev/null; true`); } catch { /* nothing to kill */ }
@@ -37,6 +38,8 @@ function resetToLocal() {
 // The stack runs ONCE for the whole suite: scenarios are one continuous
 // story (press 1 -> delegate -> press 2 -> reclaim) on live containers.
 BeforeAll({ timeout: 20 * 60 * 1000 }, () => {
+  // SKIP_SETUP=1 : stack deja montee avec binaires injectes, ne pas relancer run.sh.
+  if (process.env.SKIP_SETUP === "1") { console.log("  SKIP_SETUP=1: stack reusee"); return; }
   // full cargo build inside the image can take minutes
   execFileSync("bash", [path.join(REPO, "e2e", "run.sh")], {
     cwd: REPO, stdio: "inherit", env: { ...process.env, TESTS: "0", KEEP: "1", SKIP_BUILD: process.env.SKIP_BUILD },

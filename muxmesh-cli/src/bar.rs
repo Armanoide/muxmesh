@@ -81,6 +81,10 @@ fn delegate(base: &[String], h: &str) -> u8 {
         return 1;
     }
     muxmesh_core::tmux::run_tmux(base, &["set-option", "-g", "key-table", "off"]);
+    // CRIT1 one-bar: delegating means the PARENT goes dark and the child's
+    // bar lights up (GiveControl). The parent's badge is useless while deaf —
+    // the child's bar is the one that says where control lives.
+    muxmesh_core::tmux::run_tmux(base, &["set-option", "-g", "status", "off"]);
     muxmesh_core::tmux::run_tmux(base, &["refresh-client", "-S"]);
     // notify the child (give it control) via the agent's WS; best-effort —
     // the parent already delegated its own keyboard, a silent child is not a
