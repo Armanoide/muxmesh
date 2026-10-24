@@ -17,8 +17,13 @@ pub fn scan_tmux(socket: &str) -> (bool, Vec<RemoteSession>) {
     if !socket.is_empty() {
         cmd.arg("-S").arg(socket);
     }
+    // tmux does NOT expand "\t" in a format string — it emits the literal
+    // two characters backslash-t. Use an explicit tab via tmux's own escape
+    // "#{?...}" is overkill; a literal marker we control is simplest and safe
+    // (session names are validated elsewhere, but the marker must never appear
+    // in a name — ":WS:" is not a legal tmux session-name sequence).
     let out = match cmd
-        .args(["list-sessions", "-F", "#{session_name}\t#{session_windows}"])
+        .args(["list-sessions", "-F", "#{session_name}:WS:#{session_windows}"])
         .output()
     {
         Ok(o) if o.status.success() => o.stdout,
@@ -27,7 +32,7 @@ pub fn scan_tmux(socket: &str) -> (bool, Vec<RemoteSession>) {
     let text = String::from_utf8_lossy(&out);
     let mut sessions = Vec::new();
     for line in text.lines() {
-        let mut it = line.split('\t');
+        let mut it = line.split(":WS:");
         let name = it.next().unwrap_or("").to_string();
         let windows: u32 = it.next().and_then(|w| w.parse().ok()).unwrap_or(0);
         if name.is_empty() {
