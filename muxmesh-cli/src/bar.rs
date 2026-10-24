@@ -11,7 +11,7 @@
 //!                     the local prefix (None) + park the client in table `off`.
 //!   PARENT  press 2 -> RECLAIM locally + BarHide(child) via agent->hub.
 //!   CHILD   F10     -> local bar toggle; if hiding, ResumeControl to whoever
-//!                     armed an ssh into us (parents via agent->hub).
+//!                     armed an ssh into us (the hub directory, via agent->hub).
 
 use muxmesh_core::{Command, HubConfig};
 
@@ -121,10 +121,20 @@ fn child_press(base: &[String], hidden_now: bool, delegated: bool) -> u8 {
 /// a live ssh INTO us, then relay ResumeControl to that parent. Best-effort —
 /// never block the local bar toggle on the network or a missing agent.
 fn answer_parent_reclaim() {
-    let parent = match transport::ask_parents().into_iter().next() {
+    let doc = match transport::ask_directory() {
+        Some(d) => d,
+        None => {
+            tracing::info!("child: no directory (agent/hub silent) — local-only toggle");
+            return;
+        }
+    };
+    let parent = match muxmesh_core::tmux::parents_of(&doc, &transport::driver_host())
+        .into_iter()
+        .next()
+    {
         Some(p) => p,
         None => {
-            tracing::info!("child: no parent known (agent/hub silent) — local-only toggle");
+            tracing::info!("child: no parent in the hub directory — local-only toggle");
             return;
         }
     };

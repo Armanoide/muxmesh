@@ -50,40 +50,46 @@ pub fn relay_send(host: &str, verb: muxmesh_core::Command) -> bool {
     }
 }
 
-/// Convenience: ask the agent (-> hub over WS) who has a live ssh INTO us.
-/// Empty vec on any failure (no agent, hub silent) — the caller treats empty
-/// as "no parent", which is the safe reading for a local-only toggle.
-pub fn ask_parents() -> Vec<String> {
-    match ask_agent(&IpcRequest::AskParents) {
-        Ok(r) => r
+/// The hub directory (full StateDoc) through the agent's WS. None on any
+/// failure (no agent, hub silent) — callers degrade to tmux-only answers or
+/// report the gap, they never dial the hub themselves.
+pub fn ask_directory() -> Option<muxmesh_core::StateDoc> {
+    match ask_agent(&IpcRequest::AskDirectory) {
+        Ok(r) if r.ok => r
             .data
-            .get("parents")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
-            .unwrap_or_default(),
+            .get("directory")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        Ok(r) => {
+            tracing::warn!("cli: agent refused directory: {}", r.msg);
+            None
+        }
         Err(e) => {
-            tracing::warn!("cli: ask_parents: {e}");
-            Vec::new()
+            tracing::warn!("cli: ask_directory: {e}");
+            None
         }
     }
 }
 
-/// Convenience: ask the agent (-> hub over WS) which hosts are armed+fresh
-/// right now. Empty on any failure — the caller then falls back to tmux-only
-/// detection (the badge), so a missing agent degrades, never blocks F10.
-pub fn ask_armed_hosts() -> Vec<String> {
-    match ask_agent(&IpcRequest::AskArmed) {
-        Ok(r) => r
-            .data
-            .get("armed")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
-            .unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!("cli: ask_armed_hosts: {e}");
-            Vec::new()
+/// Our hub identity: MUST equal the agent's canonical host name (the key in
+/// tokens.json) — the same resolution the agent dials with. NOT `hostname -s`
+/// (macOS mDNS advertises a different name the hub never registered).
+/// Order: MUXMESH_HOST env > config.toml agent.host > hostname -s fallback.
+pub fn driver_host() -> String {
+    if let Ok(h) = std::env::var("MUXMESH_HOST") {
+        let h = h.trim().to_string();
+        if !h.is_empty() {
+            return h;
         }
     }
+    let map = muxmesh_core::load_map();
+    if let Some(h) = map.get("agent.host").cloned().filter(|h| !h.is_empty()) {
+        return h;
+    }
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 #[cfg(test)]
@@ -95,16 +101,16 @@ mod tests {
         // a socket path that does not exist -> actionable "no agent" error,
         // never a panic. This is the no-agent-running contract.
         std::env::set_var("MUXMESH_IPC_SOCKET", "/tmp/muxmesh-absent-test.sock");
-        let r = ask_agent(&IpcRequest::AskParents);
+        let r = ask_agent(&IpcRequest::AskDirectory);
         std::env::remove_var("MUXMESH_IPC_SOCKET");
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("no agent"));
     }
 
     #[test]
-    fn ask_parents_empty_without_daemon() {
+    fn ask_directory_none_without_daemon() {
         std::env::set_var("MUXMESH_IPC_SOCKET", "/tmp/muxmesh-absent-test.sock");
-        assert!(ask_parents().is_empty());
+        assert!(ask_directory().is_none());
         std::env::remove_var("MUXMESH_IPC_SOCKET");
     }
 }

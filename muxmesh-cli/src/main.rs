@@ -1,11 +1,14 @@
-//! muxmesh-cli — driver-side binary: badge poller, `tree`, and (brique 3) key commands.
+//! muxmesh-cli — driver-side binary: badge poller, `tree`, and key commands.
 //!
 //! Subcommands:
 //!   poll  : the badge loop. Per window: does a pane hold a live `ssh <host>`
 //!           (pgrep + ps, local) AND is <host> armed+fresh in the hub state
-//!           -> set @muxmesh-armed-win. State comes from the hub over HTTP
-//!           (GET /state, open endpoint) — a driver has no local state.json.
-//!   tree  : print the aggregated state (live hub by default, --local file).
+//!           -> set @muxmesh-armed-win. NOTE: poll is the one embedded-core
+//!           loop that still reads the hub over HTTP (it runs as a long-lived
+//!           service, not per keystroke); every interactive path (send, F10
+//!           bar-toggle, armed-host, tree, why) goes through the agent's
+//!           Unix socket instead — the CLI itself never dials the hub.
+//!   tree  : print the aggregated state (agent IPC by default, --local file).
 //!
 //! Detection rule: the pane's process tree is walked DOWN (pane pid -> children
 //! via pgrep) so tmux servers on other machines are never touched. A child is
@@ -46,16 +49,17 @@ fn main() {
     }
 }
 
-/// Print host/session tree. Default reads the live hub (poll.hub); --local
-/// falls back to the local state file (for a hub running on this machine).
+/// Print host/session tree. Default reads the hub directory THROUGH THE AGENT
+/// (IPC -> WS; the CLI never dials the hub); --local falls back to the local
+/// state file (for a hub running on this machine).
 fn tree(cfg: &muxmesh_core::HubConfig, from_local: bool) {
     let doc = if from_local {
         muxmesh_core::poll::read_state(&cfg.state_path)
     } else {
-        match muxmesh_core::http::get_state(&cfg.poll_hub) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("tree: hub unreachable: {e}");
+        match transport::ask_directory() {
+            Some(d) => d,
+            None => {
+                tracing::error!("tree: no directory (no agent on ~/.muxmesh/agent.sock, or hub silent)");
                 process::exit(1);
             }
         }

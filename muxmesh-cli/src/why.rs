@@ -45,8 +45,14 @@ pub fn run_why(cfg: &HubConfig) -> u8 {
         }
     }
 
-    // 3. hub state
-    let doc = muxmesh_core::poll::fetch_state(&cfg.poll_hub);
+    // 3. hub state — through the agent's WS (the CLI never dials the hub).
+    let doc = match crate::transport::ask_directory() {
+        Some(d) => d,
+        None => {
+            println!("X no directory: no agent on ~/.muxmesh/agent.sock (or hub silent)");
+            return 1;
+        }
+    };
     let now = muxmesh_core::now_unix();
     if doc.hosts.is_empty() {
         println!("* hub state: EMPTY (no agent ever pushed? hub up?)");

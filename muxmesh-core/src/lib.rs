@@ -20,6 +20,6 @@ pub use config::{
 };
 pub use error::CoreError;
 pub use identity::{new_token, verify_token, TokenRecord, TokenStore, PREFIX_LEN};
-pub use ipc::{ipc_socket_path, IpcRequest, IpcResponse, ParentsAnswer};
+pub use ipc::{ipc_socket_path, AskDirectory, DirectoryAnswer, IpcRequest, IpcResponse};
 pub use paths::bar_toggle_cmd;
 pub use state::{now_unix, HostState, RemoteSession, StateDoc};

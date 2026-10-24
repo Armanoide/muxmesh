@@ -26,28 +26,29 @@ pub fn is_delegated(base: &[String]) -> bool {
 /// a depth cap and misses deep trees (zsh -> node -> ssh); the embedded
 /// poller already answered that question in @muxmesh-armed-win, so trust it
 /// and recover the host name from @muxmesh-status (" REMOTE <host> ").
-pub fn armed_host_of_current_window(_cfg: &HubConfig) -> Option<String> {
+pub fn armed_host_of_current_window(cfg: &HubConfig) -> Option<String> {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
         .filter(|s| !s.is_empty());
     let base = muxmesh_core::tmux::tmux_base(&socket);
     let wid = muxmesh_core::tmux::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
     let wid = wid.trim().to_string();
-    // armed+fresh host set, fetched from the hub THROUGH THE AGENT (IPC). The
-    // CLI never opens a network socket; no agent -> empty set -> the live scan
-    // still answers via tmux, only the hub-freshness cross-check degrades.
-    let armed_hosts = crate::transport::ask_armed_hosts();
+    // armed+fresh host set, from the hub directory THROUGH THE AGENT (IPC).
+    // The CLI never opens a network socket; no agent -> empty set -> the live
+    // tmux scan still answers, only the hub-freshness cross-check degrades.
+    let doc = crate::transport::ask_directory().unwrap_or_default();
 
     if let Some(h) = muxmesh_core::tmux::window_ssh_host(&base, &wid) {
         if !muxmesh_core::valid_host(&h) {
             tracing::debug!("window {wid}: ssh target '{h}' rejected by valid_host");
             return None;
         }
-        if armed_hosts.iter().any(|a| a == &h) {
+        if doc.host_armed(&h, muxmesh_core::now_unix(), cfg.ttl) {
             return Some(h);
         }
         tracing::debug!(
-            "ssh target '{h}' not armed on hub (known: {armed_hosts:?})"
+            "ssh target '{h}' not armed on hub (known: {:?})",
+            doc.hosts.keys().collect::<Vec<_>>()
         );
         return None;
     }
@@ -76,7 +77,7 @@ pub fn armed_host_of_current_window(_cfg: &HubConfig) -> Option<String> {
         tracing::warn!("window {wid}: badge armed but @muxmesh-status '{status}' has no host");
         return None;
     }
-    if !armed_hosts.iter().any(|a| a == &host) {
+    if !doc.host_armed(&host, muxmesh_core::now_unix(), cfg.ttl) {
         return None;
     }
     tracing::info!("window {wid}: live scan missed ssh, trusting badge -> '{host}'");

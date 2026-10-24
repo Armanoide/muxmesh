@@ -14,34 +14,29 @@
 use serde::{Deserialize, Serialize};
 
 use crate::command::Command;
+use crate::state::StateDoc;
 
 /// CLI -> agent: what the driver asks the agent to do on its behalf. The
-/// agent owns every network decision (routing, parent resolution); the CLI
-/// only states an intent and carries tmux-local facts it can read itself.
+/// agent owns every network decision (routing, directory reads); the CLI only
+/// states an intent and carries tmux-local facts it can read itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
     /// relay `send <host> <verb>` to the hub (the agent enqueues on dst's WS).
     Send { host: String, verb: Command },
-    /// who has a live ssh INTO me? the agent asks the hub over the WS.
-    /// who has a live ssh INTO me? the agent asks the hub over the WS.
-    AskParents,
-    /// which hosts are armed+fresh right now? the agent asks the hub over the
-    /// WS (the CLI needs this to badge / pick a send target, never GETs it).
-    AskArmed,
-    /// the F10 bar-toggle intent: the agent runs the whole delegate/reclaim
-    /// dance (it holds the WS and the hub directory), then reports the outcome.
-    BarToggle,
+    /// the hub directory (full StateDoc): `tree` renders it, `armed-host`
+    /// and `why` read the armed set from it. One frame, every question.
+    AskDirectory,
 }
 
 /// agent -> CLI: the result of one IpcRequest. `ok=false` carries a short
-/// reason (never secrets). `data` is op-specific JSON (parents list, tree…).
+/// reason (never secrets). `data` is op-specific JSON (directory, ok flag…).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpcResponse {
     pub ok: bool,
     /// short human-readable status or error (logged + printed by the CLI).
     pub msg: String,
-    /// op-specific payload (e.g. {"parents":["mac-mini"]}), empty when unused.
+    /// op-specific payload (e.g. {"directory":{...}}), empty when unused.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub data: serde_json::Map<String, serde_json::Value>,
 }
@@ -55,20 +50,27 @@ impl IpcResponse {
     }
 }
 
-/// hub -> agent on the WS: answers AskParents. The hub holds the directory
-/// (every host's reported outbound ssh targets), so it — not the agent — can
-/// say who has a live ssh INTO `me`. This is why the agent never GETs /state:
-/// the answer comes back on the channel it already owns.
+/// agent -> hub on the WS: "give me your directory". The hub holds the map
+/// (every host's reported state), so it — not the agent — answers who is
+/// armed and who has a live ssh INTO me. This frame replaces every GET
+/// /state: the answer comes back on the channel the agent already owns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParentsAnswer {
+pub struct AskDirectory {}
+
+/// hub -> agent on the WS: the answer to AskDirectory, pushed on the same
+/// channel. `directory` is the full StateDoc; the agent keeps it only long
+/// enough to answer the next CLI request (short cache, never a source of
+/// truth — the hub is).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryAnswer {
     /// the host this answer is addressed to (echo, guards against misroute).
     pub me: String,
-    /// host keys with a live inbound ssh into `me` (empty = no parent).
-    pub parents: Vec<String>,
+    /// the hub's directory at answer time.
+    pub directory: StateDoc,
 }
 
 /// The Unix socket path the agent listens on and the CLI dials. Overridable
-/// via MUXMESH_IPC_SOCKET (tests, non-default installs).
+/// via MUXMESH_IPC_SOCKET (tests, non-local installs).
 pub fn ipc_socket_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("MUXMESH_IPC_SOCKET") {
         if !p.trim().is_empty() {
@@ -86,8 +88,7 @@ mod tests {
     #[test]
     fn request_roundtrips_per_op() {
         for req in [
-            IpcRequest::AskParents,
-            IpcRequest::BarToggle,
+            IpcRequest::AskDirectory,
             IpcRequest::Send { host: "mac-mini".into(), verb: Command::BarHide },
         ] {
             let line = serde_json::to_string(&req).unwrap();
@@ -104,10 +105,10 @@ mod tests {
     }
 
     #[test]
-    fn parents_answer_roundtrips() {
-        let a = ParentsAnswer { me: "me".into(), parents: vec!["parent".into()] };
+    fn directory_answer_roundtrips() {
+        let a = DirectoryAnswer { me: "me".into(), directory: StateDoc::default() };
         let j = serde_json::to_string(&a).unwrap();
-        assert_eq!(serde_json::from_str::<ParentsAnswer>(&j).unwrap(), a);
+        assert_eq!(serde_json::from_str::<DirectoryAnswer>(&j).unwrap(), a);
     }
 
     #[test]
