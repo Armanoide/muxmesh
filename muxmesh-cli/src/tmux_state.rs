@@ -21,11 +21,10 @@ pub fn is_delegated(base: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-/// Armed remote host of the CURRENT window: a live `ssh <host>` in its panes
-/// AND <host> armed+fresh on the hub. Badge fallback: the live pane scan has
-/// a depth cap and misses deep trees (zsh -> node -> ssh); the embedded
-/// poller already answered that question in @muxmesh-armed-win, so trust it
-/// and recover the host name from @muxmesh-status (" REMOTE <host> ").
+/// Armed remote host of the CURRENT window: badge first (@muxmesh-armed-win=1
+/// + host from @muxmesh-status, the poller's own answer — one tmux call),
+/// cross-checked armed+fresh on the hub directory. Live pgrep scan is the
+/// fallback for windows the poller has not stamped yet.
 pub fn armed_host_of_current_window(cfg: &HubConfig) -> Option<String> {
     let socket = std::env::var("MUXMESH_SOCKET")
         .ok()
@@ -37,6 +36,36 @@ pub fn armed_host_of_current_window(cfg: &HubConfig) -> Option<String> {
     // The CLI never opens a network socket; no agent -> empty set -> the live
     // tmux scan still answers, only the hub-freshness cross-check degrades.
     let doc = crate::transport::ask_directory().unwrap_or_default();
+
+    // badge first: it is the agent's own answer (poller already resolved
+    // "this window holds ssh <host>") and costs one tmux call. The live pgrep
+    // scan is the fallback for windows the poller has not stamped yet.
+    let badge = muxmesh_core::tmux::tmux_out(
+        &base,
+        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-armed-win"],
+    )
+    .map(|o| o.trim() == "1")
+    .unwrap_or(false);
+    if badge {
+        let status = muxmesh_core::tmux::tmux_out(
+            &base,
+            &["show-window-options", "-t", &wid, "-gv", "@muxmesh-status"],
+        )
+        .unwrap_or_default();
+        let host = status
+            .trim()
+            .strip_prefix("REMOTE ")
+            .map(|r| r.trim().to_string())
+            .filter(|h| muxmesh_core::valid_host(h))
+            .unwrap_or_default();
+        if host.is_empty() {
+            tracing::warn!("window {wid}: badge armed but @muxmesh-status '{status}' has no host");
+        } else if doc.host_armed(&host, muxmesh_core::now_unix(), cfg.ttl) {
+            return Some(host);
+        } else {
+            tracing::debug!("badge host '{host}' not armed+fresh on hub");
+        }
+    }
 
     if let Some(h) = muxmesh_core::tmux::window_ssh_host(&base, &wid) {
         if !muxmesh_core::valid_host(&h) {
@@ -53,35 +82,8 @@ pub fn armed_host_of_current_window(cfg: &HubConfig) -> Option<String> {
         return None;
     }
 
-    let badge = muxmesh_core::tmux::tmux_out(
-        &base,
-        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-armed-win"],
-    )
-    .map(|o| o.trim() == "1")
-    .unwrap_or(false);
-    if !badge {
-        return None;
-    }
-    let status = muxmesh_core::tmux::tmux_out(
-        &base,
-        &["show-window-options", "-t", &wid, "-gv", "@muxmesh-status"],
-    )
-    .unwrap_or_default();
-    let host = status
-        .trim()
-        .strip_prefix("REMOTE ")
-        .map(|r| r.trim().to_string())
-        .filter(|h| muxmesh_core::valid_host(h))
-        .unwrap_or_default();
-    if host.is_empty() {
-        tracing::warn!("window {wid}: badge armed but @muxmesh-status '{status}' has no host");
-        return None;
-    }
-    if !doc.host_armed(&host, muxmesh_core::now_unix(), cfg.ttl) {
-        return None;
-    }
-    tracing::info!("window {wid}: live scan missed ssh, trusting badge -> '{host}'");
-    Some(host)
+    tracing::debug!("window {wid}: no armed ssh (badge off, live scan empty)");
+    None
 }
 
 /// Post-reclaim audit: re-read tmux, never claim success on faith.

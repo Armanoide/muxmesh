@@ -21,19 +21,19 @@ use tokio::sync::Mutex;
 /// mailbox drops the answer (the CLI degrades, never hangs). Clonable so the
 /// session and the IPC listener hold handles to ONE mailbox.
 #[derive(Clone)]
-pub struct HubReplyBox {
+pub struct HubMailbox {
     inbox: Arc<tokio::sync::mpsc::Sender<DirectoryAnswer>>,
     unread: Arc<Mutex<tokio::sync::mpsc::Receiver<DirectoryAnswer>>>,
 }
 
-impl Default for HubReplyBox {
+impl Default for HubMailbox {
     fn default() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        HubReplyBox { inbox: Arc::new(tx), unread: Arc::new(Mutex::new(rx)) }
+        HubMailbox { inbox: Arc::new(tx), unread: Arc::new(Mutex::new(rx)) }
     }
 }
 
-impl HubReplyBox {
+impl HubMailbox {
     /// Post a hub answer into the mailbox. Full (8 unread) drops it — the
     /// waiter times out, the CLI degrades. Never blocks the WS reader.
     pub async fn deposit(&self, ans: DirectoryAnswer) {
@@ -213,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn mailbox_delivers_the_hubs_answer() {
-        let mailbox = Arc::new(HubReplyBox::default());
+        let mailbox = Arc::new(HubMailbox::default());
         let rv2 = mailbox.clone();
         // the hub answers 50ms after the question, as the WS reader would.
         let answer = tokio::spawn(async move {
@@ -235,7 +235,7 @@ mod tests {
         // satisfies our question — we keep waiting and hit the 5s guard. The
         // depositing task must DIE with the test: a loop that outlives it
         // keeps the runtime alive and cargo never finishes (seen: hang).
-        let mailbox = Arc::new(HubReplyBox::default());
+        let mailbox = Arc::new(HubMailbox::default());
         let rv2 = mailbox.clone();
         let spam = tokio::spawn(async move {
             for _ in 0..400 {
@@ -257,7 +257,7 @@ mod tests {
         // THE race the e2e caught: the hub answers before ask_hub reaches its
         // select! (WS faster than the scheduler). mpsc holds the answer —
         // a Notify would have lost it and burned the 5s timeout.
-        let mailbox = HubReplyBox::default();
+        let mailbox = HubMailbox::default();
         mailbox.deposit(DirectoryAnswer { me: "me".into(), directory: muxmesh_core::StateDoc::default() }).await;
         let ans = mailbox.ask_hub("me", std::future::ready(Ok(()))).await.unwrap();
         assert_eq!(ans.me, "me");
@@ -267,7 +267,7 @@ mod tests {
     async fn mailbox_drains_letters_from_a_past_question() {
         // an answer to a PAST question must not satisfy the next one: it is
         // drained, and the fresh answer (addressed correctly) wins.
-        let mailbox = HubReplyBox::default();
+        let mailbox = HubMailbox::default();
         mailbox.deposit(DirectoryAnswer { me: "old".into(), directory: muxmesh_core::StateDoc::default() }).await;
         let rv2 = mailbox.clone();
         tokio::spawn(async move {
@@ -280,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_hub_fails_when_ask_itself_fails() {
-        let mailbox = HubReplyBox::default();
+        let mailbox = HubMailbox::default();
         let e = mailbox.ask_hub("me", std::future::ready(Err("ws down".into()))).await.unwrap_err();
         assert_eq!(e, "ws down");
     }

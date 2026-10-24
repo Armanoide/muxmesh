@@ -32,7 +32,7 @@ pub const MAX_MISSED_PONGS: u64 = 2;
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-use crate::ipc::HubReplyBox;
+use crate::ipc::HubMailbox;
 
 /// The machine's persistent hub channel: identity, the live socket's sender,
 /// and the mailbox where the session posts the hub's directory replies for
@@ -44,7 +44,7 @@ pub struct Channel {
     /// None = WS down: push_frame fails immediately (no queue, no replay).
     tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     /// the hub's directory replies land here, read by the CLI listener.
-    pub mailbox: HubReplyBox,
+    pub mailbox: HubMailbox,
 }
 
 impl Channel {
@@ -52,7 +52,7 @@ impl Channel {
         Channel {
             host,
             tx: Mutex::new(None),
-            mailbox: HubReplyBox::default(),
+            mailbox: HubMailbox::default(),
         }
     }
 
