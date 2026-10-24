@@ -40,20 +40,15 @@ pub fn refresh_window_badges(base: &[String], doc: &StateDoc, ttl: u64) {
         }
         let mut armed = false;
         let mut armed_host = String::new();
-        if let Some(pids) = tmux::pane_pids(base, wid) {
-            for pid in pids {
-                if let Some(h) = tmux::pane_ssh_host(pid) {
-                    // Defense in depth: the hub whitelists these, but a hand-edited or
-                    // stale state file must never feed a crafted string to tmux `-t`.
-                    if !valid_host(&h) {
-                        continue;
-                    }
-                    if doc.host_armed(&h, now, ttl) {
-                        armed = true;
-                        armed_host = h;
-                        break;
-                    }
-                }
+        // window_ssh_host checks each pane's OWN process first, then its
+        // descendants — a `new-window 'ssh host'` has ssh as the pane_pid
+        // itself, so scanning only children (pane_ssh_host) never arms it.
+        if let Some(h) = tmux::window_ssh_host(base, wid) {
+            // Defense in depth: the hub whitelists these, but a hand-edited or
+            // stale state file must never feed a crafted string to tmux `-t`.
+            if valid_host(&h) && doc.host_armed(&h, now, ttl) {
+                armed = true;
+                armed_host = h;
             }
         }
         if armed {
