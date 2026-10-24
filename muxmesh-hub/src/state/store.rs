@@ -128,11 +128,7 @@ pub fn purge_and_write(path: &Path, ttl: u64) -> std::io::Result<()> {
     let mut doc = read_doc(path);
     let now = now_unix();
     let before = doc.hosts.len();
-    doc.hosts = doc
-        .hosts
-        .into_iter()
-        .filter(|(_, h)| h.is_fresh(now, ttl))
-        .collect();
+    doc.hosts.retain(|_, h| h.is_fresh(now, ttl));
     if doc.hosts.len() != before {
         write_atomic(path, &doc)?;
     }

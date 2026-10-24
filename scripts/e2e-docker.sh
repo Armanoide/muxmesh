@@ -226,12 +226,12 @@ C2WA1=$(docker exec "$A" tmux -S "$SOCK_A" list-windows -a | wc -l | tr -d ' ')
   || bad "CRIT2: presse1 = control chez l'enfant — fenetre doit atterrir chez B seulement (B $C2WB0->$C2WB1 A $C2WA0->$C2WA1)"
 
 # PRESSE 2 CHEZ L'ENFANT (le keystroke traverse le ssh, parent sourd = table
-# off + prefix None) : l'enfant masque sa barre et repond ParentReclaim via
+# off + prefix None) : l'enfant masque sa barre et repond ResumeControl via
 # le hub.
 docker exec "$B" sh -c "MUXMESH_HOST=$HOST_B MUXMESH_SOCKET=$SOCK_B MUXMESH_POLL_HUB=$HUB:9997 muxmesh-cli bar-toggle -v" 2>&1 | tail -3
 sleep 2
 assert_eq "$(docker exec "$B" tmux -S "$SOCK_B" show-options -g status | awk '{print $2}')" "off" "press2: $HOST_B bar hidden (child answers press 2)"
-assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on"  "press2: $HOST_A bar restored (ParentReclaim via hub)"
+assert_eq "$(docker exec "$A" tmux -S "$SOCK_A" show-options -g status | awk '{print $2}')" "on"  "press2: $HOST_A bar restored (ResumeControl via hub)"
 P2=$(docker exec "$A" tmux -S "$SOCK_A" show-options -gv prefix)
 [ "$P2" != "None" ] && ok "press2: $HOST_A control RECLAIMED (prefix '$P2')" || bad "press2: prefix still None — parent stuck"
 docker exec "$A" tmux -S "$SOCK_A" list-keys -T root | grep -q F10 \

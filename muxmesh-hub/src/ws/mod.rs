@@ -23,6 +23,9 @@ const MAX_MISSED_PONGS: u32 = 2;
 pub async fn serve_agent_until_disconnected(mut socket: WebSocket, host: String, state: Arc<AppState>) {
     let gen = WS_GEN.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // keep a handle to the raw sender: directory answers go straight onto
+    // this socket (register_channel moves its clone into the channel map).
+    let tx_handle = tx.clone();
     register_channel(&state, &host, tx, gen);
     tracing::info!("/agent/ws host={host} connected (gen {gen})");
 
@@ -51,7 +54,7 @@ pub async fn serve_agent_until_disconnected(mut socket: WebSocket, host: String,
             // HERE; a wedged half-open socket never pongs -> missed climbs.
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => read_agent_text(&state, &host, text.as_str()).await,
+                    Some(Ok(Message::Text(text))) => read_agent_text(&state, &host, text.as_str(), &tx_handle).await,
                     Some(Ok(Message::Pong(_))) => missed = 0,
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {} // binary/ping from agent: ignored
@@ -105,10 +108,16 @@ fn register_channel(
     }
 }
 
-/// Route one inbound text frame: state report → merge, ack → mirror, else a
-/// forwarded log line → hub.log. Order matters: a ReportState frame also
-/// parses as an Ack (serde ignores unknown fields), so check it FIRST.
-async fn read_agent_text(state: &AppState, host: &str, text: &str) {
+/// Route one inbound text frame: state report → merge, ack → mirror, directory
+/// question → answer on this same socket, else a forwarded log line → hub.log.
+/// Order matters: a ReportState frame also parses as an Ack (serde ignores
+/// unknown fields), so check it FIRST.
+async fn read_agent_text(
+    state: &AppState,
+    host: &str,
+    text: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+) {
     if let Some(st) = parse_report_state(text) {
         // agent -> hub state push (replaces HTTP POST /state). Identity = the
         // authenticated WS host, never the payload's own host field.
@@ -117,6 +126,10 @@ async fn read_agent_text(state: &AppState, host: &str, text: &str) {
             Ok(trace) => tracing::info!("/agent/ws host={host} state {trace}"),
             Err(e) => tracing::warn!("/agent/ws host={host}: state merge: {e}"),
         }
+    } else if is_ask_directory(text) {
+        // the agent's CLI wants the directory (tree / armed-host / why / F10).
+        // Answer on the SAME socket — no GET /state anywhere in the fleet now.
+        answer_directory(state, host, tx);
     } else if let Ok(ack) = serde_json::from_str::<Ack>(text) {
         tracing::info!(
             "/agent/ws host={host} ack id={} ok={}{}",
@@ -131,6 +144,29 @@ async fn read_agent_text(state: &AppState, host: &str, text: &str) {
         record_agent_log(state, host, &line);
     } else {
         tracing::debug!("/agent/ws host={host}: non-ack frame ignored");
+    }
+}
+
+/// Cheap pre-check: is this the agent's directory question `{"ask_directory":{}}`?
+fn is_ask_directory(text: &str) -> bool {
+    text.contains("\"ask_directory\"")
+}
+
+/// Answer an agent's directory question on its own WS: read state.json (the
+/// hub's directory) and reply {"dir":{"me":<host>,"directory":{..}}}. The
+/// agent waits on its rendez-vous; a failed send is logged, not fatal.
+fn answer_directory(
+    state: &AppState,
+    host: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    let doc = crate::state::read_doc(&state.state_path);
+    let ans = muxmesh_core::DirectoryAnswer { me: host.to_string(), directory: doc };
+    let frame = format!("{{\"dir\":{}}}", serde_json::to_string(&ans).unwrap_or_default());
+    if tx.send(frame).is_err() {
+        tracing::warn!("/agent/ws host={host}: directory answer: channel gone");
+    } else {
+        tracing::debug!("/agent/ws host={host}: directory answered");
     }
 }
 
