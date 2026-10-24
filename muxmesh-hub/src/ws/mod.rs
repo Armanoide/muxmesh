@@ -138,6 +138,11 @@ async fn read_agent_text(
             ack.err.as_deref().map(|e| format!(" err={e}")).unwrap_or_default()
         );
         record_ack(state, host, &ack);
+    } else if text.contains("\"dst\"") {
+        // a relayed command from a driver agent: route it to the dst agent's
+        // live channel. Same enqueue path as POST /cmd (the WS is now the
+        // only way a command reaches an agent).
+        forward_command(state, host, text);
     } else if let Some(line) = crate::state::agent_log_line(text) {
         // NOT an ack: a forwarded log line from the agent's tracing layer
         // ({"log":...}). Append verbatim to hub.log — one file, every machine.
@@ -167,6 +172,39 @@ fn answer_directory(
         tracing::warn!("/agent/ws host={host}: directory answer: channel gone");
     } else {
         tracing::debug!("/agent/ws host={host}: directory answered");
+    }
+}
+
+/// Route a relayed command frame to its dst agent's live WS channel. The
+/// envelope is re-serialized from the parsed value (never forwarded verbatim),
+/// so a frame that cannot be parsed never reaches an agent. The sender is the
+/// authenticated channel host; dst routing mirrors POST /cmd's enqueue path.
+fn forward_command(state: &AppState, src: &str, text: &str) {
+    let env: muxmesh_core::CommandEnvelope = match serde_json::from_str(text) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!("/agent/ws host={src}: command frame rejected: {e}");
+            return;
+        }
+    };
+    let dst = env.dst.clone();
+    let enqueued = {
+        let ch = state.channels.lock().unwrap_or_else(|e| e.into_inner());
+        match ch.get(&dst) {
+            Some(s) => match serde_json::to_string(&env) {
+                Ok(frame) => s.tx.send(frame).is_ok(),
+                Err(e) => {
+                    tracing::error!("forward id={} serialize failed: {e}", env.id);
+                    false
+                }
+            },
+            None => false,
+        }
+    };
+    if enqueued {
+        tracing::info!("/agent/ws src={src} -> queued dst={dst} id={}", env.id);
+    } else {
+        tracing::warn!("/agent/ws src={src}: dst={dst} not connected — command dropped id={}", env.id);
     }
 }
 

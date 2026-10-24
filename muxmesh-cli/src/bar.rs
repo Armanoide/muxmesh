@@ -120,18 +120,11 @@ fn child_press(base: &[String], hidden_now: bool, delegated: bool) -> u8 {
 }
 
 /// Answer a press-2 back to the parent: relay ResumeControl to whoever has a
-/// live ssh INTO us. Two sources, local truth first:
-///   1. badge of the current window — when we are delegated our OWN scan no
-///      longer sees the parent (the ssh client lives on ITS machine, not
-///      ours), but the badge was stamped while the ssh was still visible.
-///   2. hub directory `parents_of` — fallback for a child that never badged.
-/// Best-effort: never block the local bar toggle on the network.
+/// live ssh INTO us. Source: hub directory `parents_of` — the parent's own
+/// ReportState names the ssh it dialed, so the child does not need to see
+/// the parent's badge (it never can: that window lives on the parent's
+/// server). Best-effort: never block the local bar toggle on the network.
 fn answer_parent_reclaim() {
-    if let Some(parent) = parent_from_badge() {
-        tracing::info!("child: parent '{parent}' from the window badge");
-        transport::relay_send(&parent, Command::ResumeControl);
-        return;
-    }
     let doc = match transport::ask_directory() {
         Some(d) => d,
         None => {
@@ -151,31 +144,4 @@ fn answer_parent_reclaim() {
         }
     };
     transport::relay_send(&parent, Command::ResumeControl);
-}
-
-/// Parent named by the CURRENT window's badge (@muxmesh-armed-win + @muxmesh-status).
-fn parent_from_badge() -> Option<String> {
-    let socket = std::env::var("MUXMESH_SOCKET").ok().filter(|s| !s.is_empty());
-    let base = muxmesh_core::tmux::tmux_base(&socket);
-    let wid = muxmesh_core::tmux::tmux_out(&base, &["display", "-p", "#{window_id}"])?;
-    let armed = muxmesh_core::tmux::tmux_out(
-        &base,
-        &["show-window-options", "-t", wid.trim(), "-gv", "@muxmesh-armed-win"],
-    )
-    .map(|o| o.trim() == "1")
-    .unwrap_or(false);
-    if !armed {
-        return None;
-    }
-    let status = muxmesh_core::tmux::tmux_out(
-        &base,
-        &["show-window-options", "-t", wid.trim(), "-gv", "@muxmesh-status"],
-    )
-    .unwrap_or_default();
-    let host = status
-        .trim()
-        .strip_prefix("REMOTE ")
-        .map(|r| r.trim().to_string())
-        .filter(|h| muxmesh_core::valid_host(h))?;
-    Some(host)
 }
