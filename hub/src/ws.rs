@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use muxmesh_core::{decode, encode, ChallengeOk, Fingerprint, Message as AppMessage};
+use muxmesh_core::{decode, encode, hex, ChallengeOk, Fingerprint, Message as AppMessage};
 use tracing::{info, warn};
 
 use crate::state::SharedState;
@@ -91,8 +91,4 @@ async fn run_handshake(socket: WebSocket, state: SharedState, token: String, fp:
     info!("agent session open");
     // Session loop arrives with the next brick (REPORT_STATE / ACK routing).
     while let Some(Ok(_)) = stream.next().await {}
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

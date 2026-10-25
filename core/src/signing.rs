@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::hex::hex_bytes;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 /// The hub holds a permanent ED25519 keypair (generated at first start,
@@ -32,11 +33,7 @@ impl HubKeypair {
     }
 
     pub fn public_key_hex(&self) -> String {
-        self.public_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        crate::hex::hex(self.public_key().as_bytes())
     }
 
     pub fn sign(&self, msg: &[u8]) -> Signature {
@@ -99,19 +96,6 @@ impl Challenge {
     }
 }
 
-fn hex_bytes(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return Err(crate::error::ErrorCore::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "odd-length hex",
-        )));
-    }
-    s.as_bytes()
-        .chunks_exact(2)
-        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap_or("00"), 16).map_err(crate::error::ErrorCore::from))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,10 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn odd_length_hex_is_error_not_panic() {
-        // a truncated frame from the hub must fail cleanly, never crash.
-        assert!(hex_bytes("abc").is_err());
-        assert!(hex_bytes("").is_ok());
-        assert_eq!(hex_bytes("00ff").unwrap(), vec![0x00, 0xff]);
+    fn verify_hex_rejects_odd_length_nonce() {
+        let hub = HubKeypair::generate();
+        // a truncated nonce must fail cleanly, never panic.
+        assert!(Challenge::verify_hex("abc", &hub.public_key_hex(), &hub.public_key(), "fp").is_err());
     }
 }

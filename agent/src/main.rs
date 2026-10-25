@@ -1,9 +1,10 @@
 mod config;
+mod error;
 
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use muxmesh_core::{
-    decode, encode, ChallengeOk, ChallengeWire, Hello, Message, ReportState, BarStatus,
+    decode, encode, hex_bytes, ChallengeOk, ChallengeWire, Hello, Message, ReportState, BarStatus,
 };
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -11,20 +12,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-
-/// Agent-local error type: wraps the shared core errors plus tungstenite,
-/// which only the agent speaks (the hub uses axum's WS).
-#[derive(Debug, thiserror::Error)]
-pub enum AgentError {
-    #[error(transparent)]
-    Core(#[from] muxmesh_core::ErrorCore),
-    #[error("websocket: {0}")]
-    Ws(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("signature: {0}")]
-    Signature(#[from] ed25519_dalek::SignatureError),
-}
-
-type Result<T> = std::result::Result<T, AgentError>;
+use crate::error::Result;
 
 /// Dial the hub with identity headers, run the handshake, then heartbeat.
 async fn connect_and_run(cfg: &Config) -> Result<()> {
@@ -82,25 +70,12 @@ async fn connect_and_run(cfg: &Config) -> Result<()> {
 fn hub_pubkey(cfg: &Config) -> Result<ed25519_dalek::VerifyingKey> {
     let bytes = hex_bytes(&cfg.hub_pubkey_hex)?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-        AgentError::Core(muxmesh_core::ErrorCore::Io(std::io::Error::new(
+        muxmesh_core::ErrorCore::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("MUXMESH_HUB_PUBKEY must be 32 bytes (64 hex), got {}", v.len()),
-        )))
+        ))
     })?;
-    Ok(ed25519_dalek::VerifyingKey::from_bytes(&arr)?)
-}
-
-fn hex_bytes(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return Err(AgentError::Core(muxmesh_core::ErrorCore::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "odd-length hex",
-        ))));
-    }
-    s.as_bytes()
-        .chunks_exact(2)
-        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap_or("00"), 16).map_err(muxmesh_core::ErrorCore::from).map_err(AgentError::Core))
-        .collect()
+    Ok(ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(muxmesh_core::ErrorCore::from)?)
 }
 
 fn now_secs() -> u64 {
