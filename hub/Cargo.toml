@@ -1,0 +1,15 @@
+[package]
+name = "muxmesh-hub"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "muxmesh-hub"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+muxmesh-core = { path = "../core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

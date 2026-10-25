@@ -2,6 +2,9 @@
 /node_modules/
 e2e/node_modules/
 
+# Rust build artifacts — jamais en git
+/target/
+
 # Secret — NEVER committed (shared hub<->agents token)
 token
 *.token
