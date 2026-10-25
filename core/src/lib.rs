@@ -1,9 +1,26 @@
+pub mod ack;
+pub mod challenge;
+pub mod challenge_ok;
+pub mod command;
+pub mod directory;
 pub mod error;
 pub mod fingerprint;
+pub mod hello;
 pub mod identity;
+pub mod logger;
+pub mod message;
+pub mod report_state;
 pub mod signing;
 
+pub use ack::Ack;
+pub use challenge::ChallengeWire;
+pub use challenge_ok::ChallengeOk;
+pub use command::{Cmd, Command};
+pub use directory::Directory;
 pub use error::{ErrorCore, Result};
 pub use fingerprint::{Fingerprint, PEPPER};
+pub use hello::Hello;
 pub use identity::{mint_token, TokenHash};
+pub use message::{decode, encode, Message};
+pub use report_state::{BarStatus, ReportState};
 pub use signing::{Challenge, HubKeypair};

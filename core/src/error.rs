@@ -10,6 +10,12 @@ pub enum ErrorCore {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[error("protocol JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("invalid hex: {0}")]
+    Hex(#[from] std::num::ParseIntError),
+
     #[error("signature verification failed: {0}")]
     Signature(#[from] ed25519_dalek::SignatureError),
 

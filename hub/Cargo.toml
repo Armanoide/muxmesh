@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { workspace = true }
+futures-util = { workspace = true }
 muxmesh-core = { path = "../core" }
 tokio = { workspace = true }
 tracing = { workspace = true }

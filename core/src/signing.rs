@@ -62,6 +62,11 @@ impl Challenge {
         Challenge(bytes)
     }
 
+    /// Raw bytes of the fresh nonce (the hub uses this to build the wire msg).
+    pub fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// What the hub signs: nonce + agent fingerprint. Binding the challenge
     /// to the agent prevents replaying a signature made for another peer.
     pub fn sign_for(&self, key: &HubKeypair, agent_fp: &str) -> Result<Signature> {
@@ -76,6 +81,35 @@ impl Challenge {
         msg.extend_from_slice(agent_fp.as_bytes());
         Ok(pub_key.verify(&msg, sig)?)
     }
+
+    /// Agent helper: verify a wire challenge from hex inputs (nonce + sig as
+    /// they arrived over JSON), against the hub's known public key.
+    pub fn verify_hex(
+        nonce_hex: &str,
+        sig_hex: &str,
+        pub_key: &VerifyingKey,
+        agent_fp: &str,
+    ) -> Result<()> {
+        let nonce = hex_bytes(nonce_hex)?;
+        let sig_bytes = hex_bytes(sig_hex)?;
+        let sig = Signature::from_slice(&sig_bytes)?;
+        let mut msg = nonce.to_vec();
+        msg.extend_from_slice(agent_fp.as_bytes());
+        Ok(pub_key.verify(&msg, &sig)?)
+    }
+}
+
+fn hex_bytes(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return Err(crate::error::ErrorCore::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "odd-length hex",
+        )));
+    }
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap_or("00"), 16).map_err(crate::error::ErrorCore::from))
+        .collect()
 }
 
 #[cfg(test)]
@@ -124,5 +158,13 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         ));
+    }
+
+    #[test]
+    fn odd_length_hex_is_error_not_panic() {
+        // a truncated frame from the hub must fail cleanly, never crash.
+        assert!(hex_bytes("abc").is_err());
+        assert!(hex_bytes("").is_ok());
+        assert_eq!(hex_bytes("00ff").unwrap(), vec![0x00, 0xff]);
     }
 }

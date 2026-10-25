@@ -1,0 +1,17 @@
+[package]
+name = "muxmesh-agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "muxmesh-agent"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+muxmesh-core = { path = "../core" }
+tokio = { workspace = true }
+tokio-tungstenite = "0.26"
+tracing = { workspace = true }
+thiserror = { workspace = true }
