@@ -4,8 +4,7 @@ mod error;
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use muxmesh_core::{
-    decode, encode, hex_bytes, now_secs, ChallengeOk, ChallengeWire, Hello, Message, ReportState,
-    BarStatus,
+    decode, encode, now_secs, ChallengeOk, ChallengeWire, Hello, Message, ReportState, BarStatus,
 };
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -35,7 +34,7 @@ async fn connect_and_run(cfg: &Config) -> Result<()> {
     sink.send(WsMessage::Text(hello.into())).await?;
 
     // Read the hub's CHALLENGE and verify it signed by the known hub key.
-    let pub_key = hub_pubkey(cfg)?;
+    let pub_key = &cfg.hub_pubkey;
     match stream.next().await {
         Some(Ok(WsMessage::Text(line))) => {
             if let Message::Challenge(ChallengeWire { nonce, sig }) = decode(&line)? {
@@ -68,21 +67,10 @@ async fn connect_and_run(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn hub_pubkey(cfg: &Config) -> Result<ed25519_dalek::VerifyingKey> {
-    let bytes = hex_bytes(&cfg.hub_pubkey_hex)?;
-    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-        muxmesh_core::ErrorCore::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("MUXMESH_HUB_PUBKEY must be 32 bytes (64 hex), got {}", v.len()),
-        ))
-    })?;
-    Ok(ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(muxmesh_core::ErrorCore::from)?)
-}
-
 #[tokio::main]
 async fn main() {
     muxmesh_core::logger::init_tracing();
-    let cfg = Config::from_env();
+    let cfg = Config::from_env().expect("invalid agent configuration");
 
     loop {
         if let Err(e) = connect_and_run(&cfg).await {
