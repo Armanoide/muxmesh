@@ -4,7 +4,8 @@ mod error;
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use muxmesh_core::{
-    decode, encode, hex_bytes, ChallengeOk, ChallengeWire, Hello, Message, ReportState, BarStatus,
+    decode, encode, hex_bytes, now_secs, ChallengeOk, ChallengeWire, Hello, Message, ReportState,
+    BarStatus,
 };
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -76,13 +77,6 @@ fn hub_pubkey(cfg: &Config) -> Result<ed25519_dalek::VerifyingKey> {
         ))
     })?;
     Ok(ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(muxmesh_core::ErrorCore::from)?)
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }
 
 #[tokio::main]

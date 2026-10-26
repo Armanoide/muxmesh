@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::hex::hex_bytes;
+use crate::util::hex_bytes;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 /// The hub holds a permanent ED25519 keypair (generated at first start,
@@ -33,7 +33,7 @@ impl HubKeypair {
     }
 
     pub fn public_key_hex(&self) -> String {
-        crate::hex::hex(self.public_key().as_bytes())
+        crate::util::hex(self.public_key().as_bytes())
     }
 
     pub fn sign(&self, msg: &[u8]) -> Signature {

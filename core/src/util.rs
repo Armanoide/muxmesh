@@ -1,6 +1,7 @@
-//! Hex helpers shared by hub and agent — one implementation, two crates.
+//! Small shared utilities for hub and agent — one implementation, two crates.
 
 use crate::error::{ErrorCore, Result};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Decode an even-length hex string; odd length is a clean error, never a panic.
 pub fn hex_bytes(s: &str) -> Result<Vec<u8>> {
@@ -16,6 +17,14 @@ pub fn hex_bytes(s: &str) -> Result<Vec<u8>> {
 /// Encode bytes as lowercase hex.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Seconds since the Unix epoch — the clock every timestamp on the wire uses.
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs()
 }
 
 /// ParseIntError has no public constructor; craft one via an empty parse.
@@ -39,5 +48,11 @@ mod tests {
     #[test]
     fn round_trip() {
         assert_eq!(hex_bytes(&hex(&[1, 2, 253])).unwrap(), vec![1, 2, 253]);
+    }
+
+    #[test]
+    fn now_secs_is_recent() {
+        // 2026-01-01 in epoch seconds; anything older means a broken clock.
+        assert!(now_secs() > 1_767_225_600);
     }
 }
