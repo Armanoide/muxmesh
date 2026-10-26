@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use muxmesh_core::{mint_token, Fingerprint, HubKeypair, TokenHash};
+use muxmesh_core::{mint_token, BarStatus, Fingerprint, HubKeypair, ReportState, TokenHash};
 use tokio::sync::Mutex;
-/// Per-agent record pinned in the hub directory.
+/// Per-agent record pinned in the hub directory — the live card.
 #[derive(Debug)]
 pub struct Agent {
     pub label: String,
     pub fingerprint: Fingerprint,
+    /// last REPORT_STATE seen on this agent's socket
+    pub bar_on: bool,
+    pub last_seen: u64,
 }
 
 /// The hub's in-memory directory: enrolled tokens and connected agents.
@@ -61,6 +64,55 @@ impl HubState {
             }
         }
         false
+    }
+
+    /// Record a connected agent and refresh it with each REPORT_STATE heartbeat.
+    pub async fn update_agent(&self, label: &str, fp: &Fingerprint, report: &ReportState) {
+        self.agents.lock().await.insert(
+            label.to_string(),
+            Agent {
+                label: label.to_string(),
+                fingerprint: fp.clone(),
+                bar_on: report.status == BarStatus::On,
+                last_seen: report.seen,
+            },
+        );
+    }
+
+    /// Socket died — pull the agent off the live directory.
+    pub async fn remove_agent(&self, label: &str) {
+        self.agents.lock().await.remove(label);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn heartbeat_lands_on_the_card_then_vanishes() {
+        let state = HubState::new();
+        let fp = Fingerprint::compute("machine-1");
+
+        state
+            .update_agent(
+                "node-a",
+                &fp,
+                &ReportState {
+                    seen: 100,
+                    status: BarStatus::On,
+                },
+            )
+            .await;
+        {
+            let agents = state.agents.lock().await;
+            let a = agents.get("node-a").expect("agent on card");
+            assert!(a.bar_on);
+            assert_eq!(a.last_seen, 100);
+        }
+
+        state.remove_agent("node-a").await;
+        assert!(state.agents.lock().await.is_empty());
     }
 }
 

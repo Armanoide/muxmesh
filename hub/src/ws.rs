@@ -47,9 +47,12 @@ async fn run_handshake(socket: WebSocket, state: SharedState, token: String, fp:
     });
 
     // The agent announces itself first (HELLO); consume it before the challenge.
-    match stream.next().await {
+    let label = match stream.next().await {
         Some(Ok(WsMessage::Text(line))) => match decode(&line) {
-            Ok(AppMessage::Hello(h)) => info!(label = %h.label, "agent announced"),
+            Ok(AppMessage::Hello(h)) => {
+                info!(label = %h.label, "agent announced");
+                h.label
+            }
             Ok(other) => {
                 warn!(?other, "expected HELLO first — closing");
                 return;
@@ -60,7 +63,7 @@ async fn run_handshake(socket: WebSocket, state: SharedState, token: String, fp:
             }
         },
         _ => return,
-    }
+    };
 
     if sink.send(WsMessage::Text(encode(&wire).unwrap().into())).await.is_err() {
         return;
@@ -89,6 +92,13 @@ async fn run_handshake(socket: WebSocket, state: SharedState, token: String, fp:
     }
 
     info!("agent session open");
-    // Session loop arrives with the next brick (REPORT_STATE / ACK routing).
-    while let Some(Ok(_)) = stream.next().await {}
+    // Session loop: consume heartbeats into the live directory until the
+    // socket dies, then pull the agent off the card.
+    while let Some(Ok(WsMessage::Text(line))) = stream.next().await {
+        if let Ok(AppMessage::ReportState(r)) = decode(&line) {
+            state.update_agent(&label, &fp, &r).await;
+        }
+    }
+    state.remove_agent(&label).await;
+    info!(%label, "agent disconnected — removed from directory");
 }
